@@ -445,16 +445,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @staticmethod
     def _patch_llama4_attn_scale_for_spyre() -> None:
-        """Compute Mistral/Llama-4 attention temperature scaling on CPU.
+        """Route Mistral/Llama-4 attention temperature scaling through an opaque op.
 
         Models with ``llama_4_scaling`` (e.g. Ministral-3) run
         ``MistralAttention._get_llama_4_attn_scale`` per layer:
-        ``1 + beta * log(1 + floor(positions / orig_max))``. With ``positions``
-        on Spyre this is fp32 ``div``/``floor``/``log``, and Spyre has no fp32
-        ``log`` (``log on DataFormats.IEEE_FP32``). It's a tiny per-token scalar,
-        so run the whole formula on CPU and return it as fp16 on the query's
-        device — the downstream ``q * attn_scale`` then stays on-device fp16.
-        Process-global; no-op for models without this method/attr.
+        ``1 + beta * log(1 + floor(positions / orig_max))``, in fp32 — and Spyre
+        has no fp32 ``log`` (``log on DataFormats.IEEE_FP32``). The
+        ``spyre_llama4_attn_scale`` opaque op (``custom_ops/llama4_attn_scale.py``)
+        computes it on CPU and returns fp16 on the query device; being opaque it
+        works in BOTH eager and ``torch.compile`` (the CPU math isn't traced into
+        the Spyre graph, so no CPU intermediate leaks). Process-global; no-op for
+        models without this method.
         """
         from vllm.model_executor.models.mistral import MistralAttention
 
@@ -463,8 +464,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
 
         def _get_llama_4_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
-            scale = orig(self, convert(positions, device="cpu"))
-            return convert(scale, device=positions.device, dtype=torch.float16)
+            return torch.ops.vllm.spyre_llama4_attn_scale(
+                positions,
+                float(self.llama_4_scaling_beta),
+                int(self.llama_4_scaling_original_max_position_embeddings),
+            )
 
         _get_llama_4_attn_scale._spyre_patched = True
         MistralAttention._get_llama_4_attn_scale = _get_llama_4_attn_scale  # ty: ignore[invalid-assignment]
