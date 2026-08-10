@@ -161,12 +161,22 @@ def main():
         any_differ = False
 
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import (
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+            AutoTokenizer,
+        )
 
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         # Match the Spyre run's float16 weights so the greedy paths are
         # comparable (float32 vs float16 alone can flip tokens).
-        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16)
+        except ValueError:
+            # Multimodal wrappers (e.g. Mistral3ForConditionalGeneration) aren't
+            # accepted by AutoModelForCausalLM; load the image-text-to-text class.
+            # A text-only prompt still exercises the language model for comparison.
+            model = AutoModelForImageTextToText.from_pretrained(args.model, dtype=torch.float16)
 
         for i in range(args.num_prompts):
             prompt = prompts[i]
