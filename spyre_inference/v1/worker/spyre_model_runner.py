@@ -443,6 +443,32 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         bert._decode_token_type_ids = _decode_token_type_ids  # ty: ignore[invalid-assignment]
 
+    @staticmethod
+    def _patch_llama4_attn_scale_for_spyre() -> None:
+        """Compute Mistral/Llama-4 attention temperature scaling on CPU.
+
+        Models with ``llama_4_scaling`` (e.g. Ministral-3) run
+        ``MistralAttention._get_llama_4_attn_scale`` per layer:
+        ``1 + beta * log(1 + floor(positions / orig_max))``. With ``positions``
+        on Spyre this is fp32 ``div``/``floor``/``log``, and Spyre has no fp32
+        ``log`` (``log on DataFormats.IEEE_FP32``). It's a tiny per-token scalar,
+        so run the whole formula on CPU and return it as fp16 on the query's
+        device — the downstream ``q * attn_scale`` then stays on-device fp16.
+        Process-global; no-op for models without this method/attr.
+        """
+        from vllm.model_executor.models.mistral import MistralAttention
+
+        orig = MistralAttention._get_llama_4_attn_scale
+        if getattr(orig, "_spyre_patched", False):
+            return
+
+        def _get_llama_4_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
+            scale = orig(self, convert(positions, device="cpu"))
+            return convert(scale, device=positions.device, dtype=torch.float16)
+
+        _get_llama_4_attn_scale._spyre_patched = True
+        MistralAttention._get_llama_4_attn_scale = _get_llama_4_attn_scale  # ty: ignore[invalid-assignment]
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -453,6 +479,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         model_loader = get_model_loader(self.load_config)
 
         self._patch_encoder_ops_for_spyre(self.model_config)
+        self._patch_llama4_attn_scale_for_spyre()
 
         # Load model on CPU
         self.model = model_loader.load_model(
