@@ -287,6 +287,70 @@ class _SpyreModelWrapper:
         if rope_rot:
             get_forward_context().additional_kwargs["spyre_rope_rot"] = rope_rot
 
+    def embed_multimodal(self, **kwargs):
+        """Move float multimodal inputs (e.g. ``pixel_values``) onto Spyre.
+
+        vLLM's runner calls ``embed_multimodal`` directly (via ``__getattr__``,
+        bypassing ``__call__``'s input conversion), so the pixel tensors would
+        otherwise reach the vision tower + projector — whose weights live on
+        Spyre after ``model.to`` in ``load_model`` — while still on CPU, hitting
+        a cpu-activations × spyre-weights mismatch. Mirror ``compute_logits``'
+        H2D for the float inputs; ``convert`` is a no-op for tensors already on
+        the target device, and non-float entries pass through untouched.
+        """
+
+        def _to_spyre_float(t):
+            if isinstance(t, torch.Tensor) and t.is_floating_point():
+                return convert(t, dtype=torch.float16, device=self._spyre_device)
+            return t
+
+        kwargs = tree_map(_to_spyre_float, kwargs)
+        return self._model.embed_multimodal(**kwargs)
+
+    def embed_input_ids(
+        self,
+        input_ids,
+        multimodal_embeddings=None,
+        *,
+        is_multimodal=None,
+    ):
+        """Text-token embedding + multimodal merge, Spyre-aware.
+
+        The runner calls this directly (``gpu_model_runner`` :3526/:3573) via
+        ``__getattr__``, bypassing ``__call__``'s conversion, so ``input_ids``
+        arrive on CPU while ``embed_tokens`` lives on Spyre.
+
+        - **No image in the batch:** move ``input_ids`` to Spyre and do the
+          embedding lookup on-card (``embedding`` is now a Spyre op).
+        - **Image present:** the upstream merge
+          (``_merge_multimodal_embeddings``) scatters image rows via
+          ``inputs_embeds[is_multimodal] = ...`` — a **dim-0 boolean-mask
+          scatter Spyre cannot do**. So we keep the on-card text lookup, then
+          D2H and run the (unmodified) merge on CPU, then H2D the result for the
+          decoder. ``image_token_index`` is in-vocab for Mistral3 (10 <
+          vocab_size), so the placeholder tokens embed without an OOV masked
+          fill; they are overwritten by the merge regardless.
+        """
+        input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
+        inputs_embeds = self._model.embed_input_ids(input_ids)
+
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+
+        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+
+        inputs_embeds = convert(inputs_embeds, device="cpu")
+        mm_embeds_cpu = tree_map(
+            lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
+            multimodal_embeddings,
+        )
+        merged = _merge_multimodal_embeddings(
+            inputs_embeds=inputs_embeds,
+            multimodal_embeddings=mm_embeds_cpu,
+            is_multimodal=is_multimodal.to("cpu"),
+        )
+        return convert(merged, device=self._spyre_device)
+
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
 
