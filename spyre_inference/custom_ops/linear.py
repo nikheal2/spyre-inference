@@ -43,6 +43,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
+from .utils import convert
+
 logger = init_logger(__name__)
 
 
@@ -63,10 +65,25 @@ def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor |
 
     `weight_t` is the physically-transposed weight of shape `[in, out]`, so the
     matmul is a plain `x @ A` (the Spyre-fast layout), not `F.linear`'s `x @ Aᵀ`.
+
+    torch-spyre compiles each op via ``compile_once(op, dynamic=False)`` with a
+    **static output buffer**. Every decoder layer's ``qkv``/``o_proj``/
+    ``gate_up``/``down_proj`` share the same shape, so they hit the *same*
+    compiled matmul kernel writing to *one fixed device address*. Returning that
+    tensor directly aliases the shared buffer, and the next same-shape matmul
+    silently overwrites it — corrupting any retained value (the residual stream,
+    a cached activation) and producing structurally-wrong output. The
+    Spyre→CPU→Spyre round-trip DMAs the result out of the shared pool and
+    allocates a dedicated buffer that later matmuls won't clobber. (These linears
+    are ``bias=False``, so the ``+ bias`` add — which would itself allocate fresh
+    memory — usually doesn't run.)
     """
     out = torch.matmul(x, weight_t)
     if bias is not None:
         out = out + bias
+    device = out.device
+    out = convert(out, device="cpu")
+    out = convert(out, device=device)
     return out
 
 
