@@ -16,10 +16,17 @@ Run on the Spyre host:
 import torch
 import torch_spyre  # noqa: F401  (registers the "spyre" device)
 
+from vllm.config import VllmConfig, set_current_vllm_config
+
+from spyre_inference.custom_ops import register_all
 from spyre_inference.custom_ops.rotary_embedding import (
     SpyreYaRNScalingRotaryEmbedding,
     _rotate_neox_2x2,
 )
+
+# Register the plugin's custom ops (spyre_convert used by convert(), the rope
+# opaque ops, etc.). Safe to call repeatedly (lru_cached).
+register_all()
 
 torch.manual_seed(0)
 
@@ -34,10 +41,12 @@ dev = torch.device("spyre")
 # Build the exact OOT rope the model uses (mixin + YaRN). Positional args match
 # YaRNScalingRotaryEmbedding.__init__(head_size, rotary_dim,
 #   max_position_embeddings, base, is_neox_style, scaling_factor, dtype, ...).
-rope = SpyreYaRNScalingRotaryEmbedding(
-    HEAD, HEAD, ORIG_MAX, BASE, True, FACTOR, torch.float16,
-    beta_fast=32, beta_slow=1,
-)
+# RotaryEmbeddingBase is a vLLM CustomOp, so __init__ needs an active vLLM config.
+with set_current_vllm_config(VllmConfig()):
+    rope = SpyreYaRNScalingRotaryEmbedding(
+        HEAD, HEAD, ORIG_MAX, BASE, True, FACTOR, torch.float16,
+        beta_fast=32, beta_slow=1,
+    )
 
 positions = torch.arange(T)
 q = torch.randn(T, NH * HEAD, dtype=torch.float16)

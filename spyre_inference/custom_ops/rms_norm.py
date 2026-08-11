@@ -26,6 +26,8 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 
+from .utils import convert
+
 logger = init_logger(__name__)
 
 
@@ -55,9 +57,16 @@ class SpyreRMSNorm(RMSNorm):
             x = x + residual
             residual = x
 
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        # DIAGNOSTIC (fp32 promotion): Spyre is fp16-only on-device, so the
+        # square/mean/rsqrt runs in fp32 on CPU to match upstream and avoid fp16
+        # overflow of x**2 when the residual stream is large. Costs a per-norm
+        # D2H/H2D round-trip. Eager-only for now (plain CPU ops break whole-model
+        # compile — wrap in an opaque op if this turns out to be the fix).
+        orig_device = x.device
+        x32 = convert(x, device="cpu").to(torch.float32)
+        variance = x32.pow(2).mean(dim=-1, keepdim=True)
+        x32 = x32 * torch.rsqrt(variance + self.variance_epsilon)
+        x = convert(x32.to(torch.float16), device=orig_device)
 
         if self.has_weight:
             x = x * self.weight
