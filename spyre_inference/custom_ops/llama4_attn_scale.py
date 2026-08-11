@@ -12,27 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opaque op for Mistral/Llama-4 attention temperature scaling.
+"""Op for Mistral/Llama-4 attention temperature scaling.
 
 Models with ``llama_4_scaling`` (e.g. Ministral-3) run, per attention layer,
 ``MistralAttention._get_llama_4_attn_scale``::
 
     1 + beta * log(1 + floor(positions / original_max_position_embeddings))
 
-The ``div``/``floor``/``log`` execute in fp32, and Spyre has no fp32 ``log``
-(``log on DataFormats.IEEE_FP32``). Wrapping the whole thing in an opaque custom
-op (registered via ``direct_register_custom_op`` with a ``fake_impl``) means:
+which promotes the on-device ``positions`` to fp32. Spyre supports fp32 casting,
+so the whole thing runs **on-device in fp32** and returns fp16 (keeping the
+downstream ``q * attn_scale`` in fp16). The method swap that routes
+``_get_llama_4_attn_scale`` through this op is installed in the model runner's
+``load_model`` (``_patch_llama4_attn_scale_for_spyre``).
 
-- **eager**: the op body runs eagerly — the fp32 math is done on CPU and an fp16
-  result is returned on the query device (exact precision, no fp16 rounding of
-  large positions);
-- **torch.compile**: Dynamo sees a single black-box node, so the CPU math is
-  never traced into the Spyre graph — no CPU-resident intermediate for a
-  Spyre-only op (e.g. ``spyre::to_dtype_cpu``) to choke on.
-
-Mirrors the ``spyre_rope_rot`` opaque-op pattern in ``rotary_embedding.py``. The
-method swap that routes ``_get_llama_4_attn_scale`` through this op is installed
-in the model runner's ``load_model`` (``_patch_llama4_attn_scale_for_spyre``).
+Registered via ``direct_register_custom_op`` with a ``fake_impl``. The opaque
+wrapper is no longer strictly required now the body is fully on-device; it's kept
+for the stable ``_get_llama_4_attn_scale`` seam and could be inlined later if
+fusing the tiny op into the graph is worthwhile.
 """
 
 from functools import lru_cache
@@ -43,23 +39,26 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import convert
-
 logger = init_logger(__name__)
 
 
 def _llama4_attn_scale_func(
     positions: torch.Tensor, beta: float, original_max_position_embeddings: int
 ) -> torch.Tensor:
-    """Compute the attention temperature scale on CPU (Spyre lacks fp32 ``log``),
-    returning fp16 on ``positions``' device so the downstream ``q * attn_scale``
-    stays on-device fp16."""
-    pos = convert(positions, device="cpu")
+    """Compute the attention temperature scale **on-device in fp32** (Spyre
+    supports fp32 casting), returning fp16 on ``positions``' device so the
+    downstream ``q * attn_scale`` stays fp16.
+
+    NOTE: if ``log`` on fp32 is rejected on this torch-spyre revision
+    (``log on DataFormats.IEEE_FP32``), cast just the (small-integer) log
+    argument to fp16 — ``(1 + floor(pos/orig_max)).to(fp16)`` — since fp16 log of
+    values in ~[1, 17] is exact.
+    """
+    pos = positions.to(torch.float32)
     scaling = 1.0 + beta * torch.log(
         1.0 + torch.floor(pos / original_max_position_embeddings)
     )
-    scaling = scaling.unsqueeze(-1)
-    return convert(scaling, device=positions.device, dtype=torch.float16)
+    return scaling.unsqueeze(-1).to(torch.float16)
 
 
 def _llama4_attn_scale_fake(
