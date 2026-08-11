@@ -26,22 +26,12 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 
-from .utils import convert
-
 logger = init_logger(__name__)
 
 
 @RMSNorm.register_oot(name="RMSNorm")
 class SpyreRMSNorm(RMSNorm):
     """Out-of-tree (OOT) RMSNorm implementation for IBM's Spyre."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        logger.warning_once(
-            "SpyreRMSNorm: no dtype promotion is performed, "
-            "expect numerical differences to upstream vLLM."
-        )
 
     def forward_oot(
         self,
@@ -53,20 +43,21 @@ class SpyreRMSNorm(RMSNorm):
         if self.variance_size_override is not None:
             raise NotImplementedError("TODO: variance_size_override not yet implemented")
 
-        if residual is not None:
-            x = x + residual
-            residual = x
+        # fp32 promotion, matching upstream RMSNorm: Spyre supports fp32 casting
+        # on-device, so do the residual add + variance + rsqrt in fp32 to avoid
+        # fp16 overflow of x**2 / precision loss in the residual add when the
+        # residual stream is large. All on-device (no CPU round-trip) → also
+        # compile-safe. The residual is stored back in the input dtype (fp16).
+        orig_dtype = x.dtype
+        x = x.to(torch.float32)
 
-        # DIAGNOSTIC (fp32 promotion): Spyre is fp16-only on-device, so the
-        # square/mean/rsqrt runs in fp32 on CPU to match upstream and avoid fp16
-        # overflow of x**2 when the residual stream is large. Costs a per-norm
-        # D2H/H2D round-trip. Eager-only for now (plain CPU ops break whole-model
-        # compile — wrap in an opaque op if this turns out to be the fix).
-        orig_device = x.device
-        x32 = convert(x, device="cpu").to(torch.float32)
-        variance = x32.pow(2).mean(dim=-1, keepdim=True)
-        x32 = x32 * torch.rsqrt(variance + self.variance_epsilon)
-        x = convert(x32.to(torch.float16), device=orig_device)
+        if residual is not None:
+            x = x + residual.to(torch.float32)
+            residual = x.to(orig_dtype)
+
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        x = x.to(orig_dtype)
 
         if self.has_weight:
             x = x * self.weight
