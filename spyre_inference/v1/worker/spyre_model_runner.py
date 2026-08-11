@@ -443,35 +443,58 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         bert._decode_token_type_ids = _decode_token_type_ids  # ty: ignore[invalid-assignment]
 
-    @staticmethod
-    def _patch_llama4_attn_scale_for_spyre() -> None:
-        """Route Mistral/Llama-4 attention temperature scaling through an opaque op.
+    def _patch_llama4_attn_scale(self) -> None:
+        """Patch Mistral/Llama-4 attention temperature scaling onto each attention
+        instance, computing it on CPU.
 
-        Models with ``llama_4_scaling`` (e.g. Ministral-3) run
-        ``MistralAttention._get_llama_4_attn_scale`` per layer:
-        ``1 + beta * log(1 + floor(positions / orig_max))``, in fp32 — and Spyre
-        has no fp32 ``log`` (``log on DataFormats.IEEE_FP32``). The
-        ``spyre_llama4_attn_scale`` opaque op (``custom_ops/llama4_attn_scale.py``)
-        computes it on CPU and returns fp16 on the query device; being opaque it
-        works in BOTH eager and ``torch.compile`` (the CPU math isn't traced into
-        the Spyre graph, so no CPU intermediate leaks). Process-global; no-op for
-        models without this method.
+        ``MistralAttention._get_llama_4_attn_scale`` computes
+        ``1 + beta * log(1 + floor(positions / orig_max))``. ``positions`` is int64
+        on Spyre, and torch-spyre can't convert int64->float32 on-device (nor run
+        fp32 ``log``), so the whole scale is computed on CPU and returned as fp16 on
+        the query device (keeping the downstream ``q * attn_scale`` fp16).
+
+        Patched **per-instance via module traversal**, which requires running AFTER
+        the model is loaded (the real ``MistralAttention`` modules must exist) and
+        BEFORE ``torch.compile`` wraps it — an ``OptimizedModule`` doesn't traverse
+        to the underlying submodules. Eager path: the inline CPU math is not
+        compile-safe (it would trace CPU ops into the fullgraph); it is a no-op
+        (scale=1) for prompts shorter than ``orig_max`` regardless.
         """
         from vllm.model_executor.models.mistral import MistralAttention
 
-        orig = MistralAttention._get_llama_4_attn_scale
-        if getattr(orig, "_spyre_patched", False):
-            return
+        def _make_scale(module: MistralAttention):
+            beta = float(module.llama_4_scaling_beta)
+            orig_max = int(module.llama_4_scaling_original_max_position_embeddings)
+            spyre_device = self._spyre_device
 
-        def _get_llama_4_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
-            return torch.ops.vllm.spyre_llama4_attn_scale(
-                positions,
-                float(self.llama_4_scaling_beta),
-                int(self.llama_4_scaling_original_max_position_embeddings),
+            def _get_llama_4_attn_scale(positions: torch.Tensor) -> torch.Tensor:
+                pos = positions.to("cpu")
+                scaling = 1.0 + beta * torch.log(1.0 + torch.floor(pos / orig_max))
+                return convert(scaling.unsqueeze(-1), device=spyre_device, dtype=torch.float16)
+
+            return _get_llama_4_attn_scale
+
+        mistral_attns = [m for m in self.model.modules() if isinstance(m, MistralAttention)]
+
+        # Guard against a stale patch: if MistralAttention exists but none carries
+        # the `do_llama_4_scaling` attribute, the upstream API changed and the gate
+        # below would silently skip every layer (llama-4 scaling never applied).
+        # A legit non-scaled model still has the attribute (value False), so this
+        # only fires on a real rename/removal.
+        if mistral_attns and not any(hasattr(m, "do_llama_4_scaling") for m in mistral_attns):
+            raise RuntimeError(
+                "MistralAttention has no 'do_llama_4_scaling' attribute — the Spyre "
+                "llama-4 attention-scale patch is stale for this vLLM version; update "
+                "_patch_llama4_attn_scale."
             )
 
-        _get_llama_4_attn_scale._spyre_patched = True
-        MistralAttention._get_llama_4_attn_scale = _get_llama_4_attn_scale  # ty: ignore[invalid-assignment]
+        n = 0
+        for module in mistral_attns:
+            if getattr(module, "do_llama_4_scaling", False):
+                module._get_llama_4_attn_scale = _make_scale(module)
+                n += 1
+        if n:
+            logger.info("Spyre: patched %d Llama-4 attention-scale module(s) to CPU.", n)
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
@@ -483,7 +506,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         model_loader = get_model_loader(self.load_config)
 
         self._patch_encoder_ops_for_spyre(self.model_config)
-        self._patch_llama4_attn_scale_for_spyre()
 
         # Load model on CPU
         self.model = model_loader.load_model(
@@ -541,6 +563,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
+
+        # Patch Llama-4 attention scaling per-instance — must be after load (real
+        # modules exist) and before compile (OptimizedModule breaks traversal).
+        self._patch_llama4_attn_scale()
 
         # Collect RoPE modules for _SpyreModelWrapper to prime (modules() dedupes
         # a shared instance by identity).
