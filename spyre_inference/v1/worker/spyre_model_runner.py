@@ -57,12 +57,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from vllm.utils.math_utils import round_up
-from spyre_inference.custom_ops.rotary_embedding import (
-    _SpyreRotaryMixin,
-    _rotate_neox_2x2,
-    _SPYRE_STICK,
-)
+from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
 from spyre_inference.custom_ops.linear import transpose_linear_weights_for_spyre
 from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
@@ -550,23 +545,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @staticmethod
     def _patch_pixtral_vision_rope() -> None:
-        """Run Pixtral's 2D vision RoPE ON-CARD via the slice-free 2x2 rotation.
+        """Run Pixtral's 2D vision RoPE ON-CARD, expressing `rotate_half` as a matmul.
 
         transformers' `apply_rotary_pos_emb`/`rotate_half` half-slice the head dim
         (`x[..., :d/2]` / `x[..., d/2:]`), which corrupts on Spyre — and it's a
         plain module-level function, not a vLLM CustomOp, so `register_oot` can't
-        catch it. Pixtral's rope is the *same* neox structure the text decoder uses
-        (`q*cos + rotate_half(q)*sin`, with `cos/sin = cat([freqs, freqs])` so the
-        two head-dim halves match), so we reuse the text path's verified slice-free
-        `_rotate_neox_2x2`: build the small 2x2 rotation cache from `cos/sin` on CPU
-        (they're tiny and already CPU-fallback-produced by `PixtralRotaryEmbedding`),
-        move it to the device once, and apply the rotation to the large q/k ViT
-        activations ON SPYRE.
+        catch it. The text path's 2x2 helper (`_rotate_neox_2x2`) isn't usable here:
+        vision head_dim=64 → the `d/2 = 32`-wide half is *half a Spyre stick* (64),
+        which torch-spyre can't lay out ("Unexpected stick expression ... Mod(var,
+        32)"). Instead we keep the neox formula `q*cos + rotate_half(q)*sin` but
+        realize `rotate_half` as a constant `[head_dim, head_dim]` matmul (`x @ R`),
+        which is stick-aligned over the full 64-wide dim — so the whole rotation of
+        the large q/k ViT activations stays ON SPYRE with no sub-stick slice.
 
         Monkeypatches the module-level name `PixtralHFAttention.forward` resolves at
         call time; guarded/no-op if the symbol is absent (non-Pixtral / different
         vLLM layout). Eager path; wrap in an opaque op if the vision tower must
-        compile. If a layout op raises on hardware, fall *that* call back to CPU —
+        compile. If an op still raises on hardware, fall *that* call back to CPU —
         do not revert the whole rope.
         """
         try:
@@ -578,43 +573,45 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if orig is None or getattr(orig, "_spyre_patched", False):
             return
 
-        def _build_rot(cos: torch.Tensor, sin: torch.Tensor, inner: int, padded: int):
-            """Small `cos/sin` ([patches, head_dim]) → 2x2 rotation cache
-            [patches, 2, 2, padded] on CPU. Mirrors `_get_rotation_cache`; the
-            sub-stick half-slice is CPU-only (Spyre-hostile) but the tensors are
-            tiny, and the large q/k rotation still runs on-card."""
-            cos_h = cos[..., :inner].to("cpu", torch.float16)
-            sin_h = sin[..., :inner].to("cpu", torch.float16)
-            rot = torch.stack([cos_h, -sin_h, sin_h, cos_h], dim=1).view(
-                cos_h.shape[0], 2, 2, inner
-            )
-            if padded != inner:
-                rot = torch.nn.functional.pad(rot, (0, padded - inner))
-            return rot
+        @lru_cache(maxsize=None)
+        def _rotate_half_matrix(head_dim: int, device: torch.device) -> torch.Tensor:
+            """Constant `[head_dim, head_dim]` matrix `R` with `x @ R == rotate_half(x)`.
+
+            neox `rotate_half(x) = cat([-x[d/2:], x[:d/2]])`. Expressing it as a
+            full-width matmul avoids slicing the head into two `d/2`-wide halves —
+            for head_dim=64 that half is 32 = half a Spyre stick, which torch-spyre
+            can't lay out ("Unexpected stick expression ... Mod(var, 32)"). A matmul
+            over the full 64-wide dim is stick-aligned, so the rotation stays on-card.
+            Built once on CPU per (head_dim, device), then moved to the device.
+            """
+            half = head_dim // 2
+            r = torch.zeros(head_dim, head_dim, dtype=torch.float16)
+            idx = torch.arange(half)
+            r[idx + half, idx] = -1.0  # out[:half] = -x[half:]
+            r[idx, idx + half] = 1.0  # out[half:] =  x[:half]
+            return convert(r, device=device, dtype=torch.float16)
 
         def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
             # q, k: [batch, n_heads, patches, head_dim]; cos/sin: [patches, head_dim].
             dev = q.device
             head_dim = q.shape[-1]
-            inner = head_dim // 2
-            padded = round_up(inner, _SPYRE_STICK)
-            rot = convert(
-                _build_rot(cos, sin, inner, padded), device=dev, dtype=torch.float16
-            )
+            rot_r = _rotate_half_matrix(head_dim, dev)
+            # cos/sin come from PixtralRotaryEmbedding (arange/sin/cos → may be CPU);
+            # move to device and add [batch, n_heads] broadcast dims.
+            cos = convert(cos, device=dev, dtype=torch.float16).unsqueeze(0).unsqueeze(0)
+            sin = convert(sin, device=dev, dtype=torch.float16).unsqueeze(0).unsqueeze(0)
 
             def rotate(x):
-                b, h, p, d = x.shape
-                # token-first [patches, batch*n_heads, head_dim] for _rotate_neox_2x2
-                xt = x.permute(2, 0, 1, 3).reshape(p, b * h, d)
-                out = _rotate_neox_2x2(xt, rot, d)  # on Spyre
-                return out.view(p, b, h, d).permute(1, 2, 0, 3)
+                # q*cos + rotate_half(q)*sin, with rotate_half as a stick-aligned matmul.
+                return x * cos + torch.matmul(x, rot_r) * sin
 
             return rotate(q), rotate(k)
 
         _apply_rotary_pos_emb._spyre_patched = True
         pixtral.apply_rotary_pos_emb = _apply_rotary_pos_emb  # ty: ignore[invalid-assignment]
         logger.info(
-            "Spyre: patched Pixtral vision apply_rotary_pos_emb to on-card 2x2 rotation."
+            "Spyre: patched Pixtral vision apply_rotary_pos_emb to on-card "
+            "rotate-half-matrix rotation."
         )
 
     def load_model(self, load_dummy_weights: bool = False) -> None:

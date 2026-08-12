@@ -17,6 +17,9 @@ dependencies = [
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
     "torch",
+    # Required for VLM support (vLLM's image processors / Pixtral vision path).
+    # Version left out: resolved against the pinned torch from the pytorch-cpu index.
+    "torchvision",
     "hf-adapters-spyre"
 ]
 requires-python = ">=3.11"
@@ -63,10 +66,6 @@ required-environments = [
 override-dependencies = [
     # No triton support yet, don't allow any dependencies to pull it in
     "triton; sys_platform == 'never'",
-
-    # Skipping torch-vision temporarily
-    # TODO: This will be required in the future for VLM support via vllm
-    "torchvision; sys_platform == 'never'",
 
     # (transformers imports it at module level via loss_rnnt.py)
     "torchaudio; sys_platform == 'never'",
