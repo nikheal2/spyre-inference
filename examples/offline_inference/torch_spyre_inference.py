@@ -63,7 +63,100 @@ def parse_args():
         dest="enforce_eager",
         help="Skip torch.compile, run in eager mode",
     )
+    parser.add_argument(
+        "--multimodal",
+        action="store_true",
+        help="Run a single image+text (ChartQA) prompt through the vision path "
+        "instead of the text-only prompt batch.",
+    )
+    parser.add_argument(
+        "--image-url",
+        type=str,
+        default=(
+            "https://raw.githubusercontent.com/vis-nlp/ChartQA/main/"
+            "ChartQA%20Dataset/test/png/15008.png"
+        ),
+        dest="image_url",
+        help="Image URL to download and feed to the model in --multimodal mode.",
+    )
     return parser.parse_args()
+
+
+# ChartQA-style reasoning prompt used in --multimodal mode.
+MULTIMODAL_QUESTION = (
+    "Which country data shown in the bottom bar? \n Analyze the image and question "
+    "carefully, using step-by-step reasoning. \n First, describe any image provided "
+    "in detail. Then, present your reasoning. And finally your final answer in this "
+    "format: \n Final Answer: <answer> \n where <answer> follows the following "
+    "instructions: \n - <answer> should should be a single phrase or number. \n "
+    "- <answer> should not paraphrase or reformat the text in the image. \n - If "
+    "<answer> is a ratio, it should be a decimal value like 0.25 instead of 1:4. \n "
+    "- If the question is a Yes/No question, <answer> should be Yes/No. \n - If "
+    "<answer> is a number, it should not contain any units. \n - If <answer> is a "
+    "percentage, it should include a % sign. \n - If <answer> is an entity, it should "
+    "include the full label from the graph. \n IMPORTANT: Remember, to end your "
+    "answer with Final Answer: <answer>."
+)
+
+
+def run_multimodal(args):
+    """Download the image and run a single image+text prompt through the vision path.
+
+    The image is fetched in-process and passed to vLLM as a base64 data URI (no
+    remote fetch by vLLM); `llm.chat` applies the model's chat template so the
+    image placeholder tokens are inserted correctly for Mistral3/Pixtral.
+    """
+    import base64
+    import urllib.request
+
+    from vllm import LLM, SamplingParams
+
+    print(f"Downloading image: {args.image_url}")
+    req = urllib.request.Request(args.image_url, headers={"User-Agent": "spyre-inference"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        image_bytes = resp.read()
+    data_uri = "data:image/png;base64," + base64.b64encode(image_bytes).decode("utf-8")
+    print(f"Downloaded {len(image_bytes)} bytes.")
+
+    llm = LLM(
+        model=args.model,
+        tokenizer=args.model,
+        max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
+        tensor_parallel_size=args.tp,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        dtype="float16",
+        enforce_eager=args.enforce_eager,
+        num_gpu_blocks_override=args.num_gpu_blocks_override,
+        limit_mm_per_prompt={"image": 1},
+    )
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": data_uri}},
+                {"type": "text", "text": MULTIMODAL_QUESTION},
+            ],
+        }
+    ]
+    # Image tokens + the reasoning prompt need room; --max-model-len must be large
+    # enough (Pixtral expands one image into hundreds/thousands of tokens).
+    sampling_params = SamplingParams(
+        max_tokens=max(int(v) for v in args.max_tokens.split(",")),
+        temperature=0.0,
+    )
+
+    print("=============== GENERATE (multimodal)")
+    t0 = time.time()
+    outputs = llm.chat(messages, sampling_params)
+    elapsed = time.time() - t0
+    print(f"Time elapsed: {elapsed:.2f} sec")
+    print("===============")
+    for output in outputs:
+        print(f"\nPrompt:\n {output.prompt!r}")
+        print(f"\nGenerated text:\n {output.outputs[0].text!r}\n")
+        print("-----------------------------------")
 
 
 def main():
@@ -77,6 +170,10 @@ def main():
             "locally on arm64."
         )
         os.environ["HF_HUB_OFFLINE"] = "1"
+
+    if args.multimodal:
+        run_multimodal(args)
+        return
 
     template = (
         "Below is an instruction that describes a task. Write a response that "
