@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -62,6 +63,54 @@ from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
+
+def _llama4_attn_scale_op(
+    positions: torch.Tensor, beta: float, original_max_position_embeddings: int
+) -> torch.Tensor:
+    """Opaque-op body: run **upstream's** Mistral/Llama-4 attention temperature
+    scaling on CPU and return fp16 on the query device.
+
+    ``positions`` is int64 on Spyre and torch-spyre can't convert int64->float32
+    on-device (nor run fp32 ``log``), so the scale is computed on CPU. We reuse
+    upstream ``MistralAttention._get_llama_4_attn_scale`` verbatim (no formula
+    duplication) — it reads only ``self.llama_4_scaling_beta`` and
+    ``self.llama_4_scaling_original_max_position_embeddings``, which we supply via
+    a stub since a custom op can't take the module itself. Being an opaque op it
+    works in BOTH eager and ``torch.compile`` (the CPU math never enters the
+    Spyre graph).
+    """
+    from types import SimpleNamespace
+
+    from vllm.model_executor.models.mistral import MistralAttention
+
+    stub = SimpleNamespace(
+        llama_4_scaling_beta=beta,
+        llama_4_scaling_original_max_position_embeddings=original_max_position_embeddings,
+    )
+    scaling = MistralAttention._get_llama_4_attn_scale(stub, positions.to("cpu"))
+    return convert(scaling, device=positions.device, dtype=torch.float16)
+
+
+def _llama4_attn_scale_fake(
+    positions: torch.Tensor, beta: float, original_max_position_embeddings: int
+) -> torch.Tensor:
+    return torch.empty((positions.shape[0], 1), dtype=torch.float16, device=positions.device)
+
+
+@lru_cache(maxsize=1)
+def _register_llama4_attn_scale_op() -> None:
+    """Register ``torch.ops.vllm.spyre_llama4_attn_scale`` once. Called from
+    ``load_model`` (not import) so ``current_platform`` is resolved."""
+    from vllm.platforms import current_platform
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    direct_register_custom_op(
+        op_name="spyre_llama4_attn_scale",
+        op_func=_llama4_attn_scale_op,
+        fake_impl=_llama4_attn_scale_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )
+
 
 # Observed Spyre DMA failure threshold for encoder-only dummy batches with
 # multiple sequences.  Pooling warmup stays below this limit.
@@ -444,33 +493,31 @@ class TorchSpyreModelRunner(GPUModelRunner):
         bert._decode_token_type_ids = _decode_token_type_ids  # ty: ignore[invalid-assignment]
 
     def _patch_llama4_attn_scale(self) -> None:
-        """Patch Mistral/Llama-4 attention temperature scaling onto each attention
-        instance, computing it on CPU.
+        """Route Mistral/Llama-4 attention temperature scaling through the
+        ``spyre_llama4_attn_scale`` opaque op (which reuses upstream's formula on
+        CPU; see ``_llama4_attn_scale_op``).
 
         ``MistralAttention._get_llama_4_attn_scale`` computes
-        ``1 + beta * log(1 + floor(positions / orig_max))``. ``positions`` is int64
-        on Spyre, and torch-spyre can't convert int64->float32 on-device (nor run
-        fp32 ``log``), so the whole scale is computed on CPU and returned as fp16 on
-        the query device (keeping the downstream ``q * attn_scale`` fp16).
+        ``1 + beta * log(1 + floor(positions / orig_max))``; ``positions`` is int64
+        on Spyre and torch-spyre can't convert int64->float32 on-device (nor run
+        fp32 ``log``). The opaque op runs it on CPU and returns fp16, so it works in
+        **both eager and torch.compile**.
 
         Patched **per-instance via module traversal**, which requires running AFTER
         the model is loaded (the real ``MistralAttention`` modules must exist) and
         BEFORE ``torch.compile`` wraps it — an ``OptimizedModule`` doesn't traverse
-        to the underlying submodules. Eager path: the inline CPU math is not
-        compile-safe (it would trace CPU ops into the fullgraph); it is a no-op
-        (scale=1) for prompts shorter than ``orig_max`` regardless.
+        to the underlying submodules.
         """
         from vllm.model_executor.models.mistral import MistralAttention
+
+        _register_llama4_attn_scale_op()
 
         def _make_scale(module: MistralAttention):
             beta = float(module.llama_4_scaling_beta)
             orig_max = int(module.llama_4_scaling_original_max_position_embeddings)
-            spyre_device = self._spyre_device
 
             def _get_llama_4_attn_scale(positions: torch.Tensor) -> torch.Tensor:
-                pos = positions.to("cpu")
-                scaling = 1.0 + beta * torch.log(1.0 + torch.floor(pos / orig_max))
-                return convert(scaling.unsqueeze(-1), device=spyre_device, dtype=torch.float16)
+                return torch.ops.vllm.spyre_llama4_attn_scale(positions, beta, orig_max)
 
             return _get_llama_4_attn_scale
 
