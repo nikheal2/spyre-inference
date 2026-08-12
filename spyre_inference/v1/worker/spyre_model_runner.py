@@ -57,7 +57,12 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
+from vllm.utils.math_utils import round_up
+from spyre_inference.custom_ops.rotary_embedding import (
+    _SpyreRotaryMixin,
+    _rotate_neox_2x2,
+    _SPYRE_STICK,
+)
 from spyre_inference.custom_ops.linear import transpose_linear_weights_for_spyre
 from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
@@ -543,6 +548,75 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if n:
             logger.info("Spyre: patched %d Llama-4 attention-scale module(s) to CPU.", n)
 
+    @staticmethod
+    def _patch_pixtral_vision_rope() -> None:
+        """Run Pixtral's 2D vision RoPE ON-CARD via the slice-free 2x2 rotation.
+
+        transformers' `apply_rotary_pos_emb`/`rotate_half` half-slice the head dim
+        (`x[..., :d/2]` / `x[..., d/2:]`), which corrupts on Spyre — and it's a
+        plain module-level function, not a vLLM CustomOp, so `register_oot` can't
+        catch it. Pixtral's rope is the *same* neox structure the text decoder uses
+        (`q*cos + rotate_half(q)*sin`, with `cos/sin = cat([freqs, freqs])` so the
+        two head-dim halves match), so we reuse the text path's verified slice-free
+        `_rotate_neox_2x2`: build the small 2x2 rotation cache from `cos/sin` on CPU
+        (they're tiny and already CPU-fallback-produced by `PixtralRotaryEmbedding`),
+        move it to the device once, and apply the rotation to the large q/k ViT
+        activations ON SPYRE.
+
+        Monkeypatches the module-level name `PixtralHFAttention.forward` resolves at
+        call time; guarded/no-op if the symbol is absent (non-Pixtral / different
+        vLLM layout). Eager path; wrap in an opaque op if the vision tower must
+        compile. If a layout op raises on hardware, fall *that* call back to CPU —
+        do not revert the whole rope.
+        """
+        try:
+            from vllm.model_executor.models import pixtral
+        except ImportError:
+            return
+
+        orig = getattr(pixtral, "apply_rotary_pos_emb", None)
+        if orig is None or getattr(orig, "_spyre_patched", False):
+            return
+
+        def _build_rot(cos: torch.Tensor, sin: torch.Tensor, inner: int, padded: int):
+            """Small `cos/sin` ([patches, head_dim]) → 2x2 rotation cache
+            [patches, 2, 2, padded] on CPU. Mirrors `_get_rotation_cache`; the
+            sub-stick half-slice is CPU-only (Spyre-hostile) but the tensors are
+            tiny, and the large q/k rotation still runs on-card."""
+            cos_h = cos[..., :inner].to("cpu", torch.float16)
+            sin_h = sin[..., :inner].to("cpu", torch.float16)
+            rot = torch.stack([cos_h, -sin_h, sin_h, cos_h], dim=1).view(
+                cos_h.shape[0], 2, 2, inner
+            )
+            if padded != inner:
+                rot = torch.nn.functional.pad(rot, (0, padded - inner))
+            return rot
+
+        def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+            # q, k: [batch, n_heads, patches, head_dim]; cos/sin: [patches, head_dim].
+            dev = q.device
+            head_dim = q.shape[-1]
+            inner = head_dim // 2
+            padded = round_up(inner, _SPYRE_STICK)
+            rot = convert(
+                _build_rot(cos, sin, inner, padded), device=dev, dtype=torch.float16
+            )
+
+            def rotate(x):
+                b, h, p, d = x.shape
+                # token-first [patches, batch*n_heads, head_dim] for _rotate_neox_2x2
+                xt = x.permute(2, 0, 1, 3).reshape(p, b * h, d)
+                out = _rotate_neox_2x2(xt, rot, d)  # on Spyre
+                return out.view(p, b, h, d).permute(1, 2, 0, 3)
+
+            return rotate(q), rotate(k)
+
+        _apply_rotary_pos_emb._spyre_patched = True
+        pixtral.apply_rotary_pos_emb = _apply_rotary_pos_emb  # ty: ignore[invalid-assignment]
+        logger.info(
+            "Spyre: patched Pixtral vision apply_rotary_pos_emb to on-card 2x2 rotation."
+        )
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -614,6 +688,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Patch Llama-4 attention scaling per-instance — must be after load (real
         # modules exist) and before compile (OptimizedModule breaks traversal).
         self._patch_llama4_attn_scale()
+
+        # Pixtral vision 2D-RoPE on CPU (module-level monkeypatch; no-op for
+        # non-Pixtral models). Before compile like the llama-4 patch.
+        self._patch_pixtral_vision_rope()
 
         # Collect RoPE modules for _SpyreModelWrapper to prime (modules() dedupes
         # a shared instance by identity).
