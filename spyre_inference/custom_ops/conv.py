@@ -28,6 +28,8 @@ tuples are derived from tensor shapes (not hardcoded), so any out-channel count
 and variable image size are handled.
 """
 
+import time
+
 import torch
 import torch.nn.functional as F
 
@@ -111,8 +113,12 @@ class SpyreConv2d(Conv2dLayer):
 
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
+        logger.info("Spyre patch_conv: start in-shape=%s", tuple(x.shape))
+        t0 = time.perf_counter()
         # Place the input in its tiled layout via CPU (CPU->spyre is the tested
         # entry path; a device restickify would hit the same unsupported layout).
         x_cpu = x.to("cpu")
         x_dev = x_cpu.to("spyre", device_layout=_input_layout(x_cpu))
-        return self._conv(x_dev, self._weight_on_device(), self.bias)
+        out = self._conv(x_dev, self._weight_on_device(), self.bias)
+        logger.info("Spyre patch_conv: done (%.2fs)", time.perf_counter() - t0)
+        return out

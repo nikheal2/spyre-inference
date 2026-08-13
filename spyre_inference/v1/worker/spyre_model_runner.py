@@ -762,8 +762,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
 
         stick = 64
+        layer_counter = {"n": 0}
 
-        def _spyre_vision_sdpa(q, k, v, mask):
+        def _spyre_vision_sdpa(q, k, v, mask, layer):
             # q, k, v: [B, H, L, D] on device. Pad L,D to the stick, SDPA on-card, crop.
             b, h, seq, d = q.shape
             scale = d**-0.5
@@ -796,6 +797,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 m[:, :, :seq, :seq] = m[:, :, :seq, :seq] + add
 
             dev = q.device.type
+            logger.info(
+                "Spyre vision SDPA layer %d: start (B=%d H=%d Lpad=%d Dpad=%d)",
+                layer, b, h, seq_pad, d_pad,
+            )
+            t0 = time.perf_counter()
             out = torch.nn.functional.scaled_dot_product_attention(
                 convert(qb, dev),
                 convert(kb, dev),
@@ -804,10 +810,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 scale=scale,
             )
             out = convert(out, "cpu")[:, :, :seq, :d].contiguous()
+            logger.info(
+                "Spyre vision SDPA layer %d: done (%.2fs)", layer, time.perf_counter() - t0
+            )
             return convert(out, q.device.type)
 
         def _forward(self, x, mask, freqs_cis):
+            n = layer_counter["n"]
+            layer_counter["n"] = n + 1
             batch, patches, _ = x.shape
+            logger.info("Spyre vision attn layer %d: enter (patches=%d)", n, patches)
             qkv, _ = self.qkv_proj(x)
             q, k, v = qkv.chunk(3, dim=-1)
             q = q.reshape(batch, patches, self.n_heads, self.head_dim)
@@ -818,9 +830,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-            out = _spyre_vision_sdpa(q, k, v, mask)
+            out = _spyre_vision_sdpa(q, k, v, mask, n)
             out = out.transpose(1, 2).reshape(batch, patches, self.n_heads * self.head_dim)
             out, _ = self.o_proj(out)
+            logger.info("Spyre vision attn layer %d: done", n)
             return out
 
         _forward._spyre_patched = True
