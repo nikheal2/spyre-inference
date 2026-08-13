@@ -734,6 +734,102 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "rotation (index_select freqs gather + pair-swap matmul)."
         )
 
+    @staticmethod
+    def _patch_pixtral_vision_attention() -> None:
+        """Run the Pixtral vision `Attention` SDPA ON-CARD with stick-aligned padding.
+
+        Stock `Attention.forward` calls `nn.functional.scaled_dot_product_attention`
+        (pixtral.py:769), which torch-spyre lowers to two batch-matmuls. For a raw
+        patch count `L` that is coprime with the 64-wide stick, one operand can't be
+        restickified onto its matmul dim → `Unsupported: batchmatmul: cannot
+        restickify any input layout of y to carry y_var=...`.
+
+        Same fix as `SpyreEncoderAttentionImpl`: pad the sequence length (and head
+        dim) up to the 64 stick so both matmul reduction dims are stick-aligned,
+        assemble the padded dense batch + additive mask on CPU (strided
+        pad/slice/transpose are CPU-only on Spyre), run one SDPA on-device, then crop
+        back. Padded keys get `-inf` mask so they never contribute; padded queries
+        are cropped. Replaces `Attention.forward` (no xformers on Spyre); guarded and
+        idempotent.
+        """
+        try:
+            from vllm.model_executor.models import pixtral
+        except ImportError:
+            return
+
+        attn_cls = getattr(pixtral, "Attention", None)
+        if attn_cls is None or getattr(attn_cls.forward, "_spyre_patched", False):
+            return
+
+        stick = 64
+
+        def _spyre_vision_sdpa(q, k, v, mask):
+            # q, k, v: [B, H, L, D] on device. Pad L,D to the stick, SDPA on-card, crop.
+            b, h, seq, d = q.shape
+            scale = d**-0.5
+            seq_pad = ((seq + stick - 1) // stick) * stick
+            d_pad = ((d + stick - 1) // stick) * stick
+
+            qc = convert(q, "cpu")
+            kc = convert(k, "cpu")
+            vc = convert(v, "cpu")
+            dtype = qc.dtype
+
+            qb = torch.zeros(b, h, seq_pad, d_pad, dtype=dtype)
+            kb = torch.zeros(b, h, seq_pad, d_pad, dtype=dtype)
+            vb = torch.zeros(b, h, seq_pad, d_pad, dtype=dtype)
+            qb[:, :, :seq, :d] = qc
+            kb[:, :, :seq, :d] = kc
+            vb[:, :, :seq, :d] = vc
+
+            neg_inf = torch.finfo(dtype).min
+            m = torch.zeros(b, 1, seq_pad, seq_pad, dtype=dtype)
+            m[:, :, :, seq:] = neg_inf  # padded keys never attended
+            if mask is not None:
+                mc = convert(mask, "cpu")
+                if mc.dtype == torch.bool:
+                    add = torch.zeros(seq, seq, dtype=dtype).masked_fill(
+                        ~mc.reshape(seq, seq), neg_inf
+                    )
+                else:
+                    add = mc.to(dtype).reshape(seq, seq)
+                m[:, :, :seq, :seq] = m[:, :, :seq, :seq] + add
+
+            dev = q.device.type
+            out = torch.nn.functional.scaled_dot_product_attention(
+                convert(qb, dev),
+                convert(kb, dev),
+                convert(vb, dev),
+                attn_mask=convert(m, dev),
+                scale=scale,
+            )
+            out = convert(out, "cpu")[:, :, :seq, :d].contiguous()
+            return convert(out, q.device.type)
+
+        def _forward(self, x, mask, freqs_cis):
+            batch, patches, _ = x.shape
+            qkv, _ = self.qkv_proj(x)
+            q, k, v = qkv.chunk(3, dim=-1)
+            q = q.reshape(batch, patches, self.n_heads, self.head_dim)
+            k = k.reshape(batch, patches, self.n_heads, self.head_dim)
+            v = v.reshape(batch, patches, self.n_heads, self.head_dim)
+            q, k = pixtral.apply_rotary_emb_vit(q, k, freqs_cis=freqs_cis)
+            # [B, H, L, D] for SDPA.
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            out = _spyre_vision_sdpa(q, k, v, mask)
+            out = out.transpose(1, 2).reshape(batch, patches, self.n_heads * self.head_dim)
+            out, _ = self.o_proj(out)
+            return out
+
+        _forward._spyre_patched = True
+        attn_cls.forward = _forward  # ty: ignore[invalid-assignment]
+        logger.info(
+            "Spyre: patched Pixtral vision Attention to stick-aligned padded "
+            "on-card SDPA (pad L/D to 64, mask, crop)."
+        )
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -815,6 +911,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # rotation with an index_select gather. No-op for non-Pixtral / HF-Pixtral
         # models. Before compile like the other patches.
         self._patch_pixtral_vision_rope_vit()
+
+        # Pixtral vision attention: stock SDPA's batch-matmul can't restickify for
+        # coprime patch counts; run it on-card with sequence/head padded to the 64
+        # stick. No-op for non-Pixtral models. Before compile like the other patches.
+        self._patch_pixtral_vision_attention()
 
         # Collect RoPE modules for _SpyreModelWrapper to prime (modules() dedupes
         # a shared instance by identity).
