@@ -679,8 +679,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 self._width = width
 
             def __getitem__(self, idx):
-                row, col = idx  # positions[:, 0], positions[:, 1] — 1-D Spyre ints
-                flat = (row * self._width + col).to(torch.int64)
+                # idx = (positions[:, 0], positions[:, 1]): column *views* of the
+                # Spyre positions tensor. positions[:, 1] has storage_offset=1, and
+                # materializing that sliced view on-device needs a stick-aligned
+                # offset (1 is not). Fold the columns into a flat index on CPU (tiny,
+                # offset-free), then H2D just the contiguous index and gather on-card.
+                row, col = idx
+                flat = (row.to("cpu") * self._width + col.to("cpu")).to(torch.int64)
+                flat = convert(flat, device=self._table.device, dtype=torch.int64)
                 return self._table.index_select(0, flat)  # (seq, 2, head_dim)
 
         def _freqs_cis_ondev(self):
