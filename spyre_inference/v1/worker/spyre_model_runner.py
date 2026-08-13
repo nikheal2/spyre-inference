@@ -39,7 +39,6 @@ the CPU fallbacks will be obsolete and most operations will be performed on Spyr
 from __future__ import annotations
 
 import time
-import types
 from contextlib import contextmanager
 from functools import lru_cache
 
@@ -615,68 +614,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "rotate-half-matrix rotation."
         )
 
-    def _patch_pixtral_patch_conv(self) -> None:
-        """Run Pixtral's patch-embedding im2col ON THE HOST, matmul ON-CARD.
-
-        vLLM lowers the patch `Conv2d` (kernel==stride, no padding) to an
-        im2col + GEMM in `Conv2dLayer._forward_mulmat`:
-        `unfold → permute(0,2,3,1,4,5) → reshape(-1, C*K1*K2) → F.linear`.
-        The permute+reshape is an on-device gather whose source-stick
-        expression, for images whose patch grid has a dimension coprime with
-        the 64-wide stick, is `d4 + 2*Mod(7*d1, 32)` — a sub-stick (mod-32)
-        stride torch-spyre can't lay out ("Unexpected stick expression ...
-        expected Mod(var, 64)").
-
-        The im2col is pure reshuffling (no math), so do it on the host and H2D
-        the already-flattened `(num_patches, C*K1*K2)` tensor — `C*K1*K2 = 768
-        = 12*64` is stick-clean — then keep the heavy conv-as-matmul `F.linear`
-        ON SPYRE. Same trade as the vision-RoPE patch: layout-hostile shuffle on
-        CPU, big matmul on-card. Semantics identical: no extra/padded patches,
-        no attention-mask or token-count changes.
-
-        Per-instance rebind of the loaded model's patch conv(s); guarded/no-op
-        for non-Pixtral models (no `Conv2dLayer`) and idempotent.
-        """
-        try:
-            from vllm.model_executor.layers.conv import Conv2dLayer
-        except ImportError:
-            return
-
-        convs = [
-            m
-            for m in self.model.modules()
-            if isinstance(m, Conv2dLayer)
-            and getattr(m, "enable_linear", False)
-            and not getattr(m, "_spyre_host_im2col", False)
-        ]
-        if not convs:
-            return
-
-        def _forward_mulmat_host(self, x: torch.Tensor) -> torch.Tensor:
-            assert x.dim() == 4
-            dev = x.device
-            B, _, H, W = x.shape
-            K1, K2 = self.kernel_size
-            H, W = H // K1, W // K2
-            # im2col on the host: layout-only, no stick constraints there.
-            xc = x.to("cpu")
-            xc = xc.unfold(2, K1, K1).unfold(3, K2, K2)
-            xc = xc.permute(0, 2, 3, 1, 4, 5).reshape(-1, self.input_size)
-            # H2D the stick-clean (num_patches, C*K1*K2); GEMM stays on-card.
-            x = convert(xc, device=dev, dtype=x.dtype)
-            x = nn.functional.linear(
-                x, self.weight.view(self.out_channels, self.input_size), self.bias
-            )
-            return x.view(B, H, W, self.out_channels).permute(0, 3, 1, 2)
-
-        for c in convs:
-            c._forward_mulmat = types.MethodType(_forward_mulmat_host, c)
-            c._spyre_host_im2col = True
-        logger.info(
-            "Spyre: patched %d Pixtral patch-conv(s) to host im2col + on-card matmul.",
-            len(convs),
-        )
-
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -752,11 +689,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Pixtral vision 2D-RoPE on CPU (module-level monkeypatch; no-op for
         # non-Pixtral models). Before compile like the llama-4 patch.
         self._patch_pixtral_vision_rope()
-
-        # Pixtral patch-embedding im2col on CPU (per-instance; no-op for
-        # non-Pixtral models). The on-device unfold/permute/reshape produces a
-        # sub-stick gather torch-spyre can't lay out; the GEMM stays on-card.
-        self._patch_pixtral_patch_conv()
 
         # Collect RoPE modules for _SpyreModelWrapper to prime (modules() dedupes
         # a shared instance by identity).
