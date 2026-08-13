@@ -31,8 +31,6 @@ and variable image size are handled.
 import torch
 import torch.nn.functional as F
 
-from torch._inductor.exc import InductorError
-
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv2dLayer
 
@@ -86,7 +84,6 @@ class SpyreConv2d(Conv2dLayer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._w_dev: torch.Tensor | None = None
-        self._path_logged = False
         # Mirror SpyreSiluAndMul: compile the on-card conv unless the outer
         # graph is already being traced (then it captures the eager call).
         if not torch.compiler.is_dynamo_compiling():
@@ -112,48 +109,10 @@ class SpyreConv2d(Conv2dLayer):
             self._w_dev = w_cpu.to("spyre", device_layout=_weight_layout(w_cpu))
         return self._w_dev
 
-    def _log_path(self, msg: str, warn: bool = False) -> None:
-        if self._path_logged:
-            return
-        self._path_logged = True
-        (logger.warning if warn else logger.info)("Spyre conv2d: %s", msg)
-
-    def _forward_host_im2col(self, x: torch.Tensor) -> torch.Tensor:
-        """Layout-safe fallback: im2col + output reshape on host, GEMM on-card.
-
-        The layout-hostile unfold/permute/reshape and the output transpose run on
-        CPU (no stick constraints there); only the conv-as-matmul `F.linear` runs
-        on Spyre, and tensors cross the H2D entry path (which stickifies arbitrary
-        shapes) rather than an on-device restickify. `input_size = C*K1*K2` is a
-        multiple of the 64-wide stick, so the GEMM input lands stick-clean.
-        """
-        dev = x.device
-        b, _, h, w = x.shape
-        k1, k2 = self.kernel_size
-        ho, wo = h // k1, w // k2
-        xc = x.to("cpu")
-        xc = xc.unfold(2, k1, k1).unfold(3, k2, k2)
-        xc = xc.permute(0, 2, 3, 1, 4, 5).reshape(-1, self.input_size)
-        gemm = F.linear(
-            xc.to(dev),
-            self.weight.view(self.out_channels, self.input_size),
-            self.bias,
-        )
-        out = gemm.to("cpu").view(b, ho, wo, self.out_channels).permute(0, 3, 1, 2)
-        return out.contiguous().to(dev)
-
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
-        try:
-            # Place the input in its tiled layout via CPU (CPU->spyre is the tested
-            # entry path; a device restickify would hit the same bad layout).
-            x_cpu = x.to("cpu")
-            x_dev = x_cpu.to("spyre", device_layout=_input_layout(x_cpu))
-            out = self._conv(x_dev, self._weight_on_device(), self.bias)
-            self._log_path("native F.conv2d via SpyreTensorLayout")
-            return out
-        except InductorError as e:
-            # Native conv can't lay out this image (e.g. patch grid coprime with
-            # the stick). Fall back to the layout-safe host im2col + on-card GEMM.
-            self._log_path(f"host im2col fallback (native conv unsupported: {e})", warn=True)
-            return self._forward_host_im2col(x)
+        # Place the input in its tiled layout via CPU (CPU->spyre is the tested
+        # entry path; a device restickify would hit the same unsupported layout).
+        x_cpu = x.to("cpu")
+        x_dev = x_cpu.to("spyre", device_layout=_input_layout(x_cpu))
+        return self._conv(x_dev, self._weight_on_device(), self.bias)
