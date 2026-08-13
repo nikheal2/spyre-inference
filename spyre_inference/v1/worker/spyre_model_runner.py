@@ -616,34 +616,40 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @staticmethod
     def _patch_pixtral_vision_rope_vit() -> None:
-        """Run the mistral-native Pixtral `VisionTransformer` 2D-RoPE ON-CARD, real-valued.
+        """Run the mistral-native Pixtral `VisionTransformer` 2D-RoPE ON-CARD.
 
-        This `VisionTransformer` (mistral checkpoint format) uses a *complex* rope:
-        `freqs_cis` is a `complex64` table and `apply_rotary_emb_vit` does
-        `view_as_complex(q) * freqs_cis` then `view_as_real`. Spyre has no complex
-        dtype — `freqs_cis.to("spyre")` raises `does not support dtype ComplexFloat`,
-        and the complex multiply is unsupported. This is a *different* code path than
-        `apply_rotary_pos_emb` (handled by `_patch_pixtral_vision_rope`); that patch is
-        a no-op for this model.
+        This `VisionTransformer` (mistral checkpoint format) has a *complex* rope
+        whose `forward` also gathers per-token freqs with advanced indexing. Three
+        Spyre-hostile steps, hit in this order as each was cleared:
 
-        The complex product `(x0 + i·x1)(cos + i·sin)` is the real rotation of each
-        interleaved pair: `out0 = x0·cos - x1·sin`, `out1 = x0·sin + x1·cos`. We realize
-        it as `x·cos_full + (x @ P)·sin_signed`, where `P` is a constant
-        `[head_dim, head_dim]` pair-swap matrix (a full-stick-width matmul, no sub-stick
-        slice) and `cos_full`/`sin_signed` expand the per-pair cos/sin to the full head
-        dim with the `-/+` sign pattern. Same on-card trade as `_rotate_half_matrix`.
+        1. `freqs_cis.to("spyre")` — `freqs_cis` is `complex64`; Spyre has no complex
+           dtype → `RuntimeError: Spyre backend does not support dtype ComplexFloat`.
+        2. `freqs_cis[positions[:, 0], positions[:, 1]]` (pixtral.py:949) — advanced
+           index on a Spyre tensor → `NotImplementedError: Could not run
+           'aten::index.Tensor_out' ... from the 'spyre' backend`.
+        3. `view_as_complex(q) * freqs_cis` in `apply_rotary_emb_vit` — complex math,
+           unsupported on Spyre.
 
-        Two module-level monkeypatches (guarded/no-op if the symbols are absent):
-        `VisionTransformer.freqs_cis` (build the real cos/sin table on CPU; keep it real
-        on-device) and `apply_rotary_emb_vit` (the real rotation on the q/k activations).
+        All three run on-card by (a) representing the rope as a *real* rotation and
+        (b) doing the 2-D gather as a 1-D `aten::index_select` (which Spyre supports,
+        unlike `aten::index`) on a flattened table:
 
-        CPU-rotary fallback (documented, not enabled): if the on-card path ever proves
-        infeasible (e.g. the per-token `freqs_cis` gather or the pair-swap matmul can't
-        lay out), replace `_apply_rotary_emb_vit` with a version that D2H's `xq`/`xk`,
-        runs the *original* complex `view_as_complex → *freqs_cis → view_as_real` on CPU
-        (with `freqs_cis` kept complex on CPU), then H2D's the result — correctness-safe
-        but a D2H/H2D per vision attention layer. Keep the freqs table complex-on-CPU in
-        that mode and make `positions` CPU for the gather.
+        - `VisionTransformer.freqs_cis` builds a real `(H, W, 2, head_dim)` table on
+          CPU (`[...,0,:]=cos_full`, `[...,1,:]=sin_signed`), flattens it to
+          `(H*W, 2, head_dim)` and moves the *real* tensor to Spyre (fixes 1). It
+          returns a wrapper whose `__getitem__` turns `(row, col)` into a flat index
+          `row*W + col` and gathers with `index_select` on-card (fixes 2).
+        - `apply_rotary_emb_vit` is the real rotation `x·cos + (x @ P)·sin`, with `P`
+          a constant `[head_dim, head_dim]` pair-swap matrix — a full-stick-width
+          matmul, no sub-stick slice, no complex (fixes 3). Same trade as
+          `_rotate_half_matrix`.
+
+        CPU-rotary fallback (documented, not enabled): if `index_select` / the flat
+        index / the pair-swap matmul ever fail to lay out, keep the freqs table
+        *complex on CPU*, have the wrapper move the Spyre indices to CPU and gather
+        there, and replace the rotation with a version that D2H's q/k, runs the
+        original `view_as_complex → *freqs_cis → view_as_real` on CPU, and H2D's the
+        result — correctness-safe but a D2H/H2D per vision attention layer.
         """
         try:
             from vllm.model_executor.models import pixtral
@@ -664,10 +670,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
             p[even + 1, even] = 1.0
             return convert(p, device=device, dtype=torch.float16)
 
-        def _freqs_cis_real(self):
-            # Real (H, W, 2, head_dim) table: [..., 0, :]=cos_full, [..., 1, :]=sin_signed.
-            # Complex precompute on CPU; store real so neither the device move nor the
-            # on-card rope ever touches a complex tensor.
+        class _OnCardFreqsTable:
+            """Flattened real freqs table on Spyre; gathers per-token rows on-card
+            via `index_select` (a 1-D flat index), avoiding `aten::index`."""
+
+            def __init__(self, table: torch.Tensor, width: int):
+                self._table = table  # (H*W, 2, head_dim) on Spyre
+                self._width = width
+
+            def __getitem__(self, idx):
+                row, col = idx  # positions[:, 0], positions[:, 1] — 1-D Spyre ints
+                flat = (row * self._width + col).to(torch.int64)
+                return self._table.index_select(0, flat)  # (seq, 2, head_dim)
+
+        def _freqs_cis_ondev(self):
+            # Real packed table [..., 0, :]=cos_full, [..., 1, :]=sin_signed, flattened
+            # to (H*W, 2, head_dim). Complex precompute on CPU; store real so neither
+            # the device move nor the on-card rope touches a complex tensor.
             if self._freqs_cis is None:
                 fc = pixtral.precompute_freqs_cis_2d(
                     dim=self.args.hidden_size // self.args.num_attention_heads,
@@ -679,16 +698,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 sin = fc.imag
                 cos_full = cos.repeat_interleave(2, dim=-1)
                 sin_signed = torch.stack([-sin, sin], dim=-1).reshape(*sin.shape[:-1], -1)
-                self._freqs_cis = torch.stack([cos_full, sin_signed], dim=-2).to(torch.float16)
+                packed = torch.stack([cos_full, sin_signed], dim=-2)  # (H, W, 2, head_dim)
+                self._freqs_cis = packed.reshape(
+                    -1, packed.shape[-2], packed.shape[-1]
+                ).to(torch.float16)  # (H*W, 2, head_dim) on CPU
             if self._freqs_cis.device != self.device:
                 self._freqs_cis = convert(
                     self._freqs_cis, device=self.device, dtype=torch.float16
                 )
-            return self._freqs_cis
+            return _OnCardFreqsTable(self._freqs_cis, self.max_patches_per_side)
 
         def _apply_rotary_emb_vit(xq, xk, freqs_cis):
-            # xq, xk: [batch, patches, n_heads, head_dim].
-            # freqs_cis: real [patches, 2, head_dim] on device (gathered per token).
+            # xq, xk: [batch, patches, n_heads, head_dim] on Spyre.
+            # freqs_cis: real [patches, 2, head_dim] on Spyre (gathered per token).
             p = _pair_swap_matrix(xq.shape[-1], xq.device)
             cos = freqs_cis[:, 0, :][None, :, None, :]  # [1, patches, 1, head_dim]
             sin = freqs_cis[:, 1, :][None, :, None, :]
@@ -700,10 +722,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         _apply_rotary_emb_vit._spyre_patched = True
         pixtral.apply_rotary_emb_vit = _apply_rotary_emb_vit  # ty: ignore[invalid-assignment]
-        vt.freqs_cis = property(_freqs_cis_real)  # ty: ignore[invalid-assignment]
+        vt.freqs_cis = property(_freqs_cis_ondev)  # ty: ignore[invalid-assignment]
         logger.info(
-            "Spyre: patched Pixtral VisionTransformer complex 2D-RoPE to on-card "
-            "real pair-rotation (apply_rotary_emb_vit + freqs_cis)."
+            "Spyre: patched Pixtral VisionTransformer 2D-RoPE to on-card real "
+            "rotation (index_select freqs gather + pair-swap matmul)."
         )
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
@@ -782,9 +804,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # non-Pixtral models). Before compile like the llama-4 patch.
         self._patch_pixtral_vision_rope()
 
-        # Mistral-native Pixtral VisionTransformer uses a complex 2D-RoPE that
-        # Spyre can't hold; patch it to an on-card real pair-rotation. No-op for
-        # non-Pixtral / HF-Pixtral models. Before compile like the other patches.
+        # Mistral-native Pixtral VisionTransformer uses a complex 2D-RoPE (plus an
+        # aten::index freqs gather) that Spyre can't run; patch it to an on-card real
+        # rotation with an index_select gather. No-op for non-Pixtral / HF-Pixtral
+        # models. Before compile like the other patches.
         self._patch_pixtral_vision_rope_vit()
 
         # Collect RoPE modules for _SpyreModelWrapper to prime (modules() dedupes
