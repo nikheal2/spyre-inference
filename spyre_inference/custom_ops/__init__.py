@@ -38,3 +38,13 @@ def register_all():
     rotary_embedding.register()
     utils.register()
     vocab_parallel_embedding.register()
+
+    # Confirm the decorator-at-import OOT registrations actually took effect in
+    # this process (e.g. SpyreConv2d for the Pixtral vision patch conv). If this
+    # logs False, CustomOp.__new__ will fall back to the in-tree layer.
+    from vllm.model_executor.custom_op import op_registry_oot
+
+    logger.info(
+        "spyre_inference OOT ops registered: Conv2dLayer=%s",
+        "Conv2dLayer" in op_registry_oot,
+    )
