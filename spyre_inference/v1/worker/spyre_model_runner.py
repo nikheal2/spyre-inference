@@ -853,6 +853,40 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "on-card SDPA (pad L/D to 64, mask, crop)."
         )
 
+    def _offload_pixtral_projector_norm_cpu(self) -> None:
+        """Run Pixtral's `pre_mm_projector_norm` (RMSNorm) on CPU.
+
+        The projector norm reduces over the last dim of the (N_patches, D) vision
+        features; on-device that reduction + restickify stalls torch-spyre's compile
+        for these shapes. It runs once per image and is tiny, so offload just this
+        instance: move its weight to CPU, D2H the input, H2D the output. The on-card
+        `SpyreRMSNorm` used by the text decoder is unaffected. No-op if absent.
+        """
+        dev = self._spyre_device
+        for module_name, module in self.model.named_modules():
+            if module_name.rsplit(".", 1)[-1] != "pre_mm_projector_norm":
+                continue
+            module.to("cpu")
+
+            def _to_cpu(mod, args):
+                return tuple(
+                    a.to("cpu") if isinstance(a, torch.Tensor) else a for a in args
+                )
+
+            def _to_dev(mod, args, output, _dev=dev):
+                if isinstance(output, tuple):
+                    return tuple(
+                        convert(o, device=_dev) if isinstance(o, torch.Tensor) else o
+                        for o in output
+                    )
+                return convert(output, device=_dev)
+
+            module.register_forward_pre_hook(_to_cpu)
+            module.register_forward_hook(_to_dev)
+            logger.info(
+                "Spyre: %s offloaded to CPU (D2H in / H2D out)", module_name
+            )
+
     def _instrument_pixtral_projector(self) -> None:
         """Time the post-encoder projector stages via forward hooks (diagnostic).
 
@@ -973,6 +1007,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Diagnostic: time the post-encoder projector stages (patch_merger etc.) to
         # localize the vision stall. Non-invasive forward hooks; safe to remove.
         self._instrument_pixtral_projector()
+
+        # The projector RMSNorm's on-device reduction stalls compile for the vision
+        # feature shape; run it on CPU (tiny, once per image).
+        self._offload_pixtral_projector_norm_cpu()
 
         # Collect RoPE modules for _SpyreModelWrapper to prime (modules() dedupes
         # a shared instance by identity).
