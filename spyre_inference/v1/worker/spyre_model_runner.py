@@ -887,6 +887,37 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "Spyre: %s offloaded to CPU (D2H in / H2D out)", module_name
             )
 
+    @staticmethod
+    def _patch_pixtral_patch_merger() -> None:
+        """Run Pixtral `PatchMerger.permute` (spatial 2x2 regroup) on CPU.
+
+        `PatchMerger.permute` -> `get_sub_grids` uses `F.unfold` (`aten::im2col`),
+        unsupported on Spyre (`NotImplementedError: Could not run 'aten::im2col'`).
+        The regroup is pure reshuffling and runs once per image, so do it on CPU;
+        H2D the result so the `merging_layer` GEMM still runs on-card (unchanged, so
+        the Spyre-transposed linear weight is untouched). Guarded/no-op if absent.
+        """
+        try:
+            from vllm.model_executor.models import pixtral
+        except ImportError:
+            return
+
+        pm_cls = getattr(pixtral, "PatchMerger", None)
+        if pm_cls is None or getattr(pm_cls.forward, "_spyre_patched", False):
+            return
+
+        def _forward(self, x, image_sizes):
+            dev = x.device
+            x_perm = self.permute(x.to("cpu"), image_sizes)  # unfold on CPU
+            return self.merging_layer(convert(x_perm, device=dev))  # GEMM on-card
+
+        _forward._spyre_patched = True
+        pm_cls.forward = _forward  # ty: ignore[invalid-assignment]
+        logger.info(
+            "Spyre: patched Pixtral PatchMerger permute to CPU (merging_layer GEMM "
+            "stays on-card)."
+        )
+
     def _instrument_pixtral_projector(self) -> None:
         """Time the post-encoder projector stages via forward hooks (diagnostic).
 
@@ -1011,6 +1042,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # The projector RMSNorm's on-device reduction stalls compile for the vision
         # feature shape; run it on CPU (tiny, once per image).
         self._offload_pixtral_projector_norm_cpu()
+
+        # PatchMerger's spatial regroup uses aten::im2col (unsupported on Spyre);
+        # run the reshuffle on CPU, keep the merging GEMM on-card.
+        self._patch_pixtral_patch_merger()
 
         # Collect RoPE modules for _SpyreModelWrapper to prime (modules() dedupes
         # a shared instance by identity).
