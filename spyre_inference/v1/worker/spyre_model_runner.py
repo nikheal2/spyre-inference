@@ -354,7 +354,11 @@ class _SpyreModelWrapper:
             return t
 
         kwargs = tree_map(_to_spyre_float, kwargs)
-        return self._model.embed_multimodal(**kwargs)
+        logger.info("Spyre embed_multimodal: start")
+        t0 = time.perf_counter()
+        out = self._model.embed_multimodal(**kwargs)
+        logger.info("Spyre embed_multimodal: done (%.2fs)", time.perf_counter() - t0)
+        return out
 
     def embed_input_ids(
         self,
@@ -380,10 +384,15 @@ class _SpyreModelWrapper:
           vocab_size), so the placeholder tokens embed without an OOV masked
           fill; they are overwritten by the merge regardless.
         """
+        logger.info(
+            "Spyre embed_input_ids: start (mm=%s)",
+            multimodal_embeddings is not None and len(multimodal_embeddings) > 0,
+        )
         input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
         inputs_embeds = self._model.embed_input_ids(input_ids)
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            logger.info("Spyre embed_input_ids: done (text-only)")
             return inputs_embeds
 
         from vllm.model_executor.models.utils import _merge_multimodal_embeddings
@@ -398,6 +407,7 @@ class _SpyreModelWrapper:
             multimodal_embeddings=mm_embeds_cpu,
             is_multimodal=is_multimodal.to("cpu"),
         )
+        logger.info("Spyre embed_input_ids: done (merged mm)")
         return convert(merged, device=self._spyre_device)
 
     def compute_logits(self, hidden_states, *args, **kwargs):
@@ -843,6 +853,36 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "on-card SDPA (pad L/D to 64, mask, crop)."
         )
 
+    def _instrument_pixtral_projector(self) -> None:
+        """Time the post-encoder projector stages via forward hooks (diagnostic).
+
+        All 24 vision attention layers complete before the stall, so it lives in
+        `_process_image_input`'s projector (`pre_mm_projector_norm`, `patch_merger`,
+        `vision_language_adapter`) or later in the decoder. Hook those submodules by
+        attribute-name suffix so the log names the stalling stage. No-op if absent.
+        """
+        names = ("pre_mm_projector_norm", "patch_merger", "vision_language_adapter")
+        for module_name, module in self.model.named_modules():
+            leaf = module_name.rsplit(".", 1)[-1]
+            if leaf not in names:
+                continue
+            timer: dict[str, float] = {}
+
+            def _pre(mod, args, _leaf=leaf, _timer=timer):
+                logger.info("Spyre projector %s: enter", _leaf)
+                _timer["t0"] = time.perf_counter()
+
+            def _post(mod, args, output, _leaf=leaf, _timer=timer):
+                logger.info(
+                    "Spyre projector %s: done (%.2fs)",
+                    _leaf,
+                    time.perf_counter() - _timer.get("t0", time.perf_counter()),
+                )
+
+            module.register_forward_pre_hook(_pre)
+            module.register_forward_hook(_post)
+            logger.info("Spyre: instrumented projector stage %s", module_name)
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -929,6 +969,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # coprime patch counts; run it on-card with sequence/head padded to the 64
         # stick. No-op for non-Pixtral models. Before compile like the other patches.
         self._patch_pixtral_vision_attention()
+
+        # Diagnostic: time the post-encoder projector stages (patch_merger etc.) to
+        # localize the vision stall. Non-invasive forward hooks; safe to remove.
+        self._instrument_pixtral_projector()
 
         # Collect RoPE modules for _SpyreModelWrapper to prime (modules() dedupes
         # a shared instance by identity).
