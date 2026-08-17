@@ -15,7 +15,9 @@
 """Spyre OOT replacement for RMSNorm.
 
 Spyre constraints:
-    - No dtype promotion to float32 (not yet supported in torch-spyre)
+    - Dtype-changing ops (fp16->fp32) are not registered as Spyre kernels
+      (see torch_spyre/ops/eager.py), so the fp32 promotion is done on CPU and
+      the result copied back to Spyre.
 
 References:
     - Upstream RMSNorm: vllm/model_executor/layers/layernorm.py
@@ -25,6 +27,8 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
+
+from .utils import convert
 
 logger = init_logger(__name__)
 
@@ -43,21 +47,24 @@ class SpyreRMSNorm(RMSNorm):
         if self.variance_size_override is not None:
             raise NotImplementedError("TODO: variance_size_override not yet implemented")
 
-        # fp32 promotion, matching upstream RMSNorm: Spyre supports fp32 casting
-        # on-device, so do the residual add + variance + rsqrt in fp32 to avoid
-        # fp16 overflow of x**2 / precision loss in the residual add when the
-        # residual stream is large. All on-device (no CPU round-trip) → also
-        # compile-safe. The residual is stored back in the input dtype (fp16).
+        # fp32 promotion, matching upstream RMSNorm: promote to fp32 for the
+        # residual add + variance + rsqrt to avoid fp16 overflow of x**2 /
+        # precision loss in the residual add when the residual stream is large.
+        # torch-spyre does not register dtype-changing ops as Spyre kernels
+        # (see torch_spyre/ops/eager.py), so the fp32 math runs on CPU and the
+        # result is copied back to Spyre as fp16. The residual is stored back in
+        # the input dtype (fp16) on-device.
         orig_dtype = x.dtype
-        x = x.to(torch.float32)
+        device = x.device
+        x = convert(x, device="cpu", dtype=torch.float32)
 
         if residual is not None:
-            x = x + residual.to(torch.float32)
-            residual = x.to(orig_dtype)
+            x = x + convert(residual, device="cpu", dtype=torch.float32)
+            residual = convert(x, device=device, dtype=orig_dtype)
 
         variance = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
-        x = x.to(orig_dtype)
+        x = convert(x, device=device, dtype=orig_dtype)
 
         if self.has_weight:
             x = x * self.weight
