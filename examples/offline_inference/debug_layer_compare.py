@@ -264,7 +264,20 @@ def run_hf_cpu(args, input_ids: torch.Tensor) -> dict:
                 lm(input_ids=ids)
     finally:
         ARMED["on"] = False
-    return store
+
+    # Extract the target layer's MLP weights (values match Spyre's checkpoint) so the
+    # op-locality test can recompute each op's reference from Spyre's OWN input.
+    weights = {}
+    try:
+        layers = _find_decoder_layers(model)
+        mlp = layers[TARGET_LAYER["i"]].mlp
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            w = getattr(getattr(mlp, name, None), "weight", None)
+            if isinstance(w, torch.Tensor):
+                weights[name] = w.detach().to("cpu").float()
+    except Exception as e:  # noqa: BLE001 - best-effort; op-locality test is optional
+        print(f"[debug] could not extract layer-{TARGET_LAYER['i']} MLP weights: {e}")
+    return store, weights
 
 
 # --------------------------------------------------------------------------- #
@@ -389,7 +402,53 @@ def compare_mlp_internal(spyre: dict, hf: dict) -> None:
     print("Read top-down: the FIRST op whose diff is large is where the overshoot enters "
           "(down large but swiglu small → down_proj; swiglu already large → gate_up/silu).")
     print("Caveat: live MLP inputs differ slightly (Spyre vs HF), so this is a strong hint; "
-          "for proof feed HF's captured mlp_in identically into the Spyre op path.")
+          "the op-locality test below is the decisive isolation.")
+
+
+def test_mlp_op_locality(spyre: dict, weights: dict) -> None:
+    """DECISIVE op isolation: recompute each MLP op's CPU reference from Spyre's OWN
+    captured input (fp32 accumulation, as torch/HF does) using the real weights, and
+    compare to Spyre's captured output. A mismatch means THAT op is locally unfaithful
+    (isolates it); a match means the op is fine and only propagating a wrong input.
+    """
+    import torch.nn.functional as F
+
+    def sg(name):
+        return spyre.get(("mlp_int", name))
+
+    mlp_in = spyre.get((TARGET_LAYER["i"], "mlp_in"))
+    s_gate_up, s_act, s_down = sg("gate_up_proj"), sg("act_fn"), sg("down_proj")
+    Wg, Wu, Wd = weights.get("gate_proj"), weights.get("up_proj"), weights.get("down_proj")
+
+    if mlp_in is None or Wg is None or Wu is None or Wd is None:
+        print(f"\n[op-locality] missing Spyre mlp_in or HF weights for layer "
+              f"{TARGET_LAYER['i']} — skipping op-locality test.")
+        return
+
+    print(f"\n--- MLP op-locality, layer {TARGET_LAYER['i']} "
+          "(Spyre op output vs CPU-ref from Spyre's OWN input; fp32 accumulate) ---")
+    print(f"{'op':>14} {'max_abs':>12} {'mean_abs':>12} {'rel':>8}   worst-coord + values")
+
+    x = mlp_in.float()  # [T, hidden], Spyre's own MLP input
+    # gate_up: ref = x @ cat(Wg, Wu).T  ->  [T, 2*inter], order [gate, up].
+    if s_gate_up is not None:
+        ref_gate_up = x @ torch.cat([Wg, Wu], dim=0).t()
+        _report_mlp("gate_up", s_gate_up, ref_gate_up)
+    # swiglu: ref = silu(gate)*up computed from Spyre's OWN gate_up (isolates SiluAndMul).
+    if s_act is not None and s_gate_up is not None:
+        gu = s_gate_up.float()
+        inter = gu.shape[-1] // 2
+        ref_act = F.silu(gu[..., :inter]) * gu[..., inter:]
+        _report_mlp("swiglu(act)", s_act, ref_act)
+    # down: ref = (Spyre's OWN swiglu) @ Wd.T  (isolates down_proj) -> inspect dim 4000.
+    if s_down is not None and s_act is not None:
+        ref_down = s_act.float() @ Wd.t()
+        _report_mlp("down", s_down, ref_down)
+
+    print("===============================================================")
+    print("A large diff here = that op is LOCALLY wrong on Spyre (bug isolated). Small diff "
+          "everywhere = ops are faithful; the divergence is inherited from upstream (RMSNorm "
+          "/ residual) — walk this test back through post_attention_layernorm & layer 0.")
 
 
 def main():
@@ -433,14 +492,19 @@ def main():
     print(f"[debug] captured {sum(isinstance(k, tuple) for k in spyre)} Spyre boundaries")
 
     print("[debug] === RUN 1: HuggingFace on CPU (reference) ===")
-    hf = run_hf_cpu(args, spyre["input_ids"])
+    hf, mlp_weights = run_hf_cpu(args, spyre["input_ids"])
     print(f"[debug] captured {sum(isinstance(k, tuple) for k in hf)} HF boundaries")
 
     compare(spyre, hf)
     compare_mlp_internal(spyre, hf)
+    test_mlp_op_locality(spyre, mlp_weights)
 
     if args.dump:
-        torch.save({"spyre": spyre, "hf": hf, "input_ids": spyre.get("input_ids")}, args.dump)
+        torch.save(
+            {"spyre": spyre, "hf": hf, "mlp_weights": mlp_weights,
+             "input_ids": spyre.get("input_ids")},
+            args.dump,
+        )
         print(f"\n[debug] saved captured tensors to {args.dump}")
 
 
