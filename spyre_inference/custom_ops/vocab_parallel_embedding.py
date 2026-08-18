@@ -15,16 +15,18 @@
 """Spyre OOT replacement for VocabParallelEmbedding.
 
 Spyre constraints:
-    - torch-spyre compiles ops with a static device output buffer, so an on-device
-      result returned directly aliases a shared pool that the next same-shape op
-      overwrites (see custom_ops/linear.py `spyre_linear_t`). The embedding output
-      is held as the decoder layer's residual for the whole layer, so it must be
-      DMA'd into a dedicated buffer via a Spyre->CPU->Spyre round-trip before use.
+    - torch-spyre's on-device embedding gather returns numerically wrong values
+      (empirically: forcing the gather to CPU yields coherent output, running it
+      on-device — even after DMA-ing the result to a fresh buffer — is garbage).
+      So the gather runs on CPU from a cached CPU copy of the weight and only the
+      small [tokens, hidden] result is copied to Spyre, mirroring the CPU detours
+      in rms_norm.py and the pixtral rope patch.
 """
 
 from functools import lru_cache
 
 import torch
+import torch.nn.functional as F
 
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
@@ -51,6 +53,8 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
+        # Lazily-cached CPU copy of the weight for the CPU gather (see forward).
+        self._cpu_weight = None
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
@@ -73,20 +77,20 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             masked_input = input_
             keep = None
 
-        output = self.quant_method.embedding(self, masked_input.long())
+        # torch-spyre's on-device embedding gather returns wrong values for this model
+        # (proven: forcing the gather to CPU is coherent; on-device — even after DMA-ing
+        # the result to a fresh buffer — is garbage). Gather on CPU from a cached CPU copy
+        # of the weight; only the small [tokens, hidden] result crosses back to Spyre.
+        if self._cpu_weight is None:
+            self._cpu_weight = self.weight.data.detach().to("cpu")
+            logger.info("SpyreVocabParallelEmbedding: gathering on CPU (on-device gather is wrong)")
+        ids = convert(masked_input, device="cpu").long()
+        output = F.embedding(ids, self._cpu_weight)
+        output = convert(output, device=input_.device)
 
         if keep is not None:
             output = output * keep
             output = tensor_model_parallel_all_reduce(output)
-
-        # torch-spyre compiles the gather with a static output buffer; returning it
-        # directly aliases the shared pool and a later same-shape op overwrites it —
-        # and this output is held as the decoder layer's residual for the whole layer.
-        # Round-trip through CPU to land in a dedicated buffer (same fix as
-        # spyre_linear_t in custom_ops/linear.py).
-        device = output.device
-        output = convert(output, device="cpu")
-        output = convert(output, device=device)
         return output
 
 
