@@ -338,7 +338,9 @@ def _make_cpu_layer_forward(d: dict, layer_idx: int, spyre_device):
         normed = x * torch.rsqrt(var + d["eps"]) * weight
         return normed, residual
 
-    def fwd(positions, hidden_states, residual):
+    def fwd(positions, hidden_states, residual=None, *args, **kwargs):
+        # Absorb any extra args this vLLM version threads through the decoder layer
+        # (e.g. t_cond); the CPU reimplementation only needs the first three.
         pos = positions.detach().to("cpu").long().flatten()
         h = hidden_states.detach().to("cpu").float()
         r = None if residual is None else residual.detach().to("cpu").float()
