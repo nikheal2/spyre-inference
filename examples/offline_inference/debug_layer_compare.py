@@ -150,6 +150,19 @@ def _install_hooks(top_model: nn.Module, store: dict) -> None:
 
         return pre_hook
 
+    def make_norm_input_capture(prefix):
+        # RMSNorm.forward(x, residual=None) — capture both so we can recompute the
+        # norm from Spyre's OWN input. vLLM passes (hidden, residual); HF passes (hidden,).
+        def pre_hook(module, args):
+            if not ARMED["on"] or store["done"]:
+                return
+            if args and isinstance(args[0], torch.Tensor):
+                store[(prefix, "h")] = _snap(args[0])
+            if len(args) > 1 and isinstance(args[1], torch.Tensor):
+                store[(prefix, "r")] = _snap(args[1])
+
+        return pre_hook
+
     for i, layer in enumerate(layers):
         layer.register_forward_hook(make_capture((i, "layer"), full_stream=True))
         for name in SUBMODULES:
@@ -161,13 +174,18 @@ def _install_hooks(top_model: nn.Module, store: dict) -> None:
         mlp = getattr(layer, "mlp", None)
         if isinstance(mlp, nn.Module):
             mlp.register_forward_pre_hook(make_input_capture((i, "mlp_in")))
-            # On the target layer, break the MLP down to its op-level children so we
-            # can attribute the massive-activation overshoot to gate_up / silu / down.
-            if i == TARGET_LAYER["i"]:
+        # On the target layer, break the MLP down to its op-level children and capture
+        # the RMSNorm inputs, so op-locality can isolate gate_up/silu/down AND the norms.
+        if i == TARGET_LAYER["i"]:
+            if isinstance(mlp, nn.Module):
                 for name in MLP_CHILDREN:
                     child = getattr(mlp, name, None)
                     if isinstance(child, nn.Module):
                         child.register_forward_hook(make_capture(("mlp_int", name)))
+            for name in ("input_layernorm", "post_attention_layernorm"):
+                norm = getattr(layer, name, None)
+                if isinstance(norm, nn.Module):
+                    norm.register_forward_pre_hook(make_norm_input_capture(("norm_in", name)))
 
     def done_hook(module, args, out):
         # Fires after the full model forward; latch so decode steps aren't captured.
@@ -265,18 +283,25 @@ def run_hf_cpu(args, input_ids: torch.Tensor) -> dict:
     finally:
         ARMED["on"] = False
 
-    # Extract the target layer's MLP weights (values match Spyre's checkpoint) so the
-    # op-locality test can recompute each op's reference from Spyre's OWN input.
+    # Extract the target layer's MLP + RMSNorm weights (values match Spyre's checkpoint)
+    # and the rms eps, so op-locality can recompute each op from Spyre's OWN input.
     weights = {}
     try:
         layers = _find_decoder_layers(model)
-        mlp = layers[TARGET_LAYER["i"]].mlp
+        layer = layers[TARGET_LAYER["i"]]
         for name in ("gate_proj", "up_proj", "down_proj"):
-            w = getattr(getattr(mlp, name, None), "weight", None)
+            w = getattr(getattr(layer.mlp, name, None), "weight", None)
             if isinstance(w, torch.Tensor):
                 weights[name] = w.detach().to("cpu").float()
+        for name in ("input_layernorm", "post_attention_layernorm"):
+            w = getattr(getattr(layer, name, None), "weight", None)
+            if isinstance(w, torch.Tensor):
+                weights[name] = w.detach().to("cpu").float()
+        cfg = getattr(model, "config", None)
+        tcfg = getattr(cfg, "text_config", cfg)
+        weights["rms_eps"] = float(getattr(tcfg, "rms_norm_eps", 1e-5))
     except Exception as e:  # noqa: BLE001 - best-effort; op-locality test is optional
-        print(f"[debug] could not extract layer-{TARGET_LAYER['i']} MLP weights: {e}")
+        print(f"[debug] could not extract layer-{TARGET_LAYER['i']} weights: {e}")
     return store, weights
 
 
@@ -448,7 +473,39 @@ def test_mlp_op_locality(spyre: dict, weights: dict) -> None:
     print("===============================================================")
     print("A large diff here = that op is LOCALLY wrong on Spyre (bug isolated). Small diff "
           "everywhere = ops are faithful; the divergence is inherited from upstream (RMSNorm "
-          "/ residual) — walk this test back through post_attention_layernorm & layer 0.")
+          "/ residual) — see the RMSNorm op-locality below.")
+
+
+def test_rmsnorm_op_locality(spyre: dict, weights: dict) -> None:
+    """Op-locality for the two RMSNorms at the target layer: recompute the norm from
+    Spyre's OWN captured input (added = hidden + residual, fp32) using the real weight
+    + eps, and compare to Spyre's captured normed output. Isolates SpyreRMSNorm from
+    the value it was fed. (vLLM fuses residual-add into RMSNorm; we replicate it.)
+    """
+    eps = weights.get("rms_eps", 1e-5)
+    i = TARGET_LAYER["i"]
+    printed_header = False
+    for name in ("input_layernorm", "post_attention_layernorm"):
+        h = spyre.get(("norm_in", name, "h"))
+        r = spyre.get(("norm_in", name, "r"))
+        w = weights.get(name)
+        out = spyre.get((i, name))  # Spyre's captured normed output (out[0])
+        if h is None or w is None or out is None:
+            continue
+        added = h.float() if r is None else h.float() + r.float()
+        var = added.pow(2).mean(dim=-1, keepdim=True)
+        ref = added * torch.rsqrt(var + eps) * w.float()
+        if not printed_header:
+            print(f"\n--- RMSNorm op-locality, layer {i} "
+                  "(Spyre normed vs CPU-ref from Spyre's OWN input; fp32) ---")
+            print(f"{'op':>26} {'max_abs':>12} {'mean_abs':>12} {'rel':>8}   worst-coord + values")
+            printed_header = True
+        _report_mlp(name, out, ref)
+    if printed_header:
+        print("===============================================================")
+        print("Large diff = SpyreRMSNorm is locally wrong (the op we recently changed to "
+              "fp32-on-CPU). Small diff = RMSNorm faithful → the wrong value comes from its "
+              "input (attention output / incoming residual) — walk back to attention / layer 0.")
 
 
 def main():
@@ -498,6 +555,7 @@ def main():
     compare(spyre, hf)
     compare_mlp_internal(spyre, hf)
     test_mlp_op_locality(spyre, mlp_weights)
+    test_rmsnorm_op_locality(spyre, mlp_weights)
 
     if args.dump:
         torch.save(
