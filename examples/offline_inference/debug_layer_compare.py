@@ -247,16 +247,37 @@ def _force_embedding_cpu(model: nn.Module, spyre_device) -> None:
     print("[debug][cpu-layers] forced embed_tokens onto CPU")
 
 
+def _bval(mod: nn.Module, name: str):
+    b = getattr(mod, name, None)
+    return b.detach().to("cpu").float() if isinstance(b, torch.Tensor) else None
+
+
 def _lin(mod: nn.Module):
-    """Return (weight, bias) of a linear-like module as CPU fp32 tensors."""
-    W = mod.weight.detach().to("cpu").float()
-    b = getattr(mod, "bias", None)
-    b = b.detach().to("cpu").float() if isinstance(b, torch.Tensor) else None
-    return W, b
+    """Return (W, bias) as CPU fp32, with W in [in, out] orientation (so the forward
+    GEMM is a plain `x @ W`, no transpose).
+
+    Spyre stores linear weights physically transposed as `weight_t` ([in, out]) and
+    sets `weight = None` (see custom_ops/linear.py). Stock vLLM keeps `weight`
+    ([out, in]); transpose it to match.
+    """
+    wt = getattr(mod, "weight_t", None)
+    if isinstance(wt, torch.Tensor):
+        W = wt.detach().to("cpu").float()  # already [in, out]
+    else:
+        w = getattr(mod, "weight", None)
+        if not isinstance(w, torch.Tensor):
+            raise RuntimeError(f"{type(mod).__name__}: no weight/weight_t to extract")
+        W = w.detach().to("cpu").float().t().contiguous()  # [out, in] -> [in, out]
+    return W, _bval(mod, "bias")
 
 
 def _extract_cpu_layer(layer: nn.Module) -> dict:
-    """Snapshot a decoder layer's weights + attention shapes into CPU fp32 tensors."""
+    """Snapshot a decoder layer's weights + attention shapes into CPU fp32 tensors.
+
+    All projection weights are stored [in, out] so the CPU forward is `x @ W`.
+    QKV is un-fused on Spyre (q_weight/k_weight/v_weight, each [in, out]); handle
+    both that and the stock fused `qkv_proj.weight` layout.
+    """
     attn = layer.self_attn
     rot = attn.rotary_emb
     d = {
@@ -274,7 +295,20 @@ def _extract_cpu_layer(layer: nn.Module) -> dict:
         "rotary_dim": rot.rotary_dim,
         "is_neox": rot.is_neox_style,
     }
-    d["Wqkv"], d["bqkv"] = _lin(attn.qkv_proj)
+    qkv = attn.qkv_proj
+    if isinstance(getattr(qkv, "q_weight", None), torch.Tensor):  # Spyre un-fused QKV
+        d["Wq"] = qkv.q_weight.detach().to("cpu").float()
+        d["Wk"] = qkv.k_weight.detach().to("cpu").float()
+        d["Wv"] = qkv.v_weight.detach().to("cpu").float()
+        d["bq"], d["bk"], d["bv"] = (_bval(qkv, n) for n in ("q_bias", "k_bias", "v_bias"))
+    else:  # stock fused qkv: split [in, out] along the output dim
+        Wqkv, bqkv = _lin(qkv)
+        sizes = [attn.q_size, attn.kv_size, attn.kv_size]
+        d["Wq"], d["Wk"], d["Wv"] = torch.split(Wqkv, sizes, dim=1)
+        if bqkv is not None:
+            d["bq"], d["bk"], d["bv"] = torch.split(bqkv, sizes)
+        else:
+            d["bq"] = d["bk"] = d["bv"] = None
     d["Wo"], d["bo"] = _lin(attn.o_proj)
     d["Wgu"], d["bgu"] = _lin(layer.mlp.gate_up_proj)
     d["Wd"], d["bd"] = _lin(layer.mlp.down_proj)
@@ -318,10 +352,15 @@ def _make_cpu_layer_forward(d: dict, layer_idx: int, spyre_device):
 
         normed, r = _rmsnorm(h, r, d["ln1_w"])
 
-        qkv = normed @ d["Wqkv"].t()
-        if d["bqkv"] is not None:
-            qkv = qkv + d["bqkv"]
-        q, k, v = qkv.split([d["q_size"], d["kv_size"], d["kv_size"]], dim=-1)
+        q = normed @ d["Wq"]
+        if d["bq"] is not None:
+            q = q + d["bq"]
+        k = normed @ d["Wk"]
+        if d["bk"] is not None:
+            k = k + d["bk"]
+        v = normed @ d["Wv"]
+        if d["bv"] is not None:
+            v = v + d["bv"]
         q, k = RotaryEmbedding.forward_static(
             pos, q, k, d["head_size"], d["rotary_dim"], d["rot_cache"], d["is_neox"]
         )
@@ -346,18 +385,18 @@ def _make_cpu_layer_forward(d: dict, layer_idx: int, spyre_device):
         attn = torch.softmax(scores.float(), dim=-1)
         ctx = torch.einsum("hij,jhd->ihd", attn, Ve).reshape(T, Hh * D)
 
-        attn_out = ctx @ d["Wo"].t()
+        attn_out = ctx @ d["Wo"]
         if d["bo"] is not None:
             attn_out = attn_out + d["bo"]
 
         normed2, r2 = _rmsnorm(attn_out, r, d["ln2_w"])
 
-        gu = normed2 @ d["Wgu"].t()
+        gu = normed2 @ d["Wgu"]
         if d["bgu"] is not None:
             gu = gu + d["bgu"]
         inter = gu.shape[-1] // 2
         act = F.silu(gu[..., :inter]) * gu[..., inter:]
-        mlp_out = act @ d["Wd"].t()
+        mlp_out = act @ d["Wd"]
         if d["bd"] is not None:
             mlp_out = mlp_out + d["bd"]
 
