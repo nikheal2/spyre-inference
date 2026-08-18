@@ -36,9 +36,13 @@ import argparse
 import os
 
 # Must be set BEFORE importing vllm. Run the engine core in THIS process so the
-# runtime monkeypatch + hooks below are visible to the worker's model.
+# runtime monkeypatch + hooks below are visible to the worker's model. Force it
+# (not setdefault) — if the environment already exports "1", the worker runs
+# out-of-process and no hooks fire.
 os.environ["VLLM_PLUGINS"] = "spyre_inference"
-os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") not in (None, "0"):
+    print("[debug] overriding VLLM_ENABLE_V1_MULTIPROCESSING -> 0 (need in-process hooks)")
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 import torch
 import torch.nn as nn
@@ -157,18 +161,24 @@ def run_spyre(args) -> dict:
             tensor_parallel_size=1,
             max_num_batched_tokens=args.max_num_batched_tokens,
             dtype="float16",
-            enforce_eager=True,
+            enforce_eager=args.enforce_eager,
             num_gpu_blocks_override=args.num_gpu_blocks_override,
         )
         # Only the prefill is needed to compare the forward pass.
-        llm.generate([args.prompt], SamplingParams(max_tokens=1, temperature=0.0))
+        outputs = llm.generate([args.prompt], SamplingParams(max_tokens=1, temperature=0.0))
     finally:
         TorchSpyreModelRunner.load_model = orig_load_model
 
-    if "input_ids" not in store:
+    # The exact prompt tokens vLLM used — robust, independent of the forward hooks.
+    store["input_ids"] = torch.tensor(outputs[0].prompt_token_ids, dtype=torch.long)
+
+    n_boundaries = sum(isinstance(k, tuple) for k in store)
+    if n_boundaries == 0:
         raise RuntimeError(
-            "No input_ids captured — the worker likely ran out-of-process. "
-            "Ensure VLLM_ENABLE_V1_MULTIPROCESSING=0 (set at import time)."
+            "No layer activations captured — the model ran out-of-process, so the "
+            "monkeypatch/hooks never fired. VLLM_ENABLE_V1_MULTIPROCESSING is forced to "
+            "0 at import; if you still see this, the Spyre worker is spawning a separate "
+            "process anyway. Check for a WorkerProc/executor that ignores the flag."
         )
     return store
 
@@ -254,6 +264,13 @@ def main():
     )
     p.add_argument(
         "--num-gpu-blocks-override", type=int, default=None, dest="num_gpu_blocks_override"
+    )
+    p.add_argument(
+        "--enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="enforce_eager",
+        help="Skip torch.compile and run eager (default on; --no-enforce-eager to compile).",
     )
     p.add_argument(
         "--prompt", type=str, default="What are IBMs main businesses?",
