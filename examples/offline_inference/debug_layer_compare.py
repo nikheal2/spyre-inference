@@ -58,6 +58,11 @@ SUBMODULES = ("input_layernorm", "self_attn", "post_attention_layernorm", "mlp")
 # max_abs above this (per boundary) is treated as a real divergence, not fp16 noise.
 NOISE_THRESHOLD = 0.1
 
+# vLLM runs warmup/_dummy_run forwards during LLM(...) construction, BEFORE the real
+# prompt. Hooks stay inert until we arm them right before llm.generate(), so the first
+# captured forward is the real prefill (not a dummy warmup run).
+ARMED = {"on": False}
+
 
 def _tensor_of(out):
     """Module outputs may be a tuple (e.g. vLLM RMSNorm returns (normed, residual),
@@ -93,27 +98,18 @@ def _find_decoder_layers(model: nn.Module) -> nn.ModuleList:
 
 
 def _install_hooks(top_model: nn.Module, store: dict) -> None:
-    """Register capture hooks. `store` gets keys: 'input_ids' and (layer_idx, name).
+    """Register capture hooks. `store` gets keys: (layer_idx, name) -> tensor.
 
-    Only the FIRST forward (the prefill) is captured; `store['done']` latches after.
+    Hooks are inert until ARMED['on'] is True (set right before the real generate),
+    so warmup/_dummy_run forwards are skipped. The first armed forward (the prefill)
+    is captured; `store['done']` then latches so later decode steps aren't captured.
     """
     store["done"] = False
     layers = _find_decoder_layers(top_model)
 
-    def pre_hook(module, args, kwargs):
-        if store["done"]:
-            return
-        ids = kwargs.get("input_ids")
-        if ids is None and args:
-            ids = args[0]
-        if isinstance(ids, torch.Tensor) and ids.dtype in (torch.int32, torch.int64):
-            store["input_ids"] = ids.detach().to("cpu")
-
-    top_model.register_forward_pre_hook(pre_hook, with_kwargs=True)
-
     def make_capture(key):
         def hook(module, inp, out):
-            if store["done"]:
+            if not ARMED["on"] or store["done"]:
                 return
             store[key] = _tensor_of(out).detach().to("cpu").float()
 
@@ -128,7 +124,7 @@ def _install_hooks(top_model: nn.Module, store: dict) -> None:
 
     def done_hook(module, args, out):
         # Fires after the full model forward; latch so decode steps aren't captured.
-        if not store["done"] and any(isinstance(k, tuple) for k in store):
+        if ARMED["on"] and not store["done"] and any(isinstance(k, tuple) for k in store):
             store["done"] = True
 
     top_model.register_forward_hook(done_hook)
@@ -164,9 +160,13 @@ def run_spyre(args) -> dict:
             enforce_eager=args.enforce_eager,
             num_gpu_blocks_override=args.num_gpu_blocks_override,
         )
+        # Arm hooks only now — LLM(...) above already ran all warmup/_dummy_run
+        # forwards, which we want to skip. The first armed forward is the real prefill.
+        ARMED["on"] = True
         # Only the prefill is needed to compare the forward pass.
         outputs = llm.generate([args.prompt], SamplingParams(max_tokens=1, temperature=0.0))
     finally:
+        ARMED["on"] = False
         TorchSpyreModelRunner.load_model = orig_load_model
 
     # The exact prompt tokens vLLM used — robust, independent of the forward hooks.
@@ -203,17 +203,20 @@ def run_hf_cpu(args, input_ids: torch.Tensor) -> dict:
     ids = input_ids.to("cpu")
     if ids.dim() == 1:
         ids = ids.unsqueeze(0)
-    with torch.no_grad():
-        try:
-            model(input_ids=ids)
-        except (TypeError, ValueError):
-            # Multimodal wrapper may require reaching the text decoder directly.
-            lm = getattr(getattr(model, "model", model), "language_model", None)
-            lm = lm or getattr(model, "language_model", None)
-            if lm is None:
-                raise
-            with torch.no_grad():
+    ARMED["on"] = True  # HF does no warmup; single forward = the reference prefill.
+    try:
+        with torch.no_grad():
+            try:
+                model(input_ids=ids)
+            except (TypeError, ValueError):
+                # Multimodal wrapper may require reaching the text decoder directly.
+                lm = getattr(getattr(model, "model", model), "language_model", None)
+                lm = lm or getattr(model, "language_model", None)
+                if lm is None:
+                    raise
                 lm(input_ids=ids)
+    finally:
+        ARMED["on"] = False
     return store
 
 
