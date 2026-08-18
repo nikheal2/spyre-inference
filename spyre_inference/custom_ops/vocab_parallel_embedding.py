@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre OOT replacement for VocabParallelEmbedding."""
+"""Spyre OOT replacement for VocabParallelEmbedding.
+
+Spyre constraints:
+    - torch-spyre compiles ops with a static device output buffer, so an on-device
+      result returned directly aliases a shared pool that the next same-shape op
+      overwrites (see custom_ops/linear.py `spyre_linear_t`). The embedding output
+      is held as the decoder layer's residual for the whole layer, so it must be
+      DMA'd into a dedicated buffer via a Spyre->CPU->Spyre round-trip before use.
+"""
 
 from functools import lru_cache
 
@@ -70,6 +78,15 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
         if keep is not None:
             output = output * keep
             output = tensor_model_parallel_all_reduce(output)
+
+        # torch-spyre compiles the gather with a static output buffer; returning it
+        # directly aliases the shared pool and a later same-shape op overwrites it —
+        # and this output is held as the decoder layer's residual for the whole layer.
+        # Round-trip through CPU to land in a dedicated buffer (same fix as
+        # spyre_linear_t in custom_ops/linear.py).
+        device = output.device
+        output = convert(output, device="cpu")
+        output = convert(output, device=device)
         return output
 
 
