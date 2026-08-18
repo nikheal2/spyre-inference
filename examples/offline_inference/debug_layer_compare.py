@@ -157,9 +157,9 @@ def _install_hooks(top_model: nn.Module, store: dict) -> None:
             if not ARMED["on"] or store["done"]:
                 return
             if args and isinstance(args[0], torch.Tensor):
-                store[(prefix, "h")] = _snap(args[0])
+                store[(*prefix, "h")] = _snap(args[0])
             if len(args) > 1 and isinstance(args[1], torch.Tensor):
-                store[(prefix, "r")] = _snap(args[1])
+                store[(*prefix, "r")] = _snap(args[1])
 
         return pre_hook
 
