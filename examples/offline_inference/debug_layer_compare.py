@@ -107,20 +107,52 @@ def _install_hooks(top_model: nn.Module, store: dict) -> None:
     store["done"] = False
     layers = _find_decoder_layers(top_model)
 
-    def make_capture(key):
+    def _snap(t):
+        # .clone() so a later reuse of Spyre's shared static output buffer can't
+        # corrupt an already-captured activation after the fact.
+        return t.detach().to("cpu").float().clone()
+
+    def make_capture(key, full_stream=False):
         def hook(module, inp, out):
             if not ARMED["on"] or store["done"]:
                 return
-            store[key] = _tensor_of(out).detach().to("cpu").float()
+            # vLLM fused-residual decoder layer returns (hidden, residual), both the
+            # same shape → the true residual stream is their sum. HF returns
+            # (hidden_states, present_kv/attn_weights) or a bare tensor → out[1] is
+            # not a same-shape tensor, so we keep out[0] (already the full stream).
+            if (
+                full_stream
+                and isinstance(out, tuple)
+                and len(out) >= 2
+                and isinstance(out[1], torch.Tensor)
+                and out[1].shape == out[0].shape
+            ):
+                store[key] = _snap(out[0]) + _snap(out[1])
+            else:
+                store[key] = _snap(_tensor_of(out))
 
         return hook
 
+    def make_input_capture(key):
+        def pre_hook(module, args):
+            if not ARMED["on"] or store["done"]:
+                return
+            if args and isinstance(args[0], torch.Tensor):
+                store[key] = _snap(args[0])
+
+        return pre_hook
+
     for i, layer in enumerate(layers):
-        layer.register_forward_hook(make_capture((i, "layer")))
+        layer.register_forward_hook(make_capture((i, "layer"), full_stream=True))
         for name in SUBMODULES:
             sub = getattr(layer, name, None)
             if isinstance(sub, nn.Module):
                 sub.register_forward_hook(make_capture((i, name)))
+        # Capture the MLP input (post_attention_layernorm output) so the op-repro
+        # can feed the exact real large-magnitude input into the Spyre MLP.
+        mlp = getattr(layer, "mlp", None)
+        if isinstance(mlp, nn.Module):
+            mlp.register_forward_pre_hook(make_input_capture((i, "mlp_in")))
 
     def done_hook(module, args, out):
         # Fires after the full model forward; latch so decode steps aren't captured.
@@ -232,7 +264,8 @@ def _aligned(a: torch.Tensor, b: torch.Tensor):
 
 
 def compare(spyre: dict, hf: dict) -> None:
-    keys = [k for k in spyre if isinstance(k, tuple) and k in hf]
+    # 'mlp_in' is captured only to feed the op-repro; don't clutter the diff table.
+    keys = [k for k in spyre if isinstance(k, tuple) and k in hf and k[1] != "mlp_in"]
     order = {"input_layernorm": 0, "self_attn": 1, "post_attention_layernorm": 2,
              "mlp": 3, "layer": 4}
 
@@ -309,6 +342,11 @@ def main():
         help="Single prompt to run through both models (mirrors torch_spyre_inference's "
         "simple_prompt).",
     )
+    p.add_argument(
+        "--dump", type=str, default=None,
+        help="Optional path to torch.save the captured Spyre+HF tensors (incl. each layer's "
+        "'mlp_in') so the op-repro can load the exact real input.",
+    )
     args = p.parse_args()
 
     print(f"[debug] prompt: {args.prompt!r}")
@@ -321,6 +359,10 @@ def main():
     print(f"[debug] captured {sum(isinstance(k, tuple) for k in hf)} HF boundaries")
 
     compare(spyre, hf)
+
+    if args.dump:
+        torch.save({"spyre": spyre, "hf": hf, "input_ids": spyre.get("input_ids")}, args.dump)
+        print(f"\n[debug] saved captured tensors to {args.dump}")
 
 
 if __name__ == "__main__":
