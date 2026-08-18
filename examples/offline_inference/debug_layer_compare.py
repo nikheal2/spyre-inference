@@ -55,6 +55,14 @@ import torch_spyre_inference  # noqa: F401
 # (These module names exist on both vLLM and HF Mistral/Llama decoder layers.)
 SUBMODULES = ("input_layernorm", "self_attn", "post_attention_layernorm", "mlp")
 
+# MLP-internal children to hook on the --target-layer, for op-level attribution.
+# vLLM MLP has {gate_up_proj (merged), act_fn (SiluAndMul), down_proj}; HF MLP has
+# {gate_proj, up_proj, act_fn (SiLU), down_proj}. Hook whichever exist by name.
+MLP_CHILDREN = ("gate_up_proj", "gate_proj", "up_proj", "act_fn", "down_proj")
+
+# Which decoder layer to break down at the MLP-op level (set from --target-layer).
+TARGET_LAYER = {"i": 2}
+
 # max_abs above this (per boundary) is treated as a real divergence, not fp16 noise.
 NOISE_THRESHOLD = 0.1
 
@@ -153,6 +161,13 @@ def _install_hooks(top_model: nn.Module, store: dict) -> None:
         mlp = getattr(layer, "mlp", None)
         if isinstance(mlp, nn.Module):
             mlp.register_forward_pre_hook(make_input_capture((i, "mlp_in")))
+            # On the target layer, break the MLP down to its op-level children so we
+            # can attribute the massive-activation overshoot to gate_up / silu / down.
+            if i == TARGET_LAYER["i"]:
+                for name in MLP_CHILDREN:
+                    child = getattr(mlp, name, None)
+                    if isinstance(child, nn.Module):
+                        child.register_forward_hook(make_capture(("mlp_int", name)))
 
     def done_hook(module, args, out):
         # Fires after the full model forward; latch so decode steps aren't captured.
@@ -264,8 +279,12 @@ def _aligned(a: torch.Tensor, b: torch.Tensor):
 
 
 def compare(spyre: dict, hf: dict) -> None:
-    # 'mlp_in' is captured only to feed the op-repro; don't clutter the diff table.
-    keys = [k for k in spyre if isinstance(k, tuple) and k in hf and k[1] != "mlp_in"]
+    # Per-layer boundary keys are (int, name). 'mlp_in' (repro input) and
+    # ('mlp_int', *) (op-level breakdown) are handled elsewhere — exclude here.
+    keys = [
+        k for k in spyre
+        if isinstance(k, tuple) and k in hf and isinstance(k[0], int) and k[1] != "mlp_in"
+    ]
     order = {"input_layernorm": 0, "self_attn": 1, "post_attention_layernorm": 2,
              "mlp": 3, "layer": 4}
 
@@ -315,9 +334,62 @@ def compare(spyre: dict, hf: dict) -> None:
     else:
         print(f"Suspected culprit layer (residual-stream mean jump): layer {culprit}.")
         print("Inspect that layer's sub-block rows (mlp vs self_attn) above to see which "
-              "injected it, and the worst-(token,dim) table: if HF has a large value there "
-              "and Spyre ~0, Spyre is dropping a 'massive activation' (early-MLP outlier).")
-        print("Next: op-level repro of that sub-block at the captured real input.")
+              "injected it, and the worst-(token,dim) table.")
+
+
+def _report_mlp(name: str, a: torch.Tensor, b: torch.Tensor) -> None:
+    """Print max/mean/rel + the worst (token, dim) and both values for an MLP sub-op."""
+    a, b = _aligned(a, b)
+    diff = (a - b).abs()
+    flat = int(diff.argmax())
+    tok, dim = divmod(flat, diff.shape[1])
+    denom = b.abs().max().item() or 1.0
+    print(f"{name:>14} {diff.max().item():>12.4f} {diff.mean().item():>12.5f} "
+          f"{diff.max().item() / denom:>8.4f}   worst=(t{tok},d{dim}) "
+          f"spyre={a[tok, dim].item():.3f} hf={b[tok, dim].item():.3f}")
+
+
+def compare_mlp_internal(spyre: dict, hf: dict) -> None:
+    """Attribute the layer-TARGET MLP divergence to gate_up / swiglu / down.
+
+    vLLM MLP: gate_up_proj (merged [gate,up]) → act_fn (SiluAndMul) → down_proj.
+    HF MLP:   gate_proj, up_proj → silu(gate)*up → down_proj.
+    """
+    import torch.nn.functional as F
+
+    def sg(store, name):
+        return store.get(("mlp_int", name))
+
+    s_gate_up, s_act, s_down = sg(spyre, "gate_up_proj"), sg(spyre, "act_fn"), sg(spyre, "down_proj")
+    h_gate, h_up = sg(hf, "gate_proj"), sg(hf, "up_proj")
+    h_act, h_down = sg(hf, "act_fn"), sg(hf, "down_proj")
+
+    if not any([s_gate_up, s_act, s_down]):
+        print(f"\n[mlp-internal] no Spyre MLP children captured on layer {TARGET_LAYER['i']} "
+              "(names differ?) — skipping op-level breakdown.")
+        return
+
+    print(f"\n--- MLP op-level breakdown, layer {TARGET_LAYER['i']} "
+          "(Spyre vs HF, reconciled) ---")
+    print(f"{'op':>14} {'max_abs':>12} {'mean_abs':>12} {'rel':>8}   worst-coord + values")
+
+    # gate_up: Spyre merged [gate,up] vs HF cat(gate, up).
+    if s_gate_up is not None and h_gate is not None and h_up is not None:
+        h_gate_up = torch.cat([h_gate.float(), h_up.float()], dim=-1)
+        _report_mlp("gate_up", s_gate_up, h_gate_up)
+    # swiglu (down_proj input): Spyre act_fn out vs HF silu(gate)*up.
+    if s_act is not None and h_gate is not None and h_up is not None:
+        h_swiglu = F.silu(h_gate.float()) * h_up.float()
+        _report_mlp("swiglu(act)", s_act, h_swiglu)
+    # down_proj output: the massive activation lives here (dim 4000 of hidden).
+    if s_down is not None and h_down is not None:
+        _report_mlp("down", s_down, h_down)
+
+    print("===============================================================")
+    print("Read top-down: the FIRST op whose diff is large is where the overshoot enters "
+          "(down large but swiglu small → down_proj; swiglu already large → gate_up/silu).")
+    print("Caveat: live MLP inputs differ slightly (Spyre vs HF), so this is a strong hint; "
+          "for proof feed HF's captured mlp_in identically into the Spyre op path.")
 
 
 def main():
@@ -343,11 +415,17 @@ def main():
         "simple_prompt).",
     )
     p.add_argument(
+        "--target-layer", type=int, default=2, dest="target_layer",
+        help="Decoder layer to break down at the MLP-op level (default 2, where the "
+        "massive-activation overshoot is introduced).",
+    )
+    p.add_argument(
         "--dump", type=str, default=None,
         help="Optional path to torch.save the captured Spyre+HF tensors (incl. each layer's "
         "'mlp_in') so the op-repro can load the exact real input.",
     )
     args = p.parse_args()
+    TARGET_LAYER["i"] = args.target_layer
 
     print(f"[debug] prompt: {args.prompt!r}")
     print("[debug] === RUN 2: Spyre (current code) ===")
@@ -359,6 +437,7 @@ def main():
     print(f"[debug] captured {sum(isinstance(k, tuple) for k in hf)} HF boundaries")
 
     compare(spyre, hf)
+    compare_mlp_internal(spyre, hf)
 
     if args.dump:
         torch.save({"spyre": spyre, "hf": hf, "input_ids": spyre.get("input_ids")}, args.dump)
