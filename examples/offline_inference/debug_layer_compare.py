@@ -315,92 +315,97 @@ def _extract_cpu_layer(layer: nn.Module) -> dict:
     return d
 
 
-def _make_cpu_layer_forward(d: dict, layer_idx: int, spyre_device):
-    """Build a self-contained CPU forward for one fused-residual decoder layer.
+def _rmsnorm_cpu(hidden, residual, weight, eps):
+    """Fused-residual RMSNorm on CPU (fp32): returns (normed, new_residual)."""
+    residual = hidden if residual is None else hidden + residual
+    x = residual.float()
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    normed = x * torch.rsqrt(var + eps) * weight
+    return normed, residual
 
-    Mirrors vLLM's LlamaDecoderLayer exactly (fused-residual RMSNorm returning
-    (normed, new_residual); qkv -> rotary -> causal GQA SDPA -> o_proj; then MLP),
-    but on CPU with a per-layer append-list KV cache. Inputs/outputs cross the
-    Spyre<->CPU boundary at the layer edges; internal math is fp32.
-    """
-    import torch.nn.functional as F
 
-    from spyre_inference.custom_ops.utils import convert
+def _cpu_attention(d: dict, layer_idx: int, pos: torch.Tensor, normed: torch.Tensor):
+    """CPU attention for one layer from its already-normed input: qkv -> rotary ->
+    causal GQA SDPA over a per-layer append-list KV cache -> o_proj. All fp32."""
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
     Hh, Hkv, D = d["num_heads"], d["num_kv_heads"], d["head_dim"]
     rep = Hh // Hkv
 
-    def _rmsnorm(hidden, residual, weight):
-        residual = hidden if residual is None else hidden + residual
-        x = residual.float()
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        normed = x * torch.rsqrt(var + d["eps"]) * weight
-        return normed, residual
+    q = normed @ d["Wq"]
+    if d["bq"] is not None:
+        q = q + d["bq"]
+    k = normed @ d["Wk"]
+    if d["bk"] is not None:
+        k = k + d["bk"]
+    v = normed @ d["Wv"]
+    if d["bv"] is not None:
+        v = v + d["bv"]
+    q, k = RotaryEmbedding.forward_static(
+        pos, q, k, d["head_size"], d["rotary_dim"], d["rot_cache"], d["is_neox"]
+    )
+
+    T = q.shape[0]
+    q = q.view(T, Hh, D)
+    k = k.view(T, Hkv, D)
+    v = v.view(T, Hkv, D)
+
+    # New sequence's prefill starts at absolute position 0 -> reset this layer's KV
+    # (wipes warmup/_dummy_run junk); chunked prefill / decode (pos[0] != 0) append.
+    if pos.numel() and int(pos[0]) == 0:
+        _CPU_KV[layer_idx] = {"k": None, "v": None, "pos": None}
+    kv = _CPU_KV.setdefault(layer_idx, {"k": None, "v": None, "pos": None})
+    if kv["k"] is None:
+        kv["k"], kv["v"], kv["pos"] = k, v, pos
+    else:
+        kv["k"] = torch.cat([kv["k"], k], dim=0)
+        kv["v"] = torch.cat([kv["v"], v], dim=0)
+        kv["pos"] = torch.cat([kv["pos"], pos], dim=0)
+    Ke = kv["k"].repeat_interleave(rep, dim=1)  # [Tk, Hh, D]
+    Ve = kv["v"].repeat_interleave(rep, dim=1)
+
+    scores = torch.einsum("ihd,jhd->hij", q, Ke) * d["scaling"]  # [Hh, T, Tk]
+    mask = kv["pos"].view(1, -1) > pos.view(T, 1)  # key after query -> block
+    scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
+    attn = torch.softmax(scores.float(), dim=-1)
+    ctx = torch.einsum("hij,jhd->ihd", attn, Ve).reshape(T, Hh * D)
+
+    attn_out = ctx @ d["Wo"]
+    if d["bo"] is not None:
+        attn_out = attn_out + d["bo"]
+    return attn_out
+
+
+def _cpu_mlp(d: dict, normed: torch.Tensor):
+    """CPU SwiGLU MLP from an already-normed input (fp32): gate_up -> silu*mul -> down."""
+    import torch.nn.functional as F
+
+    gu = normed @ d["Wgu"]
+    if d["bgu"] is not None:
+        gu = gu + d["bgu"]
+    inter = gu.shape[-1] // 2
+    act = F.silu(gu[..., :inter]) * gu[..., inter:]
+    out = act @ d["Wd"]
+    if d["bd"] is not None:
+        out = out + d["bd"]
+    return out
+
+
+def _make_cpu_layer_forward(d: dict, layer_idx: int, spyre_device):
+    """Whole-layer CPU forward (fused-residual RMSNorm -> attention -> RMSNorm ->
+    MLP), mirroring vLLM's LlamaDecoderLayer. Boundary conversions at the edges."""
+    from spyre_inference.custom_ops.utils import convert
 
     def fwd(positions, hidden_states, residual=None, *args, **kwargs):
-        # Absorb any extra args this vLLM version threads through the decoder layer
-        # (e.g. t_cond); the CPU reimplementation only needs the first three.
+        # Absorb any extra args this vLLM version threads through (e.g. t_cond).
         pos = positions.detach().to("cpu").long().flatten()
         h = hidden_states.detach().to("cpu").float()
         r = None if residual is None else residual.detach().to("cpu").float()
 
-        # A new sequence's prefill starts at absolute position 0 -> reset this
-        # layer's KV (wipes any warmup/_dummy_run junk). Chunked prefill and decode
-        # (pos[0] != 0) append to the accumulation.
-        if pos.numel() and int(pos[0]) == 0:
-            _CPU_KV[layer_idx] = {"k": None, "v": None, "pos": None}
-        kv = _CPU_KV.setdefault(layer_idx, {"k": None, "v": None, "pos": None})
-
-        normed, r = _rmsnorm(h, r, d["ln1_w"])
-
-        q = normed @ d["Wq"]
-        if d["bq"] is not None:
-            q = q + d["bq"]
-        k = normed @ d["Wk"]
-        if d["bk"] is not None:
-            k = k + d["bk"]
-        v = normed @ d["Wv"]
-        if d["bv"] is not None:
-            v = v + d["bv"]
-        q, k = RotaryEmbedding.forward_static(
-            pos, q, k, d["head_size"], d["rotary_dim"], d["rot_cache"], d["is_neox"]
-        )
-
-        T = q.shape[0]
-        q = q.view(T, Hh, D)
-        k = k.view(T, Hkv, D)
-        v = v.view(T, Hkv, D)
-
-        if kv["k"] is None:
-            kv["k"], kv["v"], kv["pos"] = k, v, pos
-        else:
-            kv["k"] = torch.cat([kv["k"], k], dim=0)
-            kv["v"] = torch.cat([kv["v"], v], dim=0)
-            kv["pos"] = torch.cat([kv["pos"], pos], dim=0)
-        Ke = kv["k"].repeat_interleave(rep, dim=1)  # [Tk, Hh, D]
-        Ve = kv["v"].repeat_interleave(rep, dim=1)
-
-        scores = torch.einsum("ihd,jhd->hij", q, Ke) * d["scaling"]  # [Hh, T, Tk]
-        mask = kv["pos"].view(1, -1) > pos.view(T, 1)  # key after query -> block
-        scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
-        attn = torch.softmax(scores.float(), dim=-1)
-        ctx = torch.einsum("hij,jhd->ihd", attn, Ve).reshape(T, Hh * D)
-
-        attn_out = ctx @ d["Wo"]
-        if d["bo"] is not None:
-            attn_out = attn_out + d["bo"]
-
-        normed2, r2 = _rmsnorm(attn_out, r, d["ln2_w"])
-
-        gu = normed2 @ d["Wgu"]
-        if d["bgu"] is not None:
-            gu = gu + d["bgu"]
-        inter = gu.shape[-1] // 2
-        act = F.silu(gu[..., :inter]) * gu[..., inter:]
-        mlp_out = act @ d["Wd"]
-        if d["bd"] is not None:
-            mlp_out = mlp_out + d["bd"]
+        normed, r = _rmsnorm_cpu(h, r, d["ln1_w"], d["eps"])
+        attn_out = _cpu_attention(d, layer_idx, pos, normed)
+        normed2, r2 = _rmsnorm_cpu(attn_out, r, d["ln2_w"], d["eps"])
+        mlp_out = _cpu_mlp(d, normed2)
 
         # Return (hidden, residual) on the Spyre device as fp16 — same contract the
         # unmodified layer has, so the next (Spyre) layer continues transparently.
@@ -423,6 +428,92 @@ def _install_cpu_prefix(model: nn.Module, n: int, spyre_device) -> None:
             d = _extract_cpu_layer(layers[i])
             layers[i].forward = _make_cpu_layer_forward(d, i, spyre_device)
         print(f"[debug][cpu-layers] forced decoder layers 0..{last} onto CPU")
+
+
+# --------------------------------------------------------------------------- #
+# Fine-grained sub-op bisection: instead of whole decoder blocks, force one
+# sub-operation at a time onto CPU, cumulatively, in execution order. The unit
+# list is: embed_tokens, then per layer (input_layernorm, self_attn,
+# post_attention_layernorm, mlp). --cpu-ops K forces units 0..K onto CPU by
+# swapping just those submodules' forwards; everything else stays on Spyre.
+# --------------------------------------------------------------------------- #
+_OP_KINDS = ("input_layernorm", "self_attn", "post_attention_layernorm", "mlp")
+
+
+def _make_norm_forward(weight, eps, spyre_device):
+    """CPU replacement for a fused-residual RMSNorm submodule forward.
+
+    Matches the RMSNorm return contract: a bare `normed` when called without a
+    residual (layer-0's first norm), else `(normed, new_residual)`.
+    """
+    from spyre_inference.custom_ops.utils import convert
+
+    def fwd(x, residual=None, *args, **kwargs):
+        xc = x.detach().to("cpu").float()
+        rc = None if residual is None else residual.detach().to("cpu").float()
+        normed, new_r = _rmsnorm_cpu(xc, rc, weight, eps)
+        normed_s = convert(normed.to(torch.float16), device=spyre_device)
+        if residual is None:
+            return normed_s
+        return normed_s, convert(new_r.to(torch.float16), device=spyre_device)
+
+    return fwd
+
+
+def _make_attn_forward(d, layer_idx, spyre_device):
+    """CPU replacement for a self_attn submodule forward (own append-list KV)."""
+    from spyre_inference.custom_ops.utils import convert
+
+    def fwd(positions, hidden_states, *args, **kwargs):
+        pos = positions.detach().to("cpu").long().flatten()
+        normed = hidden_states.detach().to("cpu").float()
+        attn_out = _cpu_attention(d, layer_idx, pos, normed)
+        return convert(attn_out.to(torch.float16), device=spyre_device)
+
+    return fwd
+
+
+def _make_mlp_forward(d, spyre_device):
+    """CPU replacement for an mlp submodule forward."""
+    from spyre_inference.custom_ops.utils import convert
+
+    def fwd(x, *args, **kwargs):
+        normed = x.detach().to("cpu").float()
+        return convert(_cpu_mlp(d, normed).to(torch.float16), device=spyre_device)
+
+    return fwd
+
+
+def _install_cpu_ops(model: nn.Module, k: int, spyre_device) -> None:
+    """Force the first k+1 sub-op units (embed, then per-layer sub-ops) onto CPU."""
+    _CPU_KV.clear()
+    layers = _find_decoder_layers(model)
+    units = [("embed", -1)] + [(kind, i) for i in range(len(layers)) for kind in _OP_KINDS]
+    last = min(k, len(units) - 1)
+
+    layer_d: dict = {}
+    forced = []
+    for idx in range(last + 1):
+        kind, li = units[idx]
+        if kind == "embed":
+            _force_embedding_cpu(model, spyre_device)
+            forced.append("embed")
+            continue
+        if li not in layer_d:
+            layer_d[li] = _extract_cpu_layer(layers[li])
+        d, layer = layer_d[li], layers[li]
+        if kind == "input_layernorm":
+            layer.input_layernorm.forward = _make_norm_forward(d["ln1_w"], d["eps"], spyre_device)
+        elif kind == "self_attn":
+            layer.self_attn.forward = _make_attn_forward(d, li, spyre_device)
+        elif kind == "post_attention_layernorm":
+            layer.post_attention_layernorm.forward = _make_norm_forward(
+                d["ln2_w"], d["eps"], spyre_device
+            )
+        elif kind == "mlp":
+            layer.mlp.forward = _make_mlp_forward(d, spyre_device)
+        forced.append(f"L{li}.{kind}")
+    print(f"[debug][cpu-ops] forced sub-op units 0..{last} onto CPU: {', '.join(forced)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -774,10 +865,13 @@ def run_generate(args) -> None:
 
     def patched_load_model(self, *a, **k):
         orig_load_model(self, *a, **k)
-        if args.cpu_layers is not None:
+        if args.cpu_ops is not None or args.cpu_layers is not None:
             model = self.get_model()
             spyre_device = next(model.parameters()).device
-            _install_cpu_prefix(model, args.cpu_layers, spyre_device)
+            if args.cpu_ops is not None:
+                _install_cpu_ops(model, args.cpu_ops, spyre_device)
+            else:
+                _install_cpu_prefix(model, args.cpu_layers, spyre_device)
 
     TorchSpyreModelRunner.load_model = patched_load_model
     # Disable chunked prefill so the prompt is a single forward (the per-layer CPU
@@ -803,8 +897,13 @@ def run_generate(args) -> None:
         TorchSpyreModelRunner.load_model = orig_load_model
 
     text = outputs[0].outputs[0].text
-    tag = "off" if args.cpu_layers is None else str(args.cpu_layers)
-    print(f"\n================ Spyre generation (cpu-layers={tag}) ================")
+    if args.cpu_ops is not None:
+        tag = f"cpu-ops<={args.cpu_ops}"
+    elif args.cpu_layers is not None:
+        tag = f"cpu-layers={args.cpu_layers}"
+    else:
+        tag = "off"
+    print(f"\n================ Spyre generation ({tag}) ================")
     print(f"prompt: {args.prompt!r}")
     print(f"output: {text!r}")
     print("=====================================================================")
@@ -851,9 +950,17 @@ def main():
         "run until the generated text is coherent — that layer holds the bug.",
     )
     p.add_argument(
+        "--cpu-ops", type=int, default=None, dest="cpu_ops",
+        help="Fine-grained CPU bisection (requires --generate): force the first K+1 SUB-OP "
+        "units onto CPU, in execution order. Unit 0 = embed_tokens, 1 = L0.input_layernorm, "
+        "2 = L0.self_attn, 3 = L0.post_attention_layernorm, 4 = L0.mlp, 5 = L1.input_layernorm, "
+        "... Increment K until the text is coherent — that sub-op holds the bug. Takes "
+        "precedence over --cpu-layers.",
+    )
+    p.add_argument(
         "--generate", action="store_true",
         help="Run a real multi-token generation and print the text (coherence check) instead "
-        "of the 1-token per-layer capture/diff. Use with --cpu-layers.",
+        "of the 1-token per-layer capture/diff. Use with --cpu-layers or --cpu-ops.",
     )
     p.add_argument(
         "--gen-tokens", type=int, default=64, dest="gen_tokens",
@@ -870,8 +977,8 @@ def main():
     if args.generate:
         run_generate(args)
         return
-    if args.cpu_layers is not None:
-        print("[debug] --cpu-layers is only applied in --generate mode; ignoring for capture.")
+    if args.cpu_layers is not None or args.cpu_ops is not None:
+        print("[debug] --cpu-layers/--cpu-ops only apply in --generate mode; ignoring for capture.")
 
     print(f"[debug] prompt: {args.prompt!r}")
     print("[debug] === RUN 2: Spyre (current code) ===")
