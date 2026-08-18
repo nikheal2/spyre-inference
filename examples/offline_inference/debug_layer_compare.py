@@ -364,7 +364,7 @@ def compare_mlp_internal(spyre: dict, hf: dict) -> None:
     h_gate, h_up = sg(hf, "gate_proj"), sg(hf, "up_proj")
     h_act, h_down = sg(hf, "act_fn"), sg(hf, "down_proj")
 
-    if not any([s_gate_up, s_act, s_down]):
+    if all(t is None for t in (s_gate_up, s_act, s_down)):
         print(f"\n[mlp-internal] no Spyre MLP children captured on layer {TARGET_LAYER['i']} "
               "(names differ?) — skipping op-level breakdown.")
         return
