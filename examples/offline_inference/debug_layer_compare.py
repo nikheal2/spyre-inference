@@ -196,6 +196,195 @@ def _install_hooks(top_model: nn.Module, store: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Cumulative-prefix CPU bisection: force embed_tokens + decoder layers 0..N onto
+# CPU (rest stay on Spyre), run the FULL generation, and see when the text turns
+# coherent. The layer that flips it from garbage -> coherent holds the bug.
+#
+# All wiring is a runtime monkeypatch of the loaded model's module forwards; no
+# spyre_inference/ code is edited. The CPU layers keep their own per-layer KV
+# (a simple append list) since they can't use Spyre's on-device paged KV cache.
+# --------------------------------------------------------------------------- #
+
+# Per-forced-layer CPU KV: layer_idx -> {"k":[Tk,Hkv,D], "v":[Tk,Hkv,D], "pos":[Tk]}.
+_CPU_KV: dict = {}
+
+
+def _find_embed_tokens(model: nn.Module) -> nn.Module:
+    """Locate the token-embedding module across vLLM and HF module trees."""
+    for path in (
+        ("model", "embed_tokens"),
+        ("language_model", "model", "embed_tokens"),
+        ("model", "language_model", "model", "embed_tokens"),
+        ("model", "language_model", "embed_tokens"),
+    ):
+        obj = model
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if isinstance(obj, nn.Module) and hasattr(obj, "weight"):
+            return obj
+    for name, m in model.named_modules():
+        if name.endswith("embed_tokens") and hasattr(m, "weight"):
+            return m
+    raise RuntimeError("Could not locate embed_tokens in the model tree.")
+
+
+def _force_embedding_cpu(model: nn.Module, spyre_device) -> None:
+    """Replace embed_tokens.forward with a CPU gather (return to the Spyre device)."""
+    from spyre_inference.custom_ops.utils import convert
+
+    emb = _find_embed_tokens(model)
+    W = emb.weight.detach().to("cpu")  # fp16 [vocab, hidden]
+    hidden = W.shape[-1]
+
+    def emb_forward(input_):
+        ids = input_.detach().to("cpu").long()
+        out = W.index_select(0, ids.flatten()).view(*ids.shape, hidden)
+        return convert(out, device=spyre_device)
+
+    emb.forward = emb_forward
+    print("[debug][cpu-layers] forced embed_tokens onto CPU")
+
+
+def _lin(mod: nn.Module):
+    """Return (weight, bias) of a linear-like module as CPU fp32 tensors."""
+    W = mod.weight.detach().to("cpu").float()
+    b = getattr(mod, "bias", None)
+    b = b.detach().to("cpu").float() if isinstance(b, torch.Tensor) else None
+    return W, b
+
+
+def _extract_cpu_layer(layer: nn.Module) -> dict:
+    """Snapshot a decoder layer's weights + attention shapes into CPU fp32 tensors."""
+    attn = layer.self_attn
+    rot = attn.rotary_emb
+    d = {
+        "ln1_w": layer.input_layernorm.weight.detach().to("cpu").float(),
+        "ln2_w": layer.post_attention_layernorm.weight.detach().to("cpu").float(),
+        "eps": float(getattr(layer.input_layernorm, "variance_epsilon", 1e-5)),
+        "num_heads": attn.num_heads,
+        "num_kv_heads": attn.num_kv_heads,
+        "head_dim": attn.head_dim,
+        "q_size": attn.q_size,
+        "kv_size": attn.kv_size,
+        "scaling": attn.scaling,
+        "rot_cache": rot.cos_sin_cache.detach().to("cpu").float(),
+        "head_size": rot.head_size,
+        "rotary_dim": rot.rotary_dim,
+        "is_neox": rot.is_neox_style,
+    }
+    d["Wqkv"], d["bqkv"] = _lin(attn.qkv_proj)
+    d["Wo"], d["bo"] = _lin(attn.o_proj)
+    d["Wgu"], d["bgu"] = _lin(layer.mlp.gate_up_proj)
+    d["Wd"], d["bd"] = _lin(layer.mlp.down_proj)
+    return d
+
+
+def _make_cpu_layer_forward(d: dict, layer_idx: int, spyre_device):
+    """Build a self-contained CPU forward for one fused-residual decoder layer.
+
+    Mirrors vLLM's LlamaDecoderLayer exactly (fused-residual RMSNorm returning
+    (normed, new_residual); qkv -> rotary -> causal GQA SDPA -> o_proj; then MLP),
+    but on CPU with a per-layer append-list KV cache. Inputs/outputs cross the
+    Spyre<->CPU boundary at the layer edges; internal math is fp32.
+    """
+    import torch.nn.functional as F
+
+    from spyre_inference.custom_ops.utils import convert
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    Hh, Hkv, D = d["num_heads"], d["num_kv_heads"], d["head_dim"]
+    rep = Hh // Hkv
+
+    def _rmsnorm(hidden, residual, weight):
+        residual = hidden if residual is None else hidden + residual
+        x = residual.float()
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        normed = x * torch.rsqrt(var + d["eps"]) * weight
+        return normed, residual
+
+    def fwd(positions, hidden_states, residual):
+        pos = positions.detach().to("cpu").long().flatten()
+        h = hidden_states.detach().to("cpu").float()
+        r = None if residual is None else residual.detach().to("cpu").float()
+
+        # A new sequence's prefill starts at absolute position 0 -> reset this
+        # layer's KV (wipes any warmup/_dummy_run junk). Chunked prefill and decode
+        # (pos[0] != 0) append to the accumulation.
+        if pos.numel() and int(pos[0]) == 0:
+            _CPU_KV[layer_idx] = {"k": None, "v": None, "pos": None}
+        kv = _CPU_KV.setdefault(layer_idx, {"k": None, "v": None, "pos": None})
+
+        normed, r = _rmsnorm(h, r, d["ln1_w"])
+
+        qkv = normed @ d["Wqkv"].t()
+        if d["bqkv"] is not None:
+            qkv = qkv + d["bqkv"]
+        q, k, v = qkv.split([d["q_size"], d["kv_size"], d["kv_size"]], dim=-1)
+        q, k = RotaryEmbedding.forward_static(
+            pos, q, k, d["head_size"], d["rotary_dim"], d["rot_cache"], d["is_neox"]
+        )
+
+        T = q.shape[0]
+        q = q.view(T, Hh, D)
+        k = k.view(T, Hkv, D)
+        v = v.view(T, Hkv, D)
+
+        if kv["k"] is None:
+            kv["k"], kv["v"], kv["pos"] = k, v, pos
+        else:
+            kv["k"] = torch.cat([kv["k"], k], dim=0)
+            kv["v"] = torch.cat([kv["v"], v], dim=0)
+            kv["pos"] = torch.cat([kv["pos"], pos], dim=0)
+        Ke = kv["k"].repeat_interleave(rep, dim=1)  # [Tk, Hh, D]
+        Ve = kv["v"].repeat_interleave(rep, dim=1)
+
+        scores = torch.einsum("ihd,jhd->hij", q, Ke) * d["scaling"]  # [Hh, T, Tk]
+        mask = kv["pos"].view(1, -1) > pos.view(T, 1)  # key after query -> block
+        scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
+        attn = torch.softmax(scores.float(), dim=-1)
+        ctx = torch.einsum("hij,jhd->ihd", attn, Ve).reshape(T, Hh * D)
+
+        attn_out = ctx @ d["Wo"].t()
+        if d["bo"] is not None:
+            attn_out = attn_out + d["bo"]
+
+        normed2, r2 = _rmsnorm(attn_out, r, d["ln2_w"])
+
+        gu = normed2 @ d["Wgu"].t()
+        if d["bgu"] is not None:
+            gu = gu + d["bgu"]
+        inter = gu.shape[-1] // 2
+        act = F.silu(gu[..., :inter]) * gu[..., inter:]
+        mlp_out = act @ d["Wd"].t()
+        if d["bd"] is not None:
+            mlp_out = mlp_out + d["bd"]
+
+        # Return (hidden, residual) on the Spyre device as fp16 — same contract the
+        # unmodified layer has, so the next (Spyre) layer continues transparently.
+        return (
+            convert(mlp_out.to(torch.float16), device=spyre_device),
+            convert(r2.to(torch.float16), device=spyre_device),
+        )
+
+    return fwd
+
+
+def _install_cpu_prefix(model: nn.Module, n: int, spyre_device) -> None:
+    """Force embed_tokens (+ decoder layers 0..n when n>=0) onto CPU."""
+    _CPU_KV.clear()
+    _force_embedding_cpu(model, spyre_device)
+    if n >= 0:
+        layers = _find_decoder_layers(model)
+        last = min(n, len(layers) - 1)
+        for i in range(last + 1):
+            d = _extract_cpu_layer(layers[i])
+            layers[i].forward = _make_cpu_layer_forward(d, i, spyre_device)
+        print(f"[debug][cpu-layers] forced decoder layers 0..{last} onto CPU")
+
+
+# --------------------------------------------------------------------------- #
 # Run 2: Spyre / current code
 # --------------------------------------------------------------------------- #
 def run_spyre(args) -> dict:
@@ -508,6 +697,80 @@ def test_rmsnorm_op_locality(spyre: dict, weights: dict) -> None:
               "input (attention output / incoming residual) — walk back to attention / layer 0.")
 
 
+def _hf_generate(args) -> None:
+    """Coherent reference: greedy HF-CPU generation on the same prompt (fp16)."""
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoModelForImageTextToText,
+        AutoTokenizer,
+    )
+
+    tok = AutoTokenizer.from_pretrained(args.model)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16)
+    except ValueError:
+        model = AutoModelForImageTextToText.from_pretrained(args.model, dtype=torch.float16)
+    model.eval()
+    ids = tok(args.prompt, return_tensors="pt").input_ids
+    with torch.no_grad():
+        out = model.generate(ids, max_new_tokens=args.gen_tokens, do_sample=False)
+    text = tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+    print("\n---------------- HF-CPU reference generation ----------------")
+    print(f"output: {text!r}")
+
+
+def run_generate(args) -> None:
+    """Full multi-token generation with the CPU prefix forced in, printing the text.
+
+    --cpu-layers -1 forces only embed_tokens to CPU; N>=0 forces embed_tokens +
+    decoder layers 0..N. Increment N across manual runs until the text is coherent.
+    """
+    from vllm import LLM, SamplingParams
+
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    orig_load_model = TorchSpyreModelRunner.load_model
+
+    def patched_load_model(self, *a, **k):
+        orig_load_model(self, *a, **k)
+        if args.cpu_layers is not None:
+            model = self.get_model()
+            spyre_device = next(model.parameters()).device
+            _install_cpu_prefix(model, args.cpu_layers, spyre_device)
+
+    TorchSpyreModelRunner.load_model = patched_load_model
+    # Disable chunked prefill so the prompt is a single forward (the per-layer CPU
+    # KV reset keys off absolute position 0 either way, but this keeps it simple).
+    batched = max(args.max_num_batched_tokens, args.max_model_len)
+    try:
+        llm = LLM(
+            model=args.model,
+            tokenizer=args.model,
+            max_model_len=args.max_model_len,
+            max_num_seqs=1,
+            tensor_parallel_size=1,
+            max_num_batched_tokens=batched,
+            dtype="float16",
+            enforce_eager=args.enforce_eager,
+            num_gpu_blocks_override=args.num_gpu_blocks_override,
+        )
+        _CPU_KV.clear()  # drop any warmup-pass junk before the real generation
+        outputs = llm.generate(
+            [args.prompt], SamplingParams(max_tokens=args.gen_tokens, temperature=0.0)
+        )
+    finally:
+        TorchSpyreModelRunner.load_model = orig_load_model
+
+    text = outputs[0].outputs[0].text
+    tag = "off" if args.cpu_layers is None else str(args.cpu_layers)
+    print(f"\n================ Spyre generation (cpu-layers={tag}) ================")
+    print(f"prompt: {args.prompt!r}")
+    print(f"output: {text!r}")
+    print("=====================================================================")
+    if args.compare_with_cpu:
+        _hf_generate(args)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", type=str, required=True)
@@ -540,8 +803,34 @@ def main():
         help="Optional path to torch.save the captured Spyre+HF tensors (incl. each layer's "
         "'mlp_in') so the op-repro can load the exact real input.",
     )
+    p.add_argument(
+        "--cpu-layers", type=int, default=None, dest="cpu_layers",
+        help="Cumulative-prefix CPU bisection (requires --generate): force embed_tokens + "
+        "decoder layers 0..N onto CPU, rest on Spyre. -1 = embedding only. Increment N per "
+        "run until the generated text is coherent — that layer holds the bug.",
+    )
+    p.add_argument(
+        "--generate", action="store_true",
+        help="Run a real multi-token generation and print the text (coherence check) instead "
+        "of the 1-token per-layer capture/diff. Use with --cpu-layers.",
+    )
+    p.add_argument(
+        "--gen-tokens", type=int, default=64, dest="gen_tokens",
+        help="Number of tokens to generate in --generate mode (default 64).",
+    )
+    p.add_argument(
+        "--compare-with-cpu", action="store_true", dest="compare_with_cpu",
+        help="In --generate mode, also print a greedy HF-CPU generation as a coherent "
+        "reference to eyeball against.",
+    )
     args = p.parse_args()
     TARGET_LAYER["i"] = args.target_layer
+
+    if args.generate:
+        run_generate(args)
+        return
+    if args.cpu_layers is not None:
+        print("[debug] --cpu-layers is only applied in --generate mode; ignoring for capture.")
 
     print(f"[debug] prompt: {args.prompt!r}")
     print("[debug] === RUN 2: Spyre (current code) ===")
