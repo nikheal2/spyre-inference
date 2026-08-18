@@ -221,41 +221,70 @@ def run_hf_cpu(args, input_ids: torch.Tensor) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+def _aligned(a: torch.Tensor, b: torch.Tensor):
+    """Squeeze HF batch dim, flatten to [tokens, hidden], trim to common length."""
+    if a.dim() == 3:
+        a = a[0]
+    if b.dim() == 3:  # HF is [1, seq, H]; Spyre prefill is flattened [seq, H]
+        b = b[0]
+    n = min(a.shape[0], b.shape[0])
+    return a[:n].reshape(n, -1), b[:n].reshape(n, -1)
+
+
 def compare(spyre: dict, hf: dict) -> None:
-    keys = sorted(
-        k for k in spyre if isinstance(k, tuple) and k in hf
-    )
-    print("\n================ per-layer Spyre vs HF-CPU diff ================")
-    print(f"{'layer':>5} {'boundary':>26} {'max_abs':>12} {'mean_abs':>12} {'rel':>10}")
-    culprit = None
-    # Report by layer, then submodule order, so the first jump is easy to spot.
+    keys = [k for k in spyre if isinstance(k, tuple) and k in hf]
     order = {"input_layernorm": 0, "self_attn": 1, "post_attention_layernorm": 2,
              "mlp": 3, "layer": 4}
+
+    print("\n================ per-layer Spyre vs HF-CPU diff ================")
+    print(f"{'layer':>5} {'boundary':>26} {'max_abs':>12} {'mean_abs':>12} {'rel':>10}")
+    layer_mean = {}  # layer_idx -> mean_abs of the residual-stream ('layer') row
     for key in sorted(keys, key=lambda k: (k[0], order.get(k[1], 9))):
-        a, b = spyre[key], hf[key]
-        if b.dim() == 3:  # HF is [1, seq, H]; Spyre prefill is flattened [seq, H]
-            b = b[0]
-        if a.dim() == 3:
-            a = a[0]
-        n = min(a.shape[0], b.shape[0])
-        diff = (a[:n].reshape(n, -1) - b[:n].reshape(n, -1)).abs()
+        a, b = _aligned(spyre[key], hf[key])
+        diff = (a - b).abs()
         max_abs = diff.max().item()
         mean_abs = diff.mean().item()
-        denom = b[:n].reshape(n, -1).abs().max().item() or 1.0
+        denom = b.abs().max().item() or 1.0
         rel = max_abs / denom
-        flag = "  <-- FIRST DIVERGENCE" if culprit is None and max_abs > NOISE_THRESHOLD else ""
-        if flag:
-            culprit = key
-        print(f"{key[0]:>5} {key[1]:>26} {max_abs:>12.4f} {mean_abs:>12.5f} {rel:>10.4f}{flag}")
+        if key[1] == "layer":
+            layer_mean[key[0]] = mean_abs
+        print(f"{key[0]:>5} {key[1]:>26} {max_abs:>12.4f} {mean_abs:>12.5f} {rel:>10.4f}")
+    print("===============================================================")
+
+    # --- Culprit = first layer whose residual-stream mean_abs jumps (>3x prev) ---
+    # The residual-stream ('layer') rows are the reliable cross-impl boundary; the
+    # *_layernorm rows are inflated by vLLM's residual-fused RMSNorm. Ignore max_abs
+    # (dominated by a single persistent 'massive activation' coordinate) and use the
+    # systematic mean_abs trend instead.
+    JUMP, FLOOR = 3.0, 0.05
+    culprit = None
+    for i in sorted(layer_mean):
+        prev = layer_mean.get(i - 1, 0.0)
+        if layer_mean[i] > FLOOR and layer_mean[i] > JUMP * max(prev, 1e-6):
+            culprit = i
+            break
+
+    # --- Locate the worst coordinate of each layer's residual diff (massive act?) ---
+    print("\n--- residual-stream diff: worst (token, dim) per layer ---")
+    print(f"{'layer':>5} {'token':>6} {'dim':>6} {'spyre':>12} {'hf':>12} {'abs_diff':>12}")
+    for i in sorted(layer_mean):
+        a, b = _aligned(spyre[(i, "layer")], hf[(i, "layer")])
+        diff = (a - b).abs()
+        flat = int(diff.argmax())
+        tok, dim = divmod(flat, diff.shape[1])
+        sp, hfv = a[tok, dim].item(), b[tok, dim].item()
+        print(f"{i:>5} {tok:>6} {dim:>6} {sp:>12.3f} {hfv:>12.3f} {diff[tok, dim].item():>12.3f}")
 
     print("===============================================================")
     if culprit is None:
-        print("No boundary exceeded the noise threshold — divergence is elsewhere "
-              "(sampling / lm_head / final norm) or below threshold.")
+        print("No clear residual-stream jump — divergence may be gradual, below the "
+              "floor, or downstream (final norm / lm_head / sampling).")
     else:
-        print(f"Suspected culprit: layer {culprit[0]}, sub-block '{culprit[1]}'.")
-        print("Next: confirm the exact op with a standalone repro at the real shapes "
-              "(head_dim 128, GQA 8:1, YaRN, padded prefill).")
+        print(f"Suspected culprit layer (residual-stream mean jump): layer {culprit}.")
+        print("Inspect that layer's sub-block rows (mlp vs self_attn) above to see which "
+              "injected it, and the worst-(token,dim) table: if HF has a large value there "
+              "and Spyre ~0, Spyre is dropping a 'massive activation' (early-MLP outlier).")
+        print("Next: op-level repro of that sub-block at the captured real input.")
 
 
 def main():
