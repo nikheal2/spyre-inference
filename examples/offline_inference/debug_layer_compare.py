@@ -484,36 +484,58 @@ def _make_mlp_forward(d, spyre_device):
     return fwd
 
 
+def _unit_list(layers) -> list:
+    """The ordered sub-op units: embed, then per-layer (norm1, attn, norm2, mlp)."""
+    return [("embed", -1)] + [(kind, i) for i in range(len(layers)) for kind in _OP_KINDS]
+
+
+def _force_unit(model, layers, layer_d: dict, kind: str, li: int, spyre_device) -> str:
+    """Swap one sub-op unit's forward to its CPU reimplementation; return its label."""
+    if kind == "embed":
+        _force_embedding_cpu(model, spyre_device)
+        return "embed"
+    if li not in layer_d:
+        layer_d[li] = _extract_cpu_layer(layers[li])
+    d, layer = layer_d[li], layers[li]
+    if kind == "input_layernorm":
+        layer.input_layernorm.forward = _make_norm_forward(d["ln1_w"], d["eps"], spyre_device)
+    elif kind == "self_attn":
+        layer.self_attn.forward = _make_attn_forward(d, li, spyre_device)
+    elif kind == "post_attention_layernorm":
+        layer.post_attention_layernorm.forward = _make_norm_forward(
+            d["ln2_w"], d["eps"], spyre_device
+        )
+    elif kind == "mlp":
+        layer.mlp.forward = _make_mlp_forward(d, spyre_device)
+    return f"L{li}.{kind}"
+
+
 def _install_cpu_ops(model: nn.Module, k: int, spyre_device) -> None:
-    """Force the first k+1 sub-op units (embed, then per-layer sub-ops) onto CPU."""
+    """Cumulative: force the first k+1 sub-op units (embed, then per-layer) onto CPU."""
     _CPU_KV.clear()
     layers = _find_decoder_layers(model)
-    units = [("embed", -1)] + [(kind, i) for i in range(len(layers)) for kind in _OP_KINDS]
+    units = _unit_list(layers)
     last = min(k, len(units) - 1)
+    layer_d: dict = {}
+    forced = [
+        _force_unit(model, layers, layer_d, *units[idx], spyre_device)
+        for idx in range(last + 1)
+    ]
+    print(f"[debug][cpu-ops] forced sub-op units 0..{last} onto CPU: {', '.join(forced)}")
 
+
+def _install_cpu_select(model: nn.Module, indices: list, spyre_device) -> None:
+    """Targeted: force ONLY the given sub-op unit indices onto CPU, rest on Spyre."""
+    _CPU_KV.clear()
+    layers = _find_decoder_layers(model)
+    units = _unit_list(layers)
     layer_d: dict = {}
     forced = []
-    for idx in range(last + 1):
-        kind, li = units[idx]
-        if kind == "embed":
-            _force_embedding_cpu(model, spyre_device)
-            forced.append("embed")
-            continue
-        if li not in layer_d:
-            layer_d[li] = _extract_cpu_layer(layers[li])
-        d, layer = layer_d[li], layers[li]
-        if kind == "input_layernorm":
-            layer.input_layernorm.forward = _make_norm_forward(d["ln1_w"], d["eps"], spyre_device)
-        elif kind == "self_attn":
-            layer.self_attn.forward = _make_attn_forward(d, li, spyre_device)
-        elif kind == "post_attention_layernorm":
-            layer.post_attention_layernorm.forward = _make_norm_forward(
-                d["ln2_w"], d["eps"], spyre_device
-            )
-        elif kind == "mlp":
-            layer.mlp.forward = _make_mlp_forward(d, spyre_device)
-        forced.append(f"L{li}.{kind}")
-    print(f"[debug][cpu-ops] forced sub-op units 0..{last} onto CPU: {', '.join(forced)}")
+    for idx in indices:
+        if not 0 <= idx < len(units):
+            raise ValueError(f"--cpu-only index {idx} out of range 0..{len(units) - 1}")
+        forced.append(_force_unit(model, layers, layer_d, *units[idx], spyre_device))
+    print(f"[debug][cpu-only] forced units {list(indices)} onto CPU: {', '.join(forced)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -851,6 +873,16 @@ def _hf_generate(args) -> None:
     print(f"output: {text!r}")
 
 
+def _parse_indices(spec):
+    """Parse a comma-separated index list ("1,5,6") into a sorted unique int list."""
+    if spec is None:
+        return None
+    idxs = sorted({int(x) for x in spec.split(",") if x.strip() != ""})
+    if not idxs:
+        raise ValueError("--cpu-only was given but no indices were parsed")
+    return idxs
+
+
 def run_generate(args) -> None:
     """Full multi-token generation with the CPU prefix forced in, printing the text.
 
@@ -863,12 +895,16 @@ def run_generate(args) -> None:
 
     orig_load_model = TorchSpyreModelRunner.load_model
 
+    cpu_only = _parse_indices(args.cpu_only)
+
     def patched_load_model(self, *a, **k):
         orig_load_model(self, *a, **k)
-        if args.cpu_ops is not None or args.cpu_layers is not None:
+        if cpu_only is not None or args.cpu_ops is not None or args.cpu_layers is not None:
             model = self.get_model()
             spyre_device = next(model.parameters()).device
-            if args.cpu_ops is not None:
+            if cpu_only is not None:
+                _install_cpu_select(model, cpu_only, spyre_device)
+            elif args.cpu_ops is not None:
                 _install_cpu_ops(model, args.cpu_ops, spyre_device)
             else:
                 _install_cpu_prefix(model, args.cpu_layers, spyre_device)
@@ -897,7 +933,9 @@ def run_generate(args) -> None:
         TorchSpyreModelRunner.load_model = orig_load_model
 
     text = outputs[0].outputs[0].text
-    if args.cpu_ops is not None:
+    if cpu_only is not None:
+        tag = f"cpu-only={cpu_only}"
+    elif args.cpu_ops is not None:
         tag = f"cpu-ops<={args.cpu_ops}"
     elif args.cpu_layers is not None:
         tag = f"cpu-layers={args.cpu_layers}"
@@ -958,9 +996,17 @@ def main():
         "precedence over --cpu-layers.",
     )
     p.add_argument(
+        "--cpu-only", type=str, default=None, dest="cpu_only",
+        help="Targeted CPU bisection (requires --generate): force ONLY the given sub-op unit "
+        "indices onto CPU (comma-separated), everything else on Spyre. Same numbering as "
+        "--cpu-ops (0=embed_tokens, 1=L0.input_layernorm, 2=L0.self_attn, ...). Example: "
+        "'--cpu-only 1' runs only L0.input_layernorm on CPU (embed_tokens stays on Spyre). "
+        "Takes precedence over --cpu-ops and --cpu-layers.",
+    )
+    p.add_argument(
         "--generate", action="store_true",
         help="Run a real multi-token generation and print the text (coherence check) instead "
-        "of the 1-token per-layer capture/diff. Use with --cpu-layers or --cpu-ops.",
+        "of the 1-token per-layer capture/diff. Use with --cpu-layers / --cpu-ops / --cpu-only.",
     )
     p.add_argument(
         "--gen-tokens", type=int, default=64, dest="gen_tokens",
@@ -977,8 +1023,9 @@ def main():
     if args.generate:
         run_generate(args)
         return
-    if args.cpu_layers is not None or args.cpu_ops is not None:
-        print("[debug] --cpu-layers/--cpu-ops only apply in --generate mode; ignoring for capture.")
+    if args.cpu_layers is not None or args.cpu_ops is not None or args.cpu_only is not None:
+        print("[debug] --cpu-layers/--cpu-ops/--cpu-only only apply in --generate mode; "
+              "ignoring for capture.")
 
     print(f"[debug] prompt: {args.prompt!r}")
     print("[debug] === RUN 2: Spyre (current code) ===")
