@@ -97,6 +97,35 @@ def _llama4_attn_scale_fake(
     return torch.empty((positions.shape[0], 1), dtype=torch.float16, device=positions.device)
 
 
+def _dbg_boundary_stats(name: str, obj) -> None:
+    """TEMP DEBUG (remove once compile-mode multimodal works).
+
+    Log shape/mean/abs-max of a tensor (or each tensor in a list/tuple) at the
+    vision->decoder boundary. The vision tower runs eager in BOTH eager and
+    compile mode, so these numbers must match across an eager run and a compile
+    run for the same image; a mismatch means image encoding differs under
+    compile, a match exonerates it and points at the compiled decoder. Runs on
+    CPU fp32 so it never perturbs the on-device path.
+    """
+
+    def _one(tag, t):
+        if isinstance(t, torch.Tensor):
+            f = t.detach().to("cpu").float()
+            logger.info(
+                "DBG %s: shape=%s mean=%.6f absmax=%.6f",
+                tag,
+                tuple(t.shape),
+                f.mean().item(),
+                f.abs().max().item(),
+            )
+
+    if isinstance(obj, (list, tuple)):
+        for i, t in enumerate(obj):
+            _one(f"{name}[{i}]", t)
+    else:
+        _one(name, obj)
+
+
 @lru_cache(maxsize=1)
 def _register_llama4_attn_scale_op() -> None:
     """Register ``torch.ops.vllm.spyre_llama4_attn_scale`` once. Called from
@@ -358,6 +387,7 @@ class _SpyreModelWrapper:
         t0 = time.perf_counter()
         out = self._model.embed_multimodal(**kwargs)
         logger.info("Spyre embed_multimodal: done (%.2fs)", time.perf_counter() - t0)
+        _dbg_boundary_stats("embed_multimodal.out (image_features)", out)  # TEMP DEBUG
         return out
 
     def embed_input_ids(
@@ -393,7 +423,10 @@ class _SpyreModelWrapper:
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             logger.info("Spyre embed_input_ids: done (text-only)")
+            _dbg_boundary_stats("embed_input_ids.out (text-only embeds)", inputs_embeds)  # TEMP DEBUG
             return inputs_embeds
+
+        _dbg_boundary_stats("embed_input_ids.mm_embeds", multimodal_embeddings)  # TEMP DEBUG
 
         from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 
@@ -408,6 +441,7 @@ class _SpyreModelWrapper:
             is_multimodal=is_multimodal.to("cpu"),
         )
         logger.info("Spyre embed_input_ids: done (merged mm)")
+        _dbg_boundary_stats("embed_input_ids.merged (decoder input)", merged)  # TEMP DEBUG
         return convert(merged, device=self._spyre_device)
 
     def compute_logits(self, hidden_states, *args, **kwargs):
