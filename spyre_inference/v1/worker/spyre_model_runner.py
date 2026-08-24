@@ -982,6 +982,112 @@ class TorchSpyreModelRunner(GPUModelRunner):
             module.register_forward_hook(_post)
             logger.info("Spyre: instrumented projector stage %s", module_name)
 
+    def _patch_pixtral_patch_conv(self) -> None:
+        """Run the Pixtral patch-embedding as a real on-card `F.conv2d`.
+
+        Upstream `Conv2dLayer._forward_mulmat` lowers the patch conv (kernel==
+        stride, no padding -> `enable_linear`) to a hand-rolled im2col
+        (`unfold -> permute(0,2,3,1,4,5) -> reshape -> F.linear`). That on-device
+        `permute/reshape` restickify has no feasible layout when a patch-grid dim
+        is coprime with the 64-wide stick ("Unexpected stick expression ...
+        Mod(var, 32)"), and it emits `aten.linear`, so torch-spyre's conv2d
+        support is never reached.
+
+        Route it through `F.conv2d` (a real `aten.convolution`, which torch-spyre
+        lowers via `conv2d_via_bmm_decomp`) instead. Plain `.to("spyre")` tensors
+        still raise in `propagate_spyre_tensor_layouts`, so the input and weight
+        are pre-placed in the channel-on-stick `SpyreTensorLayout` the conv layout
+        pass requires: activation sticks on `C_in`, weight/output on `C_out` (see
+        torch-spyre `_conv_layouts`). The layout is built from each tensor's own
+        shape, so it generalizes across Pixtral's variable image resolutions, and
+        is applied on H2D (route via CPU) rather than a device->device restickify.
+        Weight is relayouted once. Eager path. Guarded/no-op for non-Pixtral
+        models and idempotent.
+        """
+        try:
+            from vllm.model_executor.layers.conv import Conv2dLayer
+            from torch_spyre._C import SpyreTensorLayout
+        except ImportError:
+            return
+
+        convs = [
+            m
+            for m in self.model.modules()
+            if isinstance(m, Conv2dLayer)
+            and getattr(m, "enable_linear", False)
+            and not getattr(m, "_spyre_conv2d", False)
+        ]
+        if not convs:
+            return
+
+        def _stick_layout(t: torch.Tensor, dim_order: list[int]):
+            # 4-arg overload (host_size, host_strides, torch.dtype, dim_order); the
+            # stick (innermost) device dim is dim_order[-1]. Mirrors _conv_layouts.
+            return SpyreTensorLayout(list(t.shape), list(t.stride()), torch.float16, dim_order)
+
+        # Probe which relayout path the conv actually accepts: try the on-card
+        # device->device restickify first (no CPU hop), fall back to H2D via CPU
+        # if it raises (the `optimize_restickify` "no feasible layout" gate).
+        # Log the outcome once per (tag, path) so we can settle D2D-vs-H2D from the
+        # run and drop the probe afterward.
+        _logged: set[str] = set()
+
+        def _relayout(t: torch.Tensor, dim_order: list[int], tag: str) -> torch.Tensor:
+            stl = _stick_layout(t, dim_order)
+            if t.device.type != "cpu":
+                try:
+                    out = t.to(device_layout=stl)
+                    if f"{tag}:D2D" not in _logged:
+                        logger.info(
+                            "Spyre patch-conv %s: D2D restickify SUCCEEDED (on-card, "
+                            "no CPU hop).",
+                            tag,
+                        )
+                        _logged.add(f"{tag}:D2D")
+                    return out
+                except Exception as e:  # noqa: BLE001 - probe: any failure -> H2D fallback
+                    if f"{tag}:D2Dfail" not in _logged:
+                        logger.warning(
+                            "Spyre patch-conv %s: D2D restickify FAILED (%s: %s); "
+                            "falling back to H2D via CPU.",
+                            tag,
+                            type(e).__name__,
+                            e,
+                        )
+                        _logged.add(f"{tag}:D2Dfail")
+            out = t.to("cpu").to(device_layout=stl)
+            if f"{tag}:H2D" not in _logged:
+                logger.info(
+                    "Spyre patch-conv %s: H2D (CPU->Spyre) restickify used.", tag
+                )
+                _logged.add(f"{tag}:H2D")
+            return out
+
+        def _conv2d_native(self, x: torch.Tensor) -> torch.Tensor:
+            assert x.dim() == 4
+            # activation: C_in (logical dim 1) on the 64-stick.
+            x_dev = _relayout(x, [0, 2, 3, 1], "activation")
+            return torch.nn.functional.conv2d(
+                x_dev,
+                self._spyre_conv2d_weight,
+                self.bias,
+                stride=self.stride,
+                padding=self.padding,
+            )
+
+        for c in convs:
+            # weight (C_out, C_in, kH, kW): C_out on the stick. Relayout once.
+            c._spyre_conv2d_weight = _relayout(c.weight.detach(), [1, 2, 3, 0], "weight")
+            bound = types.MethodType(_conv2d_native, c)
+            c.forward_native = bound
+            c._forward_method = bound
+            c._spyre_conv2d = True
+        logger.info(
+            "Spyre: patched %d Pixtral patch-conv(s) to on-card F.conv2d "
+            "(channel-on-stick layout; D2D-first, H2D fallback).",
+            len(convs),
+        )
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -1063,6 +1169,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # rotation with an index_select gather. No-op for non-Pixtral / HF-Pixtral
         # models. Before compile like the other patches.
         self._patch_pixtral_vision_rope_vit()
+
+        # Pixtral patch-embedding conv: upstream lowers it to a hand-rolled im2col
+        # whose on-device reshape can't restickify for coprime patch grids; run it
+        # as a real on-card F.conv2d with channel-on-stick layout. No-op for
+        # non-Pixtral models. Before compile like the other patches.
+        self._patch_pixtral_patch_conv()
 
         # Pixtral vision attention: stock SDPA's batch-matmul can't restickify for
         # coprime patch counts; run it on-card with sequence/head padded to the 64
