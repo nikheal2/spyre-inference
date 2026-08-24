@@ -39,6 +39,7 @@ the CPU fallbacks will be obsolete and most operations will be performed on Spyr
 from __future__ import annotations
 
 import time
+import types
 from contextlib import contextmanager
 from functools import lru_cache
 
