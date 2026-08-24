@@ -612,23 +612,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         slot_block_indices = (sm_cpu // self.block_size).tolist()
         slot_block_offsets = (sm_cpu % self.block_size).tolist()
 
-        # [recompile-probe] TEMP: log raw vs aligned lengths + per-step Python list
-        # values to see which one increments each decode step (drives the compile
-        # recompilation storm under multimodal). Remove after diagnosis.
-        logger.info(
-            "[recompile-probe] max_q=%d aligned_q=%d max_seq=%d aligned_seq=%d "
-            "n_seq=%d tiles_per_seq=%s slot_off0=%s slot_idx0=%s seq_lens=%s",
-            max_query_len,
-            aligned_max_query_len,
-            max_seq_len,
-            aligned_max_seq_len,
-            num_seqs,
-            [len(t) for t in attention_mask_tiles],
-            slot_block_offsets[0] if slot_block_offsets else None,
-            slot_block_indices[0] if slot_block_indices else None,
-            seq_lens.tolist() if seq_lens.numel() <= 8 else list(seq_lens.shape),
-        )
-
         # NOTE: since the outer loop of the paged attention implementation
         #  runs on the CPU (list-based), most meta-data also remains on CPU
         return SpyreAttentionMetadata(
