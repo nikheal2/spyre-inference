@@ -29,7 +29,6 @@ own transpose in `unfuse.py`; the LM head transposes `padded_weight` in
 defined once.
 """
 
-import os
 import types
 
 import torch
@@ -44,16 +43,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
-from .utils import convert
-
 logger = init_logger(__name__)
-
-# Set SPYRE_LINEAR_DEALIAS=0 to skip the Spyre->CPU->Spyre de-alias round-trip in
-# `spyre_linear_t` (see its docstring). The round-trip guards against torch-spyre
-# reusing one static output buffer per matmul shape; this switch exists to test
-# whether that has been fixed upstream, and whether the round-trip is what breaks
-# whole-graph torch.compile. Default 1 (keep the guard).
-_LINEAR_DEALIAS = os.environ.get("SPYRE_LINEAR_DEALIAS", "1") == "1"
 
 
 @QKVParallelLinear.register_oot(name="QKVParallelLinear")
@@ -74,30 +64,21 @@ def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor |
     `weight_t` is the physically-transposed weight of shape `[in, out]`, so the
     matmul is a plain `x @ A` (the Spyre-fast layout), not `F.linear`'s `x @ Aᵀ`.
 
-    torch-spyre compiles each op via ``compile_once(op, dynamic=False)`` with a
-    **static output buffer**. Every decoder layer's ``qkv``/``o_proj``/
-    ``gate_up``/``down_proj`` share the same shape, so they hit the *same*
-    compiled matmul kernel writing to *one fixed device address*. Returning that
-    tensor directly aliases the shared buffer, and the next same-shape matmul
-    silently overwrites it — corrupting any retained value (the residual stream,
-    a cached activation) and producing structurally-wrong output. The
-    Spyre→CPU→Spyre round-trip DMAs the result out of the shared pool and
-    allocates a dedicated buffer that later matmuls won't clobber. (These linears
-    are ``bias=False``, so the ``+ bias`` add — which would itself allocate fresh
-    memory — usually doesn't run.)
+    This used to end with a Spyre→CPU→Spyre round-trip: torch-spyre compiled each
+    op with a **static output buffer**, so every same-shape matmul (``qkv``/
+    ``o_proj``/``gate_up``/``down_proj`` across all decoder layers) wrote to one
+    fixed device address, and returning it directly let the next matmul clobber a
+    retained value (the residual stream), producing structurally-wrong output.
+    The round-trip DMA'd the result out of that shared pool.
 
-    ``SPYRE_LINEAR_DEALIAS=0`` skips the round-trip, to test whether torch-spyre
-    has since stopped sharing the static output buffer. If it has not, expect
-    structurally-wrong output (garbage text) — including in eager.
+    torch-spyre no longer shares the buffer, so the round-trip was removed —
+    validated on this branch by text-only generation staying coherent without it,
+    in both eager and torch.compile. If structurally-wrong output (garbage text)
+    ever reappears across the board, restore the round-trip here first.
     """
     out = torch.matmul(x, weight_t)
     if bias is not None:
         out = out + bias
-    if not _LINEAR_DEALIAS:
-        return out
-    device = out.device
-    out = convert(out, device="cpu")
-    out = convert(out, device=device)
     return out
 
 

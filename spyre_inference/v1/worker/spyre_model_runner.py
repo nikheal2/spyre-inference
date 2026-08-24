@@ -38,6 +38,7 @@ the CPU fallbacks will be obsolete and most operations will be performed on Spyr
 
 from __future__ import annotations
 
+import os
 import time
 import types
 from contextlib import contextmanager
@@ -64,6 +65,12 @@ from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
+
+# DIAGNOSTIC: SPYRE_EMBED_ROUNDTRIP=1 routes the text-only inputs_embeds through
+# D2H->H2D so it reaches the compiled graph with the same "transferred" provenance
+# as the multimodal merge. Used to test whether transferred graph inputs are what
+# corrupts compile-mode multimodal output. Default 0 (device-native, unchanged).
+_EMBED_ROUNDTRIP = os.environ.get("SPYRE_EMBED_ROUNDTRIP", "0") == "1"
 
 def _llama4_attn_scale_op(
     positions: torch.Tensor, beta: float, original_max_position_embeddings: int
@@ -386,6 +393,16 @@ class _SpyreModelWrapper:
         inputs_embeds = self._model.embed_input_ids(input_ids)
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            if _EMBED_ROUNDTRIP:
+                # DIAGNOSTIC (SPYRE_EMBED_ROUNDTRIP=1): give the text path the same
+                # D2H->H2D provenance the multimodal merge has, so its inputs_embeds
+                # enters the compiled graph as a *transferred* tensor rather than a
+                # device-native one. If text output then turns to gibberish under
+                # compile, transferred graph inputs (missing device_tensor_layout)
+                # are the multimodal corruptor.
+                inputs_embeds = convert(
+                    convert(inputs_embeds, device="cpu"), device=self._spyre_device
+                )
             return inputs_embeds
 
         from vllm.model_executor.models.utils import _merge_multimodal_embeddings
@@ -764,9 +781,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
 
         stick = 64
-        layer_counter = {"n": 0}
 
-        def _spyre_vision_sdpa(q, k, v, mask, layer):
+        def _spyre_vision_sdpa(q, k, v, mask):
             # q, k, v: [B, H, L, D] on device. Pad L,D to the stick, SDPA on-card, crop.
             b, h, seq, d = q.shape
             scale = d**-0.5
@@ -799,11 +815,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 m[:, :, :seq, :seq] = m[:, :, :seq, :seq] + add
 
             dev = q.device.type
-            logger.info(
-                "Spyre vision SDPA layer %d: start (B=%d H=%d Lpad=%d Dpad=%d)",
-                layer, b, h, seq_pad, d_pad,
-            )
-            t0 = time.perf_counter()
             out = torch.nn.functional.scaled_dot_product_attention(
                 convert(qb, dev),
                 convert(kb, dev),
@@ -812,14 +823,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 scale=scale,
             )
             out = convert(out, "cpu")[:, :, :seq, :d].contiguous()
-            logger.info(
-                "Spyre vision SDPA layer %d: done (%.2fs)", layer, time.perf_counter() - t0
-            )
             return convert(out, q.device.type)
 
         def _forward(self, x, mask, freqs_cis):
-            n = layer_counter["n"]
-            layer_counter["n"] = n + 1
             batch, patches, _ = x.shape
             qkv, _ = self.qkv_proj(x)
             q, k, v = qkv.chunk(3, dim=-1)
@@ -831,7 +837,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-            out = _spyre_vision_sdpa(q, k, v, mask, n)
+            out = _spyre_vision_sdpa(q, k, v, mask)
             out = out.transpose(1, 2).reshape(batch, patches, self.n_heads * self.head_dim)
             out, _ = self.o_proj(out)
             return out
