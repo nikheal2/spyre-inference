@@ -111,25 +111,25 @@ class SpyreRMSNorm(RMSNorm):
         if self.variance_size_override is not None:
             raise NotImplementedError("TODO: variance_size_override not yet implemented")
 
-        # fp32 promotion, matching upstream RMSNorm: promote to fp32 for the
-        # residual add + variance + rsqrt to avoid fp16 overflow of x**2 /
-        # precision loss in the residual add when the residual stream is large.
-        # torch-spyre does not register dtype-changing ops as Spyre kernels
-        # (see torch_spyre/ops/eager.py), so the fp32 math runs on CPU. It is
-        # wrapped in the opaque `spyre_rms_norm_fp32` op so the CPU `mean` is not
-        # traced into a torch.compile graph (Inductor's cpp backend cannot
-        # codegen a `mean` reduction). The weight multiply stays on-device.
-        has_residual = residual is not None
-        x, new_residual = torch.ops.vllm.spyre_rms_norm_fp32(
-            x,
-            residual if has_residual else x,
-            self.variance_epsilon,
-            has_residual,
-        )
+        # ISOLATION EXPERIMENT (compile-mode garbage): run RMSNorm fully on-device
+        # in fp16 — no CPU round-trip, no opaque op. torch-spyre registers
+        # pow/mean/rsqrt/mul/add for the compiled path, so this traces natively.
+        # If compile is STILL garbage with this, the `spyre_rms_norm_fp32` opaque
+        # op is exonerated; if compile goes coherent, that op boundary was the
+        # culprit. Caveat: fp16 sum-of-squares can overflow for large residual
+        # streams — validate this path in EAGER first (must be coherent) before
+        # trusting the compile result. Restore by reinstating the
+        # `torch.ops.vllm.spyre_rms_norm_fp32(...)` call below.
+        if residual is not None:
+            x = x + residual
+            residual = x
+
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
 
         if self.has_weight:
             x = x * self.weight
-        if not has_residual:
+        if residual is None:
             return x
         else:
-            return x, new_residual
+            return x, residual
