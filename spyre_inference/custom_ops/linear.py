@@ -29,6 +29,7 @@ own transpose in `unfuse.py`; the LM head transposes `padded_weight` in
 defined once.
 """
 
+import os
 import types
 
 import torch
@@ -46,6 +47,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from .utils import convert
 
 logger = init_logger(__name__)
+
+# Set SPYRE_LINEAR_DEALIAS=0 to skip the Spyre->CPU->Spyre de-alias round-trip in
+# `spyre_linear_t` (see its docstring). The round-trip guards against torch-spyre
+# reusing one static output buffer per matmul shape; this switch exists to test
+# whether that has been fixed upstream, and whether the round-trip is what breaks
+# whole-graph torch.compile. Default 1 (keep the guard).
+_LINEAR_DEALIAS = os.environ.get("SPYRE_LINEAR_DEALIAS", "1") == "1"
 
 
 @QKVParallelLinear.register_oot(name="QKVParallelLinear")
@@ -77,10 +85,16 @@ def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor |
     allocates a dedicated buffer that later matmuls won't clobber. (These linears
     are ``bias=False``, so the ``+ bias`` add — which would itself allocate fresh
     memory — usually doesn't run.)
+
+    ``SPYRE_LINEAR_DEALIAS=0`` skips the round-trip, to test whether torch-spyre
+    has since stopped sharing the static output buffer. If it has not, expect
+    structurally-wrong output (garbage text) — including in eager.
     """
     out = torch.matmul(x, weight_t)
     if bias is not None:
         out = out + bias
+    if not _LINEAR_DEALIAS:
+        return out
     device = out.device
     out = convert(out, device="cpu")
     out = convert(out, device=device)
