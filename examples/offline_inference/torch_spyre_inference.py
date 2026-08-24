@@ -70,6 +70,14 @@ def parse_args():
         "instead of the text-only prompt batch.",
     )
     parser.add_argument(
+        "--mm-limit",
+        action="store_true",
+        dest="mm_limit",
+        help="Diagnostic (text-only run): pass limit_mm_per_prompt={'image': 1} — the "
+        "only LLM() kwarg that differs from the multimodal run — while sending pure "
+        "text prompts. Isolates 'declaring multimodal support' from 'processing an image'.",
+    )
+    parser.add_argument(
         "--text-probe",
         action="store_true",
         dest="text_probe",
@@ -259,6 +267,12 @@ def main():
         dtype="float16",
         enforce_eager=args.enforce_eager,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
+        # DIAGNOSTIC (--mm-limit): the ONLY LLM() kwarg that differs between the
+        # coherent text-only run and the garbage multimodal run. Setting it here
+        # runs pure text prompts (no image, no vision tower) under the multimodal
+        # config. If text turns to garbage under compile, the trigger is declaring
+        # multimodal support itself — not image processing.
+        **({"limit_mm_per_prompt": {"image": 1}} if args.mm_limit else {}),
     )
 
     # Generate texts from the prompts. The output is a list of RequestOutput objects
