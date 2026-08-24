@@ -1036,8 +1036,24 @@ class TorchSpyreModelRunner(GPUModelRunner):
         def _relayout(t: torch.Tensor, dim_order: list[int], tag: str) -> torch.Tensor:
             stl = _stick_layout(t, dim_order)
             if t.device.type != "cpu":
+                out = None
                 try:
                     out = t.to(device_layout=stl)
+                except Exception as e:  # noqa: BLE001 - probe: any failure -> H2D fallback
+                    if f"{tag}:D2Dfail" not in _logged:
+                        logger.warning(
+                            "Spyre patch-conv %s: D2D restickify raised (%s: %s); "
+                            "falling back to H2D via CPU.",
+                            tag,
+                            type(e).__name__,
+                            e,
+                        )
+                        _logged.add(f"{tag}:D2Dfail")
+                # torch-spyre's spyre_to D2D branch returns copy_from_d2d's result,
+                # which is None (the op mutates `dst` in place; see customops.py
+                # copy_from_d2d, mutates_args=("dst",)). A None here means the
+                # on-card relayout produced no usable tensor, so fall back to H2D.
+                if out is not None:
                     if f"{tag}:D2D" not in _logged:
                         logger.info(
                             "Spyre patch-conv %s: D2D restickify SUCCEEDED (on-card, "
@@ -1046,16 +1062,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         )
                         _logged.add(f"{tag}:D2D")
                     return out
-                except Exception as e:  # noqa: BLE001 - probe: any failure -> H2D fallback
-                    if f"{tag}:D2Dfail" not in _logged:
-                        logger.warning(
-                            "Spyre patch-conv %s: D2D restickify FAILED (%s: %s); "
-                            "falling back to H2D via CPU.",
-                            tag,
-                            type(e).__name__,
-                            e,
-                        )
-                        _logged.add(f"{tag}:D2Dfail")
+                if f"{tag}:D2Dnone" not in _logged:
+                    logger.warning(
+                        "Spyre patch-conv %s: D2D restickify returned None "
+                        "(torch-spyre spyre_to D2D bug); falling back to H2D via CPU.",
+                        tag,
+                    )
+                    _logged.add(f"{tag}:D2Dnone")
             out = t.to("cpu").to(device_layout=stl)
             if f"{tag}:H2D" not in _logged:
                 logger.info(
