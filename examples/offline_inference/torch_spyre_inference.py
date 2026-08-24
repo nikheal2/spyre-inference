@@ -70,6 +70,14 @@ def parse_args():
         "instead of the text-only prompt batch.",
     )
     parser.add_argument(
+        "--text-probe",
+        action="store_true",
+        dest="text_probe",
+        help="Diagnostic (with --multimodal): run a text-only prompt before and after "
+        "the image request in the same process. If the AFTER probe is garbage while "
+        "BEFORE is coherent, the vision run corrupted persistent device state.",
+    )
+    parser.add_argument(
         "--image-url",
         type=str,
         default=(
@@ -147,6 +155,24 @@ def run_multimodal(args):
         temperature=0.0,
     )
 
+    # DIAGNOSTIC (--text-probe): run the same text-only prompt BEFORE and AFTER the
+    # image request, in one process. Text-only is known-coherent under compile, so:
+    #   before OK + after GARBAGE -> the vision run corrupted persistent device /
+    #       compiled-graph state (corruption outlives the image request);
+    #   before OK + after OK      -> corruption is confined to the image request
+    #       itself, so persistent device state is exonerated.
+    probe_prompt = "What are IBMs main businesses?"
+    probe_params = SamplingParams(max_tokens=32, temperature=0.0)
+
+    def _text_probe(tag):
+        if not args.text_probe:
+            return
+        out = llm.generate([probe_prompt], probe_params)
+        print(f"\n=============== TEXT PROBE ({tag})")
+        print(f"generated: {out[0].outputs[0].text!r}\n")
+
+    _text_probe("before image")
+
     print("=============== GENERATE (multimodal)")
     t0 = time.time()
     outputs = llm.chat(messages, sampling_params)
@@ -157,6 +183,8 @@ def run_multimodal(args):
         print(f"\nPrompt:\n {output.prompt!r}")
         print(f"\nGenerated text:\n {output.outputs[0].text!r}\n")
         print("-----------------------------------")
+
+    _text_probe("after image")
 
 
 def main():
