@@ -343,6 +343,12 @@ class _SpyreModelWrapper:
 
         result = tree_map(_to_cpu, result)
 
+        # TEMP DEBUG: per-forward-step output of the (compiled) decoder. Under
+        # fullgraph compile this boundary is the only observable point; comparing
+        # these stats eager-vs-compile localizes the first prefill chunk whose
+        # decoder output diverges. Remove once compile-mode multimodal works.
+        _dbg_boundary_stats("model.forward out (hidden states)", result)
+
         input_ids = kwargs_converted.get("input_ids")
         num_tokens = input_ids.shape[0] if input_ids is not None else -1
         logger.debug("t_token: %.2fms [num tokens %d]", (time.time() - t0) * 1000, num_tokens)
