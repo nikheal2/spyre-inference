@@ -924,13 +924,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @staticmethod
     def _patch_pixtral_patch_merger() -> None:
-        """Run Pixtral `PatchMerger.permute` (spatial 2x2 regroup) on CPU.
+        """Run Pixtral `PatchMerger.permute` (spatial s×s regroup) ON-CARD, CPU fallback.
 
-        `PatchMerger.permute` -> `get_sub_grids` uses `F.unfold` (`aten::im2col`),
-        unsupported on Spyre (`NotImplementedError: Could not run 'aten::im2col'`).
-        The regroup is pure reshuffling and runs once per image, so do it on CPU;
-        H2D the result so the `merging_layer` GEMM still runs on-card (unchanged, so
-        the Spyre-transposed linear weight is untouched). Guarded/no-op if absent.
+        Stock `PatchMerger.permute` -> `get_sub_grids` uses `F.unfold`
+        (`aten::im2col`), which Spyre has no kernel for. But the s×s regroup is a
+        pure space-to-depth reshuffle: it can be written with `reshape`/`permute`/
+        `cat` (no im2col) that produces the *identical* result — feature order
+        `(d, kh, kw)` and patch order row-major `(oh, ow)`, matching `F.unfold`. We
+        try that on-card first; if the on-device relayout can't lower (or any op is
+        unsupported), fall back to the original CPU unfold path. Either way the
+        `merging_layer` GEMM stays on-card. Guarded/no-op if absent.
         """
         try:
             from vllm.model_executor.models import pixtral
@@ -941,16 +944,50 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if pm_cls is None or getattr(pm_cls.forward, "_spyre_patched", False):
             return
 
+        def _permute_on_device(x, image_sizes, s):
+            # (N, d) patch tokens -> (N/s², d·s²), s×s blocks flattened as
+            # (d, kh, kw). No im2col: (h·w, d) reshapes directly to
+            # (h/s, s, w/s, s, d) because the flat patch index i·w+j decomposes as
+            # oh·s·w + kh·w + ow·s + kw — exactly this 5-D split.
+            d = x.shape[-1]
+            tokens_per_image = [h * w for h, w in image_sizes]
+            outs = []
+            for img, (h, w) in zip(x.split(tokens_per_image), image_sizes):
+                g = img.reshape(h // s, s, w // s, s, d)  # (oh, kh, ow, kw, d)
+                g = g.permute(0, 2, 4, 1, 3)              # (oh, ow, d, kh, kw)
+                g = g.reshape((h // s) * (w // s), d * s * s)
+                outs.append(g)
+            return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+
+        _logged: set[str] = set()
+
         def _forward(self, x, image_sizes):
             dev = x.device
-            x_perm = self.permute(x.to("cpu"), image_sizes)  # unfold on CPU
-            return self.merging_layer(convert(x_perm, device=dev))  # GEMM on-card
+            try:
+                x_perm = _permute_on_device(x, image_sizes, self.spatial_merge_size)
+                if "on-device" not in _logged:
+                    logger.info(
+                        "Spyre PatchMerger: on-device regroup (reshape/permute, no "
+                        "im2col)."
+                    )
+                    _logged.add("on-device")
+            except Exception as e:  # noqa: BLE001 - fall back to CPU unfold path
+                if "cpu" not in _logged:
+                    logger.warning(
+                        "Spyre PatchMerger: on-device regroup failed (%s: %s); "
+                        "falling back to CPU unfold.",
+                        type(e).__name__,
+                        e,
+                    )
+                    _logged.add("cpu")
+                x_perm = convert(self.permute(x.to("cpu"), image_sizes), device=dev)
+            return self.merging_layer(x_perm)  # GEMM on-card
 
         _forward._spyre_patched = True
         pm_cls.forward = _forward  # ty: ignore[invalid-assignment]
         logger.info(
-            "Spyre: patched Pixtral PatchMerger permute to CPU (merging_layer GEMM "
-            "stays on-card)."
+            "Spyre: patched Pixtral PatchMerger to on-card regroup (CPU unfold "
+            "fallback; merging_layer GEMM stays on-card)."
         )
 
     def _instrument_pixtral_projector(self) -> None:
@@ -1026,55 +1063,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # stick (innermost) device dim is dim_order[-1]. Mirrors _conv_layouts.
             return SpyreTensorLayout(list(t.shape), list(t.stride()), torch.float16, dim_order)
 
-        # Probe which relayout path the conv actually accepts: try the on-card
-        # device->device restickify first (no CPU hop), fall back to H2D via CPU
-        # if it raises (the `optimize_restickify` "no feasible layout" gate).
-        # Log the outcome once per (tag, path) so we can settle D2D-vs-H2D from the
-        # run and drop the probe afterward.
         _logged: set[str] = set()
 
         def _relayout(t: torch.Tensor, dim_order: list[int], tag: str) -> torch.Tensor:
-            stl = _stick_layout(t, dim_order)
-            if t.device.type != "cpu":
-                out = None
-                try:
-                    out = t.to(device_layout=stl)
-                except Exception as e:  # noqa: BLE001 - probe: any failure -> H2D fallback
-                    if f"{tag}:D2Dfail" not in _logged:
-                        logger.warning(
-                            "Spyre patch-conv %s: D2D restickify raised (%s: %s); "
-                            "falling back to H2D via CPU.",
-                            tag,
-                            type(e).__name__,
-                            e,
-                        )
-                        _logged.add(f"{tag}:D2Dfail")
-                # torch-spyre's spyre_to D2D branch returns copy_from_d2d's result,
-                # which is None (the op mutates `dst` in place; see customops.py
-                # copy_from_d2d, mutates_args=("dst",)). A None here means the
-                # on-card relayout produced no usable tensor, so fall back to H2D.
-                if out is not None:
-                    if f"{tag}:D2D" not in _logged:
-                        logger.info(
-                            "Spyre patch-conv %s: D2D restickify SUCCEEDED (on-card, "
-                            "no CPU hop).",
-                            tag,
-                        )
-                        _logged.add(f"{tag}:D2D")
-                    return out
-                if f"{tag}:D2Dnone" not in _logged:
-                    logger.warning(
-                        "Spyre patch-conv %s: D2D restickify returned None "
-                        "(torch-spyre spyre_to D2D bug); falling back to H2D via CPU.",
-                        tag,
-                    )
-                    _logged.add(f"{tag}:D2Dnone")
-            out = t.to("cpu").to(device_layout=stl)
-            if f"{tag}:H2D" not in _logged:
-                logger.info(
-                    "Spyre patch-conv %s: H2D (CPU->Spyre) restickify used.", tag
-                )
-                _logged.add(f"{tag}:H2D")
+            # Realize the channel-on-stick layout via H2D (CPU -> Spyre): that path
+            # returns a real tensor. The device->device `.to(device_layout=)` does
+            # NOT — torch-spyre's spyre_to D2D branch returns `copy_from_d2d`'s
+            # result, which is None (the op mutates `dst` in place;
+            # mutates_args=("dst",)). See ministral-multimodal-bringup-issues.md #6a.
+            out = t.to("cpu").to(device_layout=_stick_layout(t, dim_order))
+            if tag not in _logged:
+                logger.info("Spyre patch-conv %s: H2D (CPU->Spyre) restickify.", tag)
+                _logged.add(tag)
             return out
 
         def _conv2d_native(self, x: torch.Tensor) -> torch.Tensor:
@@ -1098,7 +1098,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             c._spyre_conv2d = True
         logger.info(
             "Spyre: patched %d Pixtral patch-conv(s) to on-card F.conv2d "
-            "(channel-on-stick layout; D2D-first, H2D fallback).",
+            "(channel-on-stick layout via H2D restickify).",
             len(convs),
         )
 
