@@ -68,6 +68,17 @@ def _record_function(name: str):
 # Default: off (unset or "0").
 _FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
 
+# DIAGNOSTIC (SPYRE_ATTN_ONDEVICE_Q=0): disable the single-sequence-decode
+# on-device query assembly in `_online_softmax_attention` and route every query
+# through the CPU staging path. That fast path fills a zeroed `q` via the
+# in-place `_overwrite`, which torch.compile's functionalization cannot see
+# (`torch.ops.spyre.overwrite` is dynamically registered without a `Tensor(a!)`
+# mutation annotation), so Inductor may drop or reorder the write and leave `q`
+# all zeros. It is the only path taken exclusively when num_seqs == 1 and
+# query_len == 1 — the exact condition under which compiled output is garbage.
+# Default: on (the fast path), matching previous behaviour.
+_ONDEVICE_Q_ASSEMBLY = os.environ.get("SPYRE_ATTN_ONDEVICE_Q", "1") == "1"
+
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
 # Because torch.compile treats shapes as static constants, every distinct kv_len
@@ -817,6 +828,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.max_query_len > 1
             or attn_metadata.num_seqs > 1
             or not ondevice_overwrite_ok
+            or not _ONDEVICE_Q_ASSEMBLY
         )
         query_cpu = convert(query, "cpu") if needs_query_cpu else None
 
