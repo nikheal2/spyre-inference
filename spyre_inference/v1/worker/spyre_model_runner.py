@@ -79,6 +79,8 @@ _EMBED_ROUNDTRIP = os.environ.get("SPYRE_EMBED_ROUNDTRIP", "0") == "1"
 #   "none"     - compile nothing (equivalent to eager, but keeps the compile path)
 #   "mlp"      - compile only each decoder layer's `mlp`
 #   "attn"     - compile only each decoder layer's `self_attn`
+#   "attn:X"   - compile only child X of self_attn (qkv_proj, o_proj, rotary_emb,
+#                attn); an unknown name raises listing the available children
 #   "layers:N" - compile only the first N decoder layers, whole-layer
 # Scoped modes use fullgraph=False, since a submodule boundary legitimately
 # graph-breaks (e.g. the opaque attention op); they answer "does compiling this
@@ -1242,6 +1244,26 @@ class TorchSpyreModelRunner(GPUModelRunner):
             for i in range(min(int(scope.split(":", 1)[1]), len(layers))):
                 layers[i] = _wrap(layers[i])
                 n += 1
+        elif scope.startswith("attn:"):
+            # Compile one child of self_attn, leaving the connective tissue
+            # (qkv split, head reshapes) uncompiled. If no single child breaks,
+            # the fault is in that connective tissue rather than in any child.
+            attr = scope.split(":", 1)[1]
+            seen: set[str] = set()
+            for layer in layers:
+                parent = getattr(layer, "self_attn", None)
+                if parent is None:
+                    continue
+                seen.update(name for name, _ in parent.named_children())
+                sub = getattr(parent, attr, None)
+                if sub is not None:
+                    setattr(parent, attr, _wrap(sub))
+                    n += 1
+            if n == 0:
+                raise ValueError(
+                    f"SPYRE_COMPILE_SCOPE={scope}: self_attn has no child {attr!r}; "
+                    f"available: {sorted(seen)}"
+                )
         elif scope in ("mlp", "attn"):
             attr = "mlp" if scope == "mlp" else "self_attn"
             for layer in layers:
