@@ -87,6 +87,12 @@ _EMBED_ROUNDTRIP = os.environ.get("SPYRE_EMBED_ROUNDTRIP", "0") == "1"
 # region corrupt output", not "does this region compile as one graph".
 _COMPILE_SCOPE = os.environ.get("SPYRE_COMPILE_SCOPE", "model")
 
+# DIAGNOSTIC (SPYRE_COMPILE_BACKEND): backend for scoped compiles, to tell which
+# compiler stage corrupts. "eager" = dynamo trace only (guards/specialization),
+# "aot_eager" = + AOTAutograd functionalization, "inductor" = + codegen. The
+# first backend that produces garbage is the stage at fault.
+_COMPILE_BACKEND = os.environ.get("SPYRE_COMPILE_BACKEND", "inductor")
+
 
 def _llama4_attn_scale_op(
     positions: torch.Tensor, beta: float, original_max_position_embeddings: int
@@ -1224,7 +1230,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
 
         def _wrap(m):
-            return torch.compile(m, backend="inductor", fullgraph=False, dynamic=False)
+            return torch.compile(m, backend=_COMPILE_BACKEND, fullgraph=False, dynamic=False)
 
         root = self.get_model()
         layer_lists = [
@@ -1275,8 +1281,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             raise ValueError(f"Unknown SPYRE_COMPILE_SCOPE={scope!r}")
 
         logger.info(
-            "SPYRE_COMPILE_SCOPE=%s: compiled %d module(s) of %d decoder layers.",
+            "SPYRE_COMPILE_SCOPE=%s (backend=%s): compiled %d module(s) of %d decoder layers.",
             scope,
+            _COMPILE_BACKEND,
             n,
             len(layers),
         )
