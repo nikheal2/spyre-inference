@@ -72,6 +72,20 @@ logger = init_logger(__name__)
 # corrupts compile-mode multimodal output. Default 0 (device-native, unchanged).
 _EMBED_ROUNDTRIP = os.environ.get("SPYRE_EMBED_ROUNDTRIP", "0") == "1"
 
+# DIAGNOSTIC (SPYRE_COMPILE_SCOPE): narrow what torch.compile covers, to bisect
+# which region of the decoder is miscompiled when the token count is 1 (compiled
+# output is garbage at 1 token, correct at >= 2; eager is correct at every size).
+#   "model"    - default, unchanged: one fullgraph over the whole model
+#   "none"     - compile nothing (equivalent to eager, but keeps the compile path)
+#   "mlp"      - compile only each decoder layer's `mlp`
+#   "attn"     - compile only each decoder layer's `self_attn`
+#   "layers:N" - compile only the first N decoder layers, whole-layer
+# Scoped modes use fullgraph=False, since a submodule boundary legitimately
+# graph-breaks (e.g. the opaque attention op); they answer "does compiling this
+# region corrupt output", not "does this region compile as one graph".
+_COMPILE_SCOPE = os.environ.get("SPYRE_COMPILE_SCOPE", "model")
+
+
 def _llama4_attn_scale_op(
     positions: torch.Tensor, beta: float, original_max_position_embeddings: int
 ) -> torch.Tensor:
@@ -1160,6 +1174,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
         - CompilationMode.STOCK_TORCH_COMPILE: whole-model torch.compile
         """
         mode = self.compilation_config.mode
+        # vLLM appends "none" to custom_ops whenever backend=="inductor" and
+        # mode!=NONE, which routes every CustomOp to forward_native and silently
+        # bypasses the Spyre forward_oot implementations. platform.py appends
+        # "all" first to prevent that; log the resolved value so a regression in
+        # config ordering is visible rather than silent.
+        logger.info(
+            "Spyre compile config: mode=%s backend=%s custom_ops=%s",
+            mode,
+            self.compilation_config.backend,
+            self.compilation_config.custom_ops,
+        )
         if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
             raise ValueError(
                 f"Unsupported compilation mode {mode} for Spyre. Only "
@@ -1169,6 +1194,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
             logger.info("Compilation disabled (enforce_eager=True)")
+            return
+
+        if _COMPILE_SCOPE != "model":
+            self._compile_scoped(_COMPILE_SCOPE)
             return
 
         # Trigger whole-model compile:
@@ -1184,6 +1213,50 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "Compiled model %s as a single graph for Spyre in %.3fs.",
             type(self.get_model()).__name__,
             time.time() - t0,
+        )
+
+    def _compile_scoped(self, scope: str) -> None:
+        """DIAGNOSTIC: compile only part of the decoder. See _COMPILE_SCOPE."""
+        if scope == "none":
+            logger.info("SPYRE_COMPILE_SCOPE=none: compiling nothing.")
+            return
+
+        def _wrap(m):
+            return torch.compile(m, backend="inductor", fullgraph=False, dynamic=False)
+
+        root = self.get_model()
+        layer_lists = [
+            m
+            for m in root.modules()
+            if isinstance(m, torch.nn.ModuleList)
+            and len(m) > 0
+            and type(m[0]).__name__.endswith("DecoderLayer")
+        ]
+        if not layer_lists:
+            raise ValueError(f"SPYRE_COMPILE_SCOPE={scope}: found no decoder layer list")
+        # The language model's stack is the longest; a vision tower's is shorter.
+        layers = max(layer_lists, key=len)
+
+        n = 0
+        if scope.startswith("layers:"):
+            for i in range(min(int(scope.split(":", 1)[1]), len(layers))):
+                layers[i] = _wrap(layers[i])
+                n += 1
+        elif scope in ("mlp", "attn"):
+            attr = "mlp" if scope == "mlp" else "self_attn"
+            for layer in layers:
+                sub = getattr(layer, attr, None)
+                if sub is not None:
+                    setattr(layer, attr, _wrap(sub))
+                    n += 1
+        else:
+            raise ValueError(f"Unknown SPYRE_COMPILE_SCOPE={scope!r}")
+
+        logger.info(
+            "SPYRE_COMPILE_SCOPE=%s: compiled %d module(s) of %d decoder layers.",
+            scope,
+            n,
+            len(layers),
         )
 
     def warming_up_model(self) -> None:
