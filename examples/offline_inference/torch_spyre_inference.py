@@ -88,19 +88,33 @@ def parse_args():
     parser.add_argument(
         "--image-url",
         type=str,
-        default=(
-            "https://raw.githubusercontent.com/vis-nlp/ChartQA/main/"
-            "ChartQA%20Dataset/test/png/15008.png"
-        ),
+        default=None,
         dest="image_url",
-        help="Image URL to download and feed to the model in --multimodal mode.",
+        help="Comma-separated image URLs overriding MULTIMODAL_CASES. The first "
+        "--num-prompts images are sent as one batch; any that fail to download "
+        "fall back to the first image so the batch size is still honoured.",
     )
     return parser.parse_args()
 
 
-# ChartQA-style reasoning prompt used in --multimodal mode.
+_CHARTQA = "https://raw.githubusercontent.com/vis-nlp/ChartQA/main/ChartQA%20Dataset/test/png/"
+
+# (image, question) pairs for --multimodal mode, taken in order up to
+# --num-prompts. Each question is specific to its own chart, so a wrong answer
+# is a real miss rather than an artifact of asking a generic question.
+MULTIMODAL_CASES = [
+    (f"{_CHARTQA}15008.png", "Which country data shown in the bottom bar?"),
+    (
+        f"{_CHARTQA}1201.png",
+        "What's the percentage of all adults who say the coronavirus outbreak is a "
+        "major threat to personal financial situation?",
+    ),
+    (f"{_CHARTQA}41699051005347.png", "How many food item is shown in the bar graph?"),
+]
+
+# ChartQA-style reasoning wrapper; `{}` is filled with a MULTIMODAL_CASES question.
 MULTIMODAL_QUESTION = (
-    "Which country data shown in the bottom bar? \n Analyze the image and question "
+    "{} \n Analyze the image and question "
     "carefully, using step-by-step reasoning. \n First, describe any image provided "
     "in detail. Then, present your reasoning. And finally your final answer in this "
     "format: \n Final Answer: <answer> \n where <answer> follows the following "
@@ -116,23 +130,51 @@ MULTIMODAL_QUESTION = (
 
 
 def run_multimodal(args):
-    """Download the image and run a single image+text prompt through the vision path.
+    """Run --num-prompts image+text prompts through the vision path as one batch.
 
-    The image is fetched in-process and passed to vLLM as a base64 data URI (no
+    Images are fetched in-process and passed to vLLM as base64 data URIs (no
     remote fetch by vLLM); `llm.chat` applies the model's chat template so the
     image placeholder tokens are inserted correctly for Mistral3/Pixtral.
+
+    Sending several at once matters for debugging: with `--num-prompts 1` the
+    decoder only ever runs a single sequence, so every step is a 1-token batch.
+    Raising it keeps 2+ sequences resident and exercises the wider batch shapes
+    that text-only runs hit by default.
     """
     import base64
     import urllib.request
 
     from vllm import LLM, SamplingParams
 
-    print(f"Downloading image: {args.image_url}")
-    req = urllib.request.Request(args.image_url, headers={"User-Agent": "spyre-inference"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        image_bytes = resp.read()
-    data_uri = "data:image/png;base64," + base64.b64encode(image_bytes).decode("utf-8")
-    print(f"Downloaded {len(image_bytes)} bytes.")
+    def _fetch(url: str) -> str:
+        req = urllib.request.Request(url, headers={"User-Agent": "spyre-inference"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            image_bytes = resp.read()
+        print(f"Downloaded {len(image_bytes)} bytes from {url}")
+        return "data:image/png;base64," + base64.b64encode(image_bytes).decode("utf-8")
+
+    if args.image_url:
+        # An explicit --image-url list reuses the built-in questions positionally.
+        urls = [u for u in (u.strip() for u in args.image_url.split(",")) if u]
+        cases = [
+            (urls[i % len(urls)], MULTIMODAL_CASES[i % len(MULTIMODAL_CASES)][1])
+            for i in range(args.num_prompts)
+        ]
+    else:
+        cases = [MULTIMODAL_CASES[i % len(MULTIMODAL_CASES)] for i in range(args.num_prompts)]
+
+    prepared: list[tuple[str, str]] = []
+    for url, question in cases:
+        try:
+            prepared.append((_fetch(url), question))
+        except Exception as exc:  # noqa: BLE001 - any download failure is non-fatal
+            # Reuse the first image rather than shrink the batch: batch size is
+            # the variable under test, so it must not depend on network luck.
+            # Keep this case's own question so the mismatch is visible in output.
+            if not prepared:
+                raise
+            print(f"WARNING: {url} failed ({exc}); reusing the first image.")
+            prepared.append((prepared[0][0], question))
 
     llm = LLM(
         model=args.model,
@@ -147,14 +189,19 @@ def run_multimodal(args):
         limit_mm_per_prompt={"image": 1},
     )
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": data_uri}},
-                {"type": "text", "text": MULTIMODAL_QUESTION},
-            ],
-        }
+    # One conversation per image; llm.chat takes a list of conversations and
+    # schedules them together, so max_num_seqs of them run concurrently.
+    conversations = [
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": uri}},
+                    {"type": "text", "text": MULTIMODAL_QUESTION.format(question)},
+                ],
+            }
+        ]
+        for uri, question in prepared
     ]
     # Image tokens + the reasoning prompt need room; --max-model-len must be large
     # enough (Pixtral expands one image into hundreds/thousands of tokens).
@@ -181,14 +228,14 @@ def run_multimodal(args):
 
     _text_probe("before image")
 
-    print("=============== GENERATE (multimodal)")
+    print(f"=============== GENERATE (multimodal, {len(conversations)} prompt(s))")
     t0 = time.time()
-    outputs = llm.chat(messages, sampling_params)
+    outputs = llm.chat(conversations, sampling_params)
     elapsed = time.time() - t0
     print(f"Time elapsed: {elapsed:.2f} sec")
     print("===============")
-    for output in outputs:
-        print(f"\nPrompt:\n {output.prompt!r}")
+    for i, output in enumerate(outputs):
+        print(f"\n[{i}] Question:\n {prepared[i][1]!r}")
         print(f"\nGenerated text:\n {output.outputs[0].text!r}\n")
         print("-----------------------------------")
 
