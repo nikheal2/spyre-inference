@@ -94,6 +94,17 @@ def parse_args():
         "--num-prompts images are sent as one batch; any that fail to download "
         "fall back to the first image so the batch size is still honoured.",
     )
+    parser.add_argument(
+        "--case-order",
+        type=str,
+        default=None,
+        dest="case_order",
+        help="DIAGNOSTIC: comma-separated indices permuting MULTIMODAL_CASES, e.g. "
+        "'2,0,1'. Each (image, question) pair stays intact, so only the batch "
+        "position changes. Use it to tell whether garbage output follows the slot "
+        "(same position bad under any order) or the image (same case bad wherever "
+        "it lands).",
+    )
     return parser.parse_args()
 
 
@@ -153,15 +164,20 @@ def run_multimodal(args):
         print(f"Downloaded {len(image_bytes)} bytes from {url}")
         return "data:image/png;base64," + base64.b64encode(image_bytes).decode("utf-8")
 
+    all_cases = MULTIMODAL_CASES
+    if args.case_order:
+        order = [int(i) for i in args.case_order.split(",")]
+        all_cases = [MULTIMODAL_CASES[i] for i in order]
+        print(f"Case order: {order}")
+
     if args.image_url:
         # An explicit --image-url list reuses the built-in questions positionally.
         urls = [u for u in (u.strip() for u in args.image_url.split(",")) if u]
         cases = [
-            (urls[i % len(urls)], MULTIMODAL_CASES[i % len(MULTIMODAL_CASES)][1])
-            for i in range(args.num_prompts)
+            (urls[i % len(urls)], all_cases[i % len(all_cases)][1]) for i in range(args.num_prompts)
         ]
     else:
-        cases = [MULTIMODAL_CASES[i % len(MULTIMODAL_CASES)] for i in range(args.num_prompts)]
+        cases = [all_cases[i % len(all_cases)] for i in range(args.num_prompts)]
 
     prepared: list[tuple[str, str]] = []
     for url, question in cases:
