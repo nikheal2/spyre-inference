@@ -93,6 +93,21 @@ _COMPILE_SCOPE = os.environ.get("SPYRE_COMPILE_SCOPE", "model")
 # first backend that produces garbage is the stage at fault.
 _COMPILE_BACKEND = os.environ.get("SPYRE_COMPILE_BACKEND", "inductor")
 
+# DIAGNOSTIC (SPYRE_PAD_BATCH_ROWS): append N dummy rows to the token dimension of
+# the compiled graph's inputs, then crop them off the output. Compile-mode output
+# is wrong for the LAST sequence of the batch at every batch size (1, 2, 3, 4) and
+# correct for all the others, which points at the final row of the flat
+# [num_tokens, hidden] activation rather than at anything per-sequence. If the
+# corruption is positional, padding moves it onto a dummy row and every real
+# sequence comes out clean. Attention is unaffected: it slices per sequence using
+# query_start_loc, so the trailing rows are never read, and reshape_and_cache
+# writes only num_actual_tokens slots. Default 0 (unpadded, unchanged).
+_PAD_BATCH_ROWS = int(os.environ.get("SPYRE_PAD_BATCH_ROWS", "0"))
+
+# Model-forward kwargs whose dim 0 is the token dimension, so padding must extend
+# them together. Everything else (intermediate_tensors, kv caches) is left alone.
+_PADDABLE_INPUTS = ("input_ids", "positions", "inputs_embeds")
+
 
 def _llama4_attn_scale_op(
     positions: torch.Tensor, beta: float, original_max_position_embeddings: int
@@ -313,6 +328,15 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_rope_modules", rope_modules or [])
 
     def __call__(self, *args, **kwargs):
+        # DIAGNOSTIC (SPYRE_PAD_BATCH_ROWS): pad before priming so the RoPE
+        # rotation slice covers the dummy rows too. No-op when the flag is unset.
+        n_pad = self._batch_pad_rows(kwargs)
+        if n_pad:
+            kwargs = {
+                key: (self._pad_rows(val, n_pad) if key in _PADDABLE_INPUTS else val)
+                for key, val in kwargs.items()
+            }
+
         # Prime RoPE while positions are still on the host (no D2H).
         self._prime_rope_rotation(kwargs.get("positions"))
 
@@ -338,6 +362,12 @@ class _SpyreModelWrapper:
         t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)
 
+        if n_pad:
+            result = tree_map(
+                lambda x: x[:-n_pad] if isinstance(x, torch.Tensor) and x.dim() >= 1 else x,
+                result,
+            )
+
         def _to_cpu(x):
             return convert(x, device="cpu")
 
@@ -348,6 +378,23 @@ class _SpyreModelWrapper:
         logger.debug("t_token: %.2fms [num tokens %d]", (time.time() - t0) * 1000, num_tokens)
 
         return result
+
+    @staticmethod
+    def _batch_pad_rows(kwargs: dict) -> int:
+        """DIAGNOSTIC: rows to append to the token dim (see SPYRE_PAD_BATCH_ROWS)."""
+        if not _PAD_BATCH_ROWS:
+            return 0
+        anchor = kwargs.get("input_ids")
+        if anchor is None:
+            anchor = kwargs.get("inputs_embeds")
+        return _PAD_BATCH_ROWS if isinstance(anchor, torch.Tensor) and anchor.dim() >= 1 else 0
+
+    @staticmethod
+    def _pad_rows(t, n_pad: int):
+        """DIAGNOSTIC: repeat the last row `n_pad` times along dim 0."""
+        if not isinstance(t, torch.Tensor) or t.dim() < 1 or t.shape[0] == 0:
+            return t
+        return torch.cat([t, t[-1:].expand(n_pad, *t.shape[1:])], dim=0)
 
     def _prime_rope_rotation(self, positions: torch.Tensor | None) -> None:
         """Pre-gather each RoPE module's per-token rotation slice into the forward
@@ -746,13 +793,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 cos_full = cos.repeat_interleave(2, dim=-1)
                 sin_signed = torch.stack([-sin, sin], dim=-1).reshape(*sin.shape[:-1], -1)
                 packed = torch.stack([cos_full, sin_signed], dim=-2)  # (H, W, 2, head_dim)
-                self._freqs_cis = packed.reshape(
-                    -1, packed.shape[-2], packed.shape[-1]
-                ).to(torch.float16)  # (H*W, 2, head_dim) on CPU
+                self._freqs_cis = packed.reshape(-1, packed.shape[-2], packed.shape[-1]).to(
+                    torch.float16
+                )  # (H*W, 2, head_dim) on CPU
             if self._freqs_cis.device != self.device:
-                self._freqs_cis = convert(
-                    self._freqs_cis, device=self.device, dtype=torch.float16
-                )
+                self._freqs_cis = convert(self._freqs_cis, device=self.device, dtype=torch.float16)
             return _OnCardFreqsTable(self._freqs_cis, self.max_patches_per_side)
 
         def _apply_rotary_emb_vit(xq, xk, freqs_cis):
@@ -887,9 +932,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             module.to("cpu")
 
             def _to_cpu(mod, args):
-                return tuple(
-                    a.to("cpu") if isinstance(a, torch.Tensor) else a for a in args
-                )
+                return tuple(a.to("cpu") if isinstance(a, torch.Tensor) else a for a in args)
 
             def _to_dev(mod, args, output, _dev=dev):
                 if isinstance(output, tuple):
@@ -901,9 +944,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
             module.register_forward_pre_hook(_to_cpu)
             module.register_forward_hook(_to_dev)
-            logger.info(
-                "Spyre: %s offloaded to CPU (D2H in / H2D out)", module_name
-            )
+            logger.info("Spyre: %s offloaded to CPU (D2H in / H2D out)", module_name)
 
     @staticmethod
     def _patch_pixtral_patch_merger() -> None:
@@ -937,7 +978,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             outs = []
             for img, (h, w) in zip(x.split(tokens_per_image), image_sizes):
                 g = img.reshape(h // s, s, w // s, s, d)  # (oh, kh, ow, kw, d)
-                g = g.permute(0, 2, 4, 1, 3)              # (oh, ow, d, kh, kw)
+                g = g.permute(0, 2, 4, 1, 3)  # (oh, ow, d, kh, kw)
                 g = g.reshape((h // s) * (w // s), d * s * s)
                 outs.append(g)
             return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
@@ -950,8 +991,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 x_perm = _permute_on_device(x, image_sizes, self.spatial_merge_size)
                 if "on-device" not in _logged:
                     logger.info(
-                        "Spyre PatchMerger: on-device regroup (reshape/permute, no "
-                        "im2col)."
+                        "Spyre PatchMerger: on-device regroup (reshape/permute, no im2col)."
                     )
                     _logged.add("on-device")
             except Exception as e:  # noqa: BLE001 - fall back to CPU unfold path
@@ -1187,6 +1227,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # bypasses the Spyre forward_oot implementations. platform.py appends
         # "all" first to prevent that; log the resolved value so a regression in
         # config ordering is visible rather than silent.
+        # DIAGNOSTIC: log line added while bisecting compile-mode corruption.
         logger.info(
             "Spyre compile config: mode=%s backend=%s custom_ops=%s",
             mode,

@@ -73,7 +73,7 @@ def parse_args():
         "--mm-limit",
         action="store_true",
         dest="mm_limit",
-        help="Diagnostic (text-only run): pass limit_mm_per_prompt={'image': 1} — the "
+        help="DIAGNOSTIC (text-only run): pass limit_mm_per_prompt={'image': 1} — the "
         "only LLM() kwarg that differs from the multimodal run — while sending pure "
         "text prompts. Isolates 'declaring multimodal support' from 'processing an image'.",
     )
@@ -81,7 +81,7 @@ def parse_args():
         "--text-probe",
         action="store_true",
         dest="text_probe",
-        help="Diagnostic (with --multimodal): run a text-only prompt before and after "
+        help="DIAGNOSTIC (with --multimodal): run a text-only prompt before and after "
         "the image request in the same process. If the AFTER probe is garbage while "
         "BEFORE is coherent, the vision run corrupted persistent device state.",
     )
@@ -90,7 +90,7 @@ def parse_args():
         type=str,
         default=None,
         dest="image_url",
-        help="Comma-separated image URLs overriding MULTIMODAL_CASES. The first "
+        help="DIAGNOSTIC: comma-separated image URLs overriding MULTIMODAL_CASES. The first "
         "--num-prompts images are sent as one batch; any that fail to download "
         "fall back to the first image so the batch size is still honoured.",
     )

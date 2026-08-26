@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Which compiled op is wrong on Spyre when the token dim is 1?
+"""DIAGNOSTIC (temporary): which compiled op is wrong on Spyre when the token dim is 1?
+
+This whole file is scaffolding for the compile-mode corruption investigation and
+should be deleted once that bug is fixed. See DIAGNOSTICS.md.
+
 
 Motivation: in compile mode the Ministral decoder is coherent on every step whose
 token count is >= 2 and garbage on every step whose token count is exactly 1.
