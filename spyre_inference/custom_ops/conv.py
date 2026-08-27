@@ -38,6 +38,21 @@ from vllm.model_executor.layers.conv import Conv2dLayer
 logger = init_logger(__name__)
 
 
+def _layouts_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Can this conv use the tiled on-card layouts below?
+
+    The layout tuples assume a single image, in-channels inside one 64-wide stick,
+    and out-channels tiling into whole sticks. That holds for a Pixtral/Ministral
+    patch embed (1x3xHxW, out_channels a multiple of 64) but not for convs in
+    general, and this class is registered OOT for *every* `Conv2dLayer` — so when
+    the assumptions do not hold, defer to vLLM's stock path instead of asserting.
+    """
+    if x.dim() != 4 or weight.dim() != 4:
+        return False
+    b, c = x.shape[0], x.shape[1]
+    return b == 1 and c <= 64 and weight.shape[0] % 64 == 0
+
+
 def _weight_layout(weight: torch.Tensor):
     """SpyreTensorLayout for a conv weight (O, C, K1, K2), sticked on out-channels.
 
@@ -86,6 +101,18 @@ class SpyreConv2d(Conv2dLayer):
         self._w_dev: torch.Tensor | None = None
         # Mirror SpyreSiluAndMul: compile the on-card conv unless the outer
         # graph is already being traced (then it captures the eager call).
+        #
+        # dynamic=False is required, not a tuning choice: Spyre cannot handle
+        # dynamic shapes (SymInt), so every torch.compile in this codebase pins
+        # static shapes -- see TorchSpyreModelRunner._compile_for_spyre.
+        #
+        # Consequence for Pixtral, whose images vary in resolution: one Spyre
+        # compile per distinct (H, W). Past torch._dynamo.config.cache_size_limit
+        # (default 8) dynamo stops recompiling and runs this eagerly, which is a
+        # correctness risk here rather than just a slowdown -- eager F.conv2d on
+        # pre-laid-out Spyre tensors is not a validated path. If a workload uses
+        # more than a handful of resolutions, raise the limit or bucket/resize
+        # images to a fixed set.
         if not torch.compiler.is_dynamo_compiling():
             self._conv = torch.compile(self._conv_native, dynamic=False)
         else:
@@ -111,6 +138,18 @@ class SpyreConv2d(Conv2dLayer):
 
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
+        if not _layouts_supported(x, self.weight):
+            # Not a patch-embed-shaped conv; the tiled layouts do not apply. Stock
+            # path is correct here — its im2col only fails to restickify for the
+            # coprime *patch grids* this class exists to handle.
+            logger.warning_once(
+                "Spyre conv2d: shape %s (weight %s) outside the tiled-layout "
+                "assumptions (batch 1, in_channels <= 64, out_channels %% 64 == 0); "
+                "falling back to vLLM's stock Conv2dLayer path.",
+                tuple(x.shape),
+                tuple(self.weight.shape),
+            )
+            return self.forward_native(x)
         # Proves which patch-conv implementation is live; the runner's duplicate
         # patch was removed 2026-08-27, leaving this as the only implementation.
         logger.info_once("Spyre conv2d: on-card F.conv2d with tiled layouts")
