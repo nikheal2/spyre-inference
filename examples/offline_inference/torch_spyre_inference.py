@@ -69,42 +69,6 @@ def parse_args():
         help="Run a single image+text (ChartQA) prompt through the vision path "
         "instead of the text-only prompt batch.",
     )
-    parser.add_argument(
-        "--mm-limit",
-        action="store_true",
-        dest="mm_limit",
-        help="DIAGNOSTIC (text-only run): pass limit_mm_per_prompt={'image': 1} — the "
-        "only LLM() kwarg that differs from the multimodal run — while sending pure "
-        "text prompts. Isolates 'declaring multimodal support' from 'processing an image'.",
-    )
-    parser.add_argument(
-        "--text-probe",
-        action="store_true",
-        dest="text_probe",
-        help="DIAGNOSTIC (with --multimodal): run a text-only prompt before and after "
-        "the image request in the same process. If the AFTER probe is garbage while "
-        "BEFORE is coherent, the vision run corrupted persistent device state.",
-    )
-    parser.add_argument(
-        "--image-url",
-        type=str,
-        default=None,
-        dest="image_url",
-        help="DIAGNOSTIC: comma-separated image URLs overriding MULTIMODAL_CASES. The first "
-        "--num-prompts images are sent as one batch; any that fail to download "
-        "fall back to the first image so the batch size is still honoured.",
-    )
-    parser.add_argument(
-        "--case-order",
-        type=str,
-        default=None,
-        dest="case_order",
-        help="DIAGNOSTIC: comma-separated indices permuting MULTIMODAL_CASES, e.g. "
-        "'2,0,1'. Each (image, question) pair stays intact, so only the batch "
-        "position changes. Use it to tell whether garbage output follows the slot "
-        "(same position bad under any order) or the image (same case bad wherever "
-        "it lands).",
-    )
     return parser.parse_args()
 
 
@@ -164,20 +128,7 @@ def run_multimodal(args):
         print(f"Downloaded {len(image_bytes)} bytes from {url}")
         return "data:image/png;base64," + base64.b64encode(image_bytes).decode("utf-8")
 
-    all_cases = MULTIMODAL_CASES
-    if args.case_order:
-        order = [int(i) for i in args.case_order.split(",")]
-        all_cases = [MULTIMODAL_CASES[i] for i in order]
-        print(f"Case order: {order}")
-
-    if args.image_url:
-        # An explicit --image-url list reuses the built-in questions positionally.
-        urls = [u for u in (u.strip() for u in args.image_url.split(",")) if u]
-        cases = [
-            (urls[i % len(urls)], all_cases[i % len(all_cases)][1]) for i in range(args.num_prompts)
-        ]
-    else:
-        cases = [all_cases[i % len(all_cases)] for i in range(args.num_prompts)]
+    cases = [MULTIMODAL_CASES[i % len(MULTIMODAL_CASES)] for i in range(args.num_prompts)]
 
     prepared: list[tuple[str, str]] = []
     for url, question in cases:
@@ -226,24 +177,6 @@ def run_multimodal(args):
         temperature=0.0,
     )
 
-    # DIAGNOSTIC (--text-probe): run the same text-only prompt BEFORE and AFTER the
-    # image request, in one process. Text-only is known-coherent under compile, so:
-    #   before OK + after GARBAGE -> the vision run corrupted persistent device /
-    #       compiled-graph state (corruption outlives the image request);
-    #   before OK + after OK      -> corruption is confined to the image request
-    #       itself, so persistent device state is exonerated.
-    probe_prompt = "What are IBMs main businesses?"
-    probe_params = SamplingParams(max_tokens=32, temperature=0.0)
-
-    def _text_probe(tag):
-        if not args.text_probe:
-            return
-        out = llm.generate([probe_prompt], probe_params)
-        print(f"\n=============== TEXT PROBE ({tag})")
-        print(f"generated: {out[0].outputs[0].text!r}\n")
-
-    _text_probe("before image")
-
     print(f"=============== GENERATE (multimodal, {len(conversations)} prompt(s))")
     t0 = time.time()
     outputs = llm.chat(conversations, sampling_params)
@@ -254,8 +187,6 @@ def run_multimodal(args):
         print(f"\n[{i}] Question:\n {prepared[i][1]!r}")
         print(f"\nGenerated text:\n {output.outputs[0].text!r}\n")
         print("-----------------------------------")
-
-    _text_probe("after image")
 
 
 def main():
@@ -330,12 +261,6 @@ def main():
         dtype="float16",
         enforce_eager=args.enforce_eager,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
-        # DIAGNOSTIC (--mm-limit): the ONLY LLM() kwarg that differs between the
-        # coherent text-only run and the garbage multimodal run. Setting it here
-        # runs pure text prompts (no image, no vision tower) under the multimodal
-        # config. If text turns to garbage under compile, the trigger is declaring
-        # multimodal support itself — not image processing.
-        **({"limit_mm_per_prompt": {"image": 1}} if args.mm_limit else {}),
     )
 
     # Generate texts from the prompts. The output is a list of RequestOutput objects

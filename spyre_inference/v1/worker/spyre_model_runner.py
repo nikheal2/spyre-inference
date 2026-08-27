@@ -66,43 +66,20 @@ from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
 
-# DIAGNOSTIC: SPYRE_EMBED_ROUNDTRIP=1 routes the text-only inputs_embeds through
-# D2H->H2D so it reaches the compiled graph with the same "transferred" provenance
-# as the multimodal merge. Used to test whether transferred graph inputs are what
-# corrupts compile-mode multimodal output. Default 0 (device-native, unchanged).
-_EMBED_ROUNDTRIP = os.environ.get("SPYRE_EMBED_ROUNDTRIP", "0") == "1"
-
-# DIAGNOSTIC (SPYRE_COMPILE_SCOPE): narrow what torch.compile covers, to bisect
-# which region of the decoder is miscompiled when the token count is 1 (compiled
-# output is garbage at 1 token, correct at >= 2; eager is correct at every size).
-#   "model"    - default, unchanged: one fullgraph over the whole model
-#   "none"     - compile nothing (equivalent to eager, but keeps the compile path)
-#   "mlp"      - compile only each decoder layer's `mlp`
-#   "attn"     - compile only each decoder layer's `self_attn`
-#   "attn:X"   - compile only child X of self_attn (qkv_proj, o_proj, rotary_emb,
-#                attn); an unknown name raises listing the available children
-#   "layers:N" - compile only the first N decoder layers, whole-layer
-# Scoped modes use fullgraph=False, since a submodule boundary legitimately
-# graph-breaks (e.g. the opaque attention op); they answer "does compiling this
-# region corrupt output", not "does this region compile as one graph".
-_COMPILE_SCOPE = os.environ.get("SPYRE_COMPILE_SCOPE", "model")
-
-# DIAGNOSTIC (SPYRE_COMPILE_BACKEND): backend for scoped compiles, to tell which
-# compiler stage corrupts. "eager" = dynamo trace only (guards/specialization),
-# "aot_eager" = + AOTAutograd functionalization, "inductor" = + codegen. The
-# first backend that produces garbage is the stage at fault.
-_COMPILE_BACKEND = os.environ.get("SPYRE_COMPILE_BACKEND", "inductor")
-
-# DIAGNOSTIC (SPYRE_PAD_BATCH_ROWS): append N dummy rows to the token dimension of
-# the compiled graph's inputs, then crop them off the output. Compile-mode output
-# is wrong for the LAST sequence of the batch at every batch size (1, 2, 3, 4) and
-# correct for all the others, which points at the final row of the flat
-# [num_tokens, hidden] activation rather than at anything per-sequence. If the
-# corruption is positional, padding moves it onto a dummy row and every real
-# sequence comes out clean. Attention is unaffected: it slices per sequence using
-# query_start_loc, so the trailing rows are never read, and reshape_and_cache
-# writes only num_actual_tokens slots. Default 0 (unpadded, unchanged).
-_PAD_BATCH_ROWS = int(os.environ.get("SPYRE_PAD_BATCH_ROWS", "0"))
+# WORKAROUND (torch-spyre Inductor tail-tile bug): Inductor miscompiles the final
+# row of the flat [num_tokens, hidden] activation, so the last sequence of every
+# batch decodes to garbage — at every batch size, independent of input content,
+# and only under CompilationMode.STOCK_TORCH_COMPILE (eager and the `eager` /
+# `aot_eager` backends are all correct). Appending one dummy row moves the
+# corruption onto a row nothing reads, then we crop it off the output.
+#
+# Attention is unaffected: it slices per sequence via query_start_loc, so trailing
+# rows are never read, and reshape_and_cache writes only num_actual_tokens slots.
+# Cost is one extra row of decoder math per forward pass.
+#
+# Applied only in compile mode (see _pad_batch_rows on the runner). Override with
+# SPYRE_PAD_BATCH_ROWS to disable (0) or widen the pad, e.g. to re-test the bug.
+_PAD_BATCH_ROWS = int(os.environ.get("SPYRE_PAD_BATCH_ROWS", "1"))
 
 # Model-forward kwargs whose dim 0 is the token dimension, so padding must extend
 # them together. Everything else (intermediate_tensors, kv caches) is left alone.
@@ -321,15 +298,16 @@ class _SpyreModelWrapper:
         model: nn.Module,
         spyre_device: torch.device,
         rope_modules: list[_SpyreRotaryMixin] | None = None,
+        compiled: bool = False,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
         object.__setattr__(self, "_rope_modules", rope_modules or [])
+        object.__setattr__(self, "_compiled", compiled)
 
     def __call__(self, *args, **kwargs):
-        # DIAGNOSTIC (SPYRE_PAD_BATCH_ROWS): pad before priming so the RoPE
-        # rotation slice covers the dummy rows too. No-op when the flag is unset.
+        # Pad before priming so the RoPE rotation slice covers the dummy rows too.
         n_pad = self._batch_pad_rows(kwargs)
         if n_pad:
             kwargs = {
@@ -379,10 +357,10 @@ class _SpyreModelWrapper:
 
         return result
 
-    @staticmethod
-    def _batch_pad_rows(kwargs: dict) -> int:
-        """DIAGNOSTIC: rows to append to the token dim (see SPYRE_PAD_BATCH_ROWS)."""
-        if not _PAD_BATCH_ROWS:
+    def _batch_pad_rows(self, kwargs: dict) -> int:
+        """Rows to append to the token dim (see _PAD_BATCH_ROWS). Compile mode only —
+        eager is unaffected by the Inductor tail-tile bug and shouldn't pay the cost."""
+        if not _PAD_BATCH_ROWS or not self._compiled:
             return 0
         anchor = kwargs.get("input_ids")
         if anchor is None:
@@ -391,7 +369,7 @@ class _SpyreModelWrapper:
 
     @staticmethod
     def _pad_rows(t, n_pad: int):
-        """DIAGNOSTIC: repeat the last row `n_pad` times along dim 0."""
+        """Repeat the last row `n_pad` times along dim 0."""
         if not isinstance(t, torch.Tensor) or t.dim() < 1 or t.shape[0] == 0:
             return t
         return torch.cat([t, t[-1:].expand(n_pad, *t.shape[1:])], dim=0)
@@ -462,16 +440,6 @@ class _SpyreModelWrapper:
         inputs_embeds = self._model.embed_input_ids(input_ids)
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            if _EMBED_ROUNDTRIP:
-                # DIAGNOSTIC (SPYRE_EMBED_ROUNDTRIP=1): give the text path the same
-                # D2H->H2D provenance the multimodal merge has, so its inputs_embeds
-                # enters the compiled graph as a *transferred* tensor rather than a
-                # device-native one. If text output then turns to gibberish under
-                # compile, transferred graph inputs (missing device_tensor_layout)
-                # are the multimodal corruptor.
-                inputs_embeds = convert(
-                    convert(inputs_embeds, device="cpu"), device=self._spyre_device
-                )
             return inputs_embeds
 
         from vllm.model_executor.models.utils import _merge_multimodal_embeddings
@@ -524,6 +492,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Store the real Spyre device before super().__init__ so that
         # _make_buffer can place .gpu tensors on Spyre directly.
         self._spyre_device = device
+
+        # Set by _compile_for_spyre; gates the Inductor tail-tile pad workaround.
+        self._compiled = False
 
         # Phase 1: Init with device="cpu" to avoid dtype/device errors.
         # Many components create tensors on self.device during init, and
@@ -948,16 +919,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @staticmethod
     def _patch_pixtral_patch_merger() -> None:
-        """Run Pixtral `PatchMerger.permute` (spatial s×s regroup) ON-CARD, CPU fallback.
+        """Run Pixtral `PatchMerger.permute` (spatial s×s regroup) on CPU.
 
-        Stock `PatchMerger.permute` -> `get_sub_grids` uses `F.unfold`
-        (`aten::im2col`), which Spyre has no kernel for. But the s×s regroup is a
-        pure space-to-depth reshuffle: it can be written with `reshape`/`permute`/
-        `cat` (no im2col) that produces the *identical* result — feature order
-        `(d, kh, kw)` and patch order row-major `(oh, ow)`, matching `F.unfold`. We
-        try that on-card first; if the on-device relayout can't lower (or any op is
-        unsupported), fall back to the original CPU unfold path. Either way the
-        `merging_layer` GEMM stays on-card. Guarded/no-op if absent.
+        `PatchMerger.permute` -> `get_sub_grids` uses `F.unfold` (`aten::im2col`),
+        unsupported on Spyre (`NotImplementedError: Could not run 'aten::im2col'`).
+        An on-device reshape/permute rewrite was tried and does not lower — the
+        regroup is a multi-counter stick scatter (`44*d0 + 2*d1 + 22*d3 + d4`,
+        image-geometry dependent), which torch-spyre's restickify can't express.
+        So do the regroup on CPU (pure reshuffle, once per image); H2D the result
+        so the `merging_layer` GEMM still runs on-card (unchanged, so the
+        Spyre-transposed linear weight is untouched). Guarded/no-op if absent.
         """
         try:
             from vllm.model_executor.models import pixtral
@@ -968,49 +939,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if pm_cls is None or getattr(pm_cls.forward, "_spyre_patched", False):
             return
 
-        def _permute_on_device(x, image_sizes, s):
-            # (N, d) patch tokens -> (N/s², d·s²), s×s blocks flattened as
-            # (d, kh, kw). No im2col: (h·w, d) reshapes directly to
-            # (h/s, s, w/s, s, d) because the flat patch index i·w+j decomposes as
-            # oh·s·w + kh·w + ow·s + kw — exactly this 5-D split.
-            d = x.shape[-1]
-            tokens_per_image = [h * w for h, w in image_sizes]
-            outs = []
-            for img, (h, w) in zip(x.split(tokens_per_image), image_sizes):
-                g = img.reshape(h // s, s, w // s, s, d)  # (oh, kh, ow, kw, d)
-                g = g.permute(0, 2, 4, 1, 3)  # (oh, ow, d, kh, kw)
-                g = g.reshape((h // s) * (w // s), d * s * s)
-                outs.append(g)
-            return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
-
-        _logged: set[str] = set()
-
         def _forward(self, x, image_sizes):
             dev = x.device
-            try:
-                x_perm = _permute_on_device(x, image_sizes, self.spatial_merge_size)
-                if "on-device" not in _logged:
-                    logger.info(
-                        "Spyre PatchMerger: on-device regroup (reshape/permute, no im2col)."
-                    )
-                    _logged.add("on-device")
-            except Exception as e:  # noqa: BLE001 - fall back to CPU unfold path
-                if "cpu" not in _logged:
-                    logger.warning(
-                        "Spyre PatchMerger: on-device regroup failed (%s: %s); "
-                        "falling back to CPU unfold.",
-                        type(e).__name__,
-                        e,
-                    )
-                    _logged.add("cpu")
-                x_perm = convert(self.permute(x.to("cpu"), image_sizes), device=dev)
-            return self.merging_layer(x_perm)  # GEMM on-card
+            x_perm = self.permute(x.to("cpu"), image_sizes)  # unfold on CPU
+            return self.merging_layer(convert(x_perm, device=dev))  # GEMM on-card
 
         _forward._spyre_patched = True
         pm_cls.forward = _forward  # ty: ignore[invalid-assignment]
         logger.info(
-            "Spyre: patched Pixtral PatchMerger to on-card regroup (CPU unfold "
-            "fallback; merging_layer GEMM stays on-card)."
+            "Spyre: patched Pixtral PatchMerger permute to CPU (merging_layer GEMM stays on-card)."
         )
 
     def _patch_pixtral_patch_conv(self) -> None:
@@ -1208,7 +1145,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # automatically convert Spyre outputs to CPU. This ensures downstream
         # indexing (logits_indices), lm_head (CPU weights), and sampling all
         # receive CPU tensors without needing per-call-site overrides.
-        self.model = _SpyreModelWrapper(self.model, self._spyre_device, rope_modules)
+        self.model = _SpyreModelWrapper(
+            self.model, self._spyre_device, rope_modules, self._compiled
+        )
 
     def _compile_for_spyre(self) -> None:
         """Apply torch.compile for Spyre with static shapes.
@@ -1227,13 +1166,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # bypasses the Spyre forward_oot implementations. platform.py appends
         # "all" first to prevent that; log the resolved value so a regression in
         # config ordering is visible rather than silent.
-        # DIAGNOSTIC: log line added while bisecting compile-mode corruption.
-        logger.info(
-            "Spyre compile config: mode=%s backend=%s custom_ops=%s",
-            mode,
-            self.compilation_config.backend,
-            self.compilation_config.custom_ops,
-        )
         if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
             raise ValueError(
                 f"Unsupported compilation mode {mode} for Spyre. Only "
@@ -1245,9 +1177,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 
-        if _COMPILE_SCOPE != "model":
-            self._compile_scoped(_COMPILE_SCOPE)
-            return
+        self._compiled = True
 
         # Trigger whole-model compile:
         # a single fullgraph over the entire model using dynamic=False.
@@ -1262,71 +1192,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "Compiled model %s as a single graph for Spyre in %.3fs.",
             type(self.get_model()).__name__,
             time.time() - t0,
-        )
-
-    def _compile_scoped(self, scope: str) -> None:
-        """DIAGNOSTIC: compile only part of the decoder. See _COMPILE_SCOPE."""
-        if scope == "none":
-            logger.info("SPYRE_COMPILE_SCOPE=none: compiling nothing.")
-            return
-
-        def _wrap(m):
-            return torch.compile(m, backend=_COMPILE_BACKEND, fullgraph=False, dynamic=False)
-
-        root = self.get_model()
-        layer_lists = [
-            m
-            for m in root.modules()
-            if isinstance(m, torch.nn.ModuleList)
-            and len(m) > 0
-            and type(m[0]).__name__.endswith("DecoderLayer")
-        ]
-        if not layer_lists:
-            raise ValueError(f"SPYRE_COMPILE_SCOPE={scope}: found no decoder layer list")
-        # The language model's stack is the longest; a vision tower's is shorter.
-        layers = max(layer_lists, key=len)
-
-        n = 0
-        if scope.startswith("layers:"):
-            for i in range(min(int(scope.split(":", 1)[1]), len(layers))):
-                layers[i] = _wrap(layers[i])
-                n += 1
-        elif scope.startswith("attn:"):
-            # Compile one child of self_attn, leaving the connective tissue
-            # (qkv split, head reshapes) uncompiled. If no single child breaks,
-            # the fault is in that connective tissue rather than in any child.
-            attr = scope.split(":", 1)[1]
-            seen: set[str] = set()
-            for layer in layers:
-                parent = getattr(layer, "self_attn", None)
-                if parent is None:
-                    continue
-                seen.update(name for name, _ in parent.named_children())
-                sub = getattr(parent, attr, None)
-                if sub is not None:
-                    setattr(parent, attr, _wrap(sub))
-                    n += 1
-            if n == 0:
-                raise ValueError(
-                    f"SPYRE_COMPILE_SCOPE={scope}: self_attn has no child {attr!r}; "
-                    f"available: {sorted(seen)}"
-                )
-        elif scope in ("mlp", "attn"):
-            attr = "mlp" if scope == "mlp" else "self_attn"
-            for layer in layers:
-                sub = getattr(layer, attr, None)
-                if sub is not None:
-                    setattr(layer, attr, _wrap(sub))
-                    n += 1
-        else:
-            raise ValueError(f"Unknown SPYRE_COMPILE_SCOPE={scope!r}")
-
-        logger.info(
-            "SPYRE_COMPILE_SCOPE=%s (backend=%s): compiled %d module(s) of %d decoder layers.",
-            scope,
-            _COMPILE_BACKEND,
-            n,
-            len(layers),
         )
 
     def warming_up_model(self) -> None:
