@@ -40,9 +40,8 @@ from __future__ import annotations
 
 import os
 import time
-import types
 from contextlib import contextmanager
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
 import torch.nn as nn
@@ -84,6 +83,42 @@ _PAD_BATCH_ROWS = int(os.environ.get("SPYRE_PAD_BATCH_ROWS", "1"))
 # Model-forward kwargs whose dim 0 is the token dimension, so padding must extend
 # them together. Everything else (intermediate_tensors, kv caches) is left alone.
 _PADDABLE_INPUTS = ("input_ids", "positions", "inputs_embeds")
+
+
+@cache
+def _rope_perm_matrix(kind: str, head_dim: int, device: torch.device) -> torch.Tensor:
+    """Constant `[head_dim, head_dim]` permutation `M` so `x @ M` is a rope shuffle.
+
+    A full-width matmul avoids slicing the head into two `d/2`-wide halves — for
+    head_dim=64 that half is 32, half a Spyre stick, which torch-spyre cannot lay
+    out ("Unexpected stick expression ... Mod(var, 32)"). A matmul over the full
+    64-aligned dim is stick-aligned, so the rotation stays on-card.
+
+    kind="half": `x @ M == rotate_half(x)` (`out[:h] = -x[h:]`, `out[h:] = x[:h]`),
+    for the HF-format Pixtral vision rope.
+    kind="pair": `x @ M` swaps each `(2k, 2k+1)` pair, for the mistral-format
+    `VisionTransformer` 2D rope.
+
+    Built once on CPU per (kind, head_dim, device), then moved to the device.
+    """
+    m = torch.zeros(head_dim, head_dim, dtype=torch.float16)
+    if kind == "half":
+        half = head_dim // 2
+        idx = torch.arange(half)
+        m[idx + half, idx] = -1.0  # out[:half] = -x[half:]
+        m[idx, idx + half] = 1.0  # out[half:] =  x[:half]
+    elif kind == "pair":
+        even = torch.arange(0, head_dim, 2)
+        m[even, even + 1] = 1.0
+        m[even + 1, even] = 1.0
+    else:
+        raise ValueError(f"unknown rope permutation kind {kind!r}")
+    return convert(m, device=device, dtype=torch.float16)
+
+
+def _rope_rotate_matmul(x, cos, sin, m: torch.Tensor):
+    """`x*cos + (x @ m)*sin` — the rope rotation as a stick-aligned matmul."""
+    return x * cos + torch.matmul(x, m) * sin
 
 
 def _llama4_attn_scale_op(
@@ -632,39 +667,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if orig is None or getattr(orig, "_spyre_patched", False):
             return
 
-        @lru_cache(maxsize=None)
-        def _rotate_half_matrix(head_dim: int, device: torch.device) -> torch.Tensor:
-            """Constant `[head_dim, head_dim]` matrix `R` with `x @ R == rotate_half(x)`.
-
-            neox `rotate_half(x) = cat([-x[d/2:], x[:d/2]])`. Expressing it as a
-            full-width matmul avoids slicing the head into two `d/2`-wide halves —
-            for head_dim=64 that half is 32 = half a Spyre stick, which torch-spyre
-            can't lay out ("Unexpected stick expression ... Mod(var, 32)"). A matmul
-            over the full 64-wide dim is stick-aligned, so the rotation stays on-card.
-            Built once on CPU per (head_dim, device), then moved to the device.
-            """
-            half = head_dim // 2
-            r = torch.zeros(head_dim, head_dim, dtype=torch.float16)
-            idx = torch.arange(half)
-            r[idx + half, idx] = -1.0  # out[:half] = -x[half:]
-            r[idx, idx + half] = 1.0  # out[half:] =  x[:half]
-            return convert(r, device=device, dtype=torch.float16)
-
         def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
             # q, k: [batch, n_heads, patches, head_dim]; cos/sin: [patches, head_dim].
             dev = q.device
-            head_dim = q.shape[-1]
-            rot_r = _rotate_half_matrix(head_dim, dev)
+            rot_r = _rope_perm_matrix("half", q.shape[-1], dev)
             # cos/sin come from PixtralRotaryEmbedding (arange/sin/cos → may be CPU);
             # move to device and add [batch, n_heads] broadcast dims.
             cos = convert(cos, device=dev, dtype=torch.float16).unsqueeze(0).unsqueeze(0)
             sin = convert(sin, device=dev, dtype=torch.float16).unsqueeze(0).unsqueeze(0)
 
-            def rotate(x):
-                # q*cos + rotate_half(q)*sin, with rotate_half as a stick-aligned matmul.
-                return x * cos + torch.matmul(x, rot_r) * sin
-
-            return rotate(q), rotate(k)
+            return (
+                _rope_rotate_matmul(q, cos, sin, rot_r),
+                _rope_rotate_matmul(k, cos, sin, rot_r),
+            )
 
         _apply_rotary_pos_emb._spyre_patched = True
         pixtral.apply_rotary_pos_emb = _apply_rotary_pos_emb  # ty: ignore[invalid-assignment]
@@ -701,7 +716,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         - `apply_rotary_emb_vit` is the real rotation `x·cos + (x @ P)·sin`, with `P`
           a constant `[head_dim, head_dim]` pair-swap matrix — a full-stick-width
           matmul, no sub-stick slice, no complex (fixes 3). Same trade as
-          `_rotate_half_matrix`.
+          `_rope_perm_matrix`.
 
         CPU-rotary fallback (documented, not enabled): if `index_select` / the flat
         index / the pair-swap matmul ever fail to lay out, keep the freqs table
@@ -719,15 +734,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         vt = getattr(pixtral, "VisionTransformer", None)
         if orig is None or vt is None or getattr(orig, "_spyre_patched", False):
             return
-
-        @lru_cache(maxsize=None)
-        def _pair_swap_matrix(head_dim: int, device: torch.device) -> torch.Tensor:
-            """Constant `[head_dim, head_dim]` `P`: `(x @ P)` swaps each `(2k, 2k+1)` pair."""
-            p = torch.zeros(head_dim, head_dim, dtype=torch.float16)
-            even = torch.arange(0, head_dim, 2)
-            p[even, even + 1] = 1.0
-            p[even + 1, even] = 1.0
-            return convert(p, device=device, dtype=torch.float16)
 
         class _OnCardFreqsTable:
             """Flattened real freqs table on Spyre; gathers per-token rows on-card
@@ -774,14 +780,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         def _apply_rotary_emb_vit(xq, xk, freqs_cis):
             # xq, xk: [batch, patches, n_heads, head_dim] on Spyre.
             # freqs_cis: real [patches, 2, head_dim] on Spyre (gathered per token).
-            p = _pair_swap_matrix(xq.shape[-1], xq.device)
+            p = _rope_perm_matrix("pair", xq.shape[-1], xq.device)
             cos = freqs_cis[:, 0, :][None, :, None, :]  # [1, patches, 1, head_dim]
             sin = freqs_cis[:, 1, :][None, :, None, :]
 
-            def rot(x):
-                return x * cos + torch.matmul(x, p) * sin
-
-            return rot(xq).type_as(xq), rot(xk).type_as(xk)
+            return (
+                _rope_rotate_matmul(xq, cos, sin, p).type_as(xq),
+                _rope_rotate_matmul(xk, cos, sin, p).type_as(xk),
+            )
 
         _apply_rotary_emb_vit._spyre_patched = True
         pixtral.apply_rotary_emb_vit = _apply_rotary_emb_vit  # ty: ignore[invalid-assignment]
@@ -950,88 +956,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "Spyre: patched Pixtral PatchMerger permute to CPU (merging_layer GEMM stays on-card)."
         )
 
-    def _patch_pixtral_patch_conv(self) -> None:
-        """Run the Pixtral patch-embedding as a real on-card `F.conv2d`.
-
-        Upstream `Conv2dLayer._forward_mulmat` lowers the patch conv (kernel==
-        stride, no padding -> `enable_linear`) to a hand-rolled im2col
-        (`unfold -> permute(0,2,3,1,4,5) -> reshape -> F.linear`). That on-device
-        `permute/reshape` restickify has no feasible layout when a patch-grid dim
-        is coprime with the 64-wide stick ("Unexpected stick expression ...
-        Mod(var, 32)"), and it emits `aten.linear`, so torch-spyre's conv2d
-        support is never reached.
-
-        Route it through `F.conv2d` (a real `aten.convolution`, which torch-spyre
-        lowers via `conv2d_via_bmm_decomp`) instead. Plain `.to("spyre")` tensors
-        still raise in `propagate_spyre_tensor_layouts`, so the input and weight
-        are pre-placed in the channel-on-stick `SpyreTensorLayout` the conv layout
-        pass requires: activation sticks on `C_in`, weight/output on `C_out` (see
-        torch-spyre `_conv_layouts`). The layout is built from each tensor's own
-        shape, so it generalizes across Pixtral's variable image resolutions, and
-        is applied on H2D (route via CPU) rather than a device->device restickify.
-        Weight is relayouted once. Eager path. Guarded/no-op for non-Pixtral
-        models and idempotent.
-        """
-        try:
-            from vllm.model_executor.layers.conv import Conv2dLayer
-            from torch_spyre._C import SpyreTensorLayout
-        except ImportError:
-            return
-
-        convs = [
-            m
-            for m in self.model.modules()
-            if isinstance(m, Conv2dLayer)
-            and getattr(m, "enable_linear", False)
-            and not getattr(m, "_spyre_conv2d", False)
-        ]
-        if not convs:
-            return
-
-        def _stick_layout(t: torch.Tensor, dim_order: list[int]):
-            # 4-arg overload (host_size, host_strides, torch.dtype, dim_order); the
-            # stick (innermost) device dim is dim_order[-1]. Mirrors _conv_layouts.
-            return SpyreTensorLayout(list(t.shape), list(t.stride()), torch.float16, dim_order)
-
-        _logged: set[str] = set()
-
-        def _relayout(t: torch.Tensor, dim_order: list[int], tag: str) -> torch.Tensor:
-            # Realize the channel-on-stick layout via H2D (CPU -> Spyre): that path
-            # returns a real tensor. The device->device `.to(device_layout=)` does
-            # NOT — torch-spyre's spyre_to D2D branch returns `copy_from_d2d`'s
-            # result, which is None (the op mutates `dst` in place;
-            # mutates_args=("dst",)). See ministral-multimodal-bringup-issues.md #6a.
-            out = t.to("cpu").to(device_layout=_stick_layout(t, dim_order))
-            if tag not in _logged:
-                logger.info("Spyre patch-conv %s: H2D (CPU->Spyre) restickify.", tag)
-                _logged.add(tag)
-            return out
-
-        def _conv2d_native(self, x: torch.Tensor) -> torch.Tensor:
-            assert x.dim() == 4
-            # activation: C_in (logical dim 1) on the 64-stick.
-            x_dev = _relayout(x, [0, 2, 3, 1], "activation")
-            return torch.nn.functional.conv2d(
-                x_dev,
-                self._spyre_conv2d_weight,
-                self.bias,
-                stride=self.stride,
-                padding=self.padding,
-            )
-
-        for c in convs:
-            # weight (C_out, C_in, kH, kW): C_out on the stick. Relayout once.
-            c._spyre_conv2d_weight = _relayout(c.weight.detach(), [1, 2, 3, 0], "weight")
-            bound = types.MethodType(_conv2d_native, c)
-            c.forward_native = bound
-            c._forward_method = bound
-            c._spyre_conv2d = True
-        logger.info(
-            "Spyre: patched %d Pixtral patch-conv(s) to on-card F.conv2d "
-            "(channel-on-stick layout via H2D restickify).",
-            len(convs),
-        )
-
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -1114,11 +1038,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # models. Before compile like the other patches.
         self._patch_pixtral_vision_rope_vit()
 
-        # Pixtral patch-embedding conv: upstream lowers it to a hand-rolled im2col
-        # whose on-device reshape can't restickify for coprime patch grids; run it
-        # as a real on-card F.conv2d with channel-on-stick layout. No-op for
-        # non-Pixtral models. Before compile like the other patches.
-        self._patch_pixtral_patch_conv()
+        # NOTE: the Pixtral patch-embedding conv is handled by SpyreConv2d in
+        # custom_ops/conv.py (OOT dispatch), not by a patch here. A duplicate
+        # patch here was removed 2026-08-27 as dead code (forward_native is
+        # unreachable while the OOT op is enabled).
 
         # Pixtral vision attention: stock SDPA's batch-matmul can't restickify for
         # coprime patch counts; run it on-card with sequence/head padded to the 64

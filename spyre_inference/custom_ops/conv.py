@@ -111,6 +111,9 @@ class SpyreConv2d(Conv2dLayer):
 
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
+        # Proves which patch-conv implementation is live; the runner's duplicate
+        # patch was removed 2026-08-27, leaving this as the only implementation.
+        logger.info_once("Spyre conv2d: on-card F.conv2d with tiled layouts")
         # Place the input in its tiled layout via CPU (CPU->spyre is the tested
         # entry path; a device restickify would hit the same unsupported layout).
         x_cpu = x.to("cpu")
