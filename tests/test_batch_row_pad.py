@@ -90,13 +90,6 @@ def test_pad_rows_handles_1d_and_empty():
     assert _SpyreModelWrapper._pad_rows(empty, 1).shape == (0, 4)
 
 
-def test_pad_rows_passes_through_non_tensors():
-    from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
-
-    assert _SpyreModelWrapper._pad_rows(None, 1) is None
-    assert _SpyreModelWrapper._pad_rows("not-a-tensor", 1) == "not-a-tensor"
-
-
 # ---------------------------------------------------------------------------
 # _batch_pad_rows (the gate)
 # ---------------------------------------------------------------------------

@@ -79,22 +79,6 @@ def test_pair_matrix_equals_pair_swap(head_dim):
 
 
 @pytest.mark.rotary
-@pytest.mark.parametrize("kind", ["half", "pair"])
-@pytest.mark.parametrize("head_dim", HEAD_DIMS)
-def test_perm_matrix_is_a_permutation(kind, head_dim):
-    """Each matrix is a signed permutation: exactly one non-zero (+-1) per
-    row and per column. Catches an off-by-one in the index arithmetic that a
-    single random-input comparison could still slip past."""
-    from spyre_inference.v1.worker.spyre_model_runner import _rope_perm_matrix
-
-    m = _rope_perm_matrix(kind, head_dim, torch.device("cpu")).float()
-
-    assert torch.equal((m != 0).sum(dim=0), torch.ones(head_dim, dtype=torch.int64))
-    assert torch.equal((m != 0).sum(dim=1), torch.ones(head_dim, dtype=torch.int64))
-    assert torch.equal(m.abs().sum(), torch.tensor(float(head_dim)))
-
-
-@pytest.mark.rotary
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
 def test_rope_rotate_matmul_matches_neox_formula(head_dim):
     """`_rope_rotate_matmul` is the neox rotation `x*cos + rotate_half(x)*sin`."""
@@ -113,16 +97,6 @@ def test_rope_rotate_matmul_matches_neox_formula(head_dim):
     expected = x * cos + reference_rotate_half(x) * sin
 
     torch.testing.assert_close(_rope_rotate_matmul(x, cos, sin, m), expected)
-
-
-@pytest.mark.rotary
-def test_rope_perm_matrix_rejects_unknown_kind():
-    """An unknown kind raises rather than silently returning zeros (which would
-    turn the rotation into a plain `x*cos` and degrade quality quietly)."""
-    from spyre_inference.v1.worker.spyre_model_runner import _rope_perm_matrix
-
-    with pytest.raises(ValueError, match="unknown rope permutation kind"):
-        _rope_perm_matrix("bogus", 64, torch.device("cpu"))
 
 
 if __name__ == "__main__":

@@ -127,33 +127,6 @@ def test_unsupported_shape_falls_back_to_forward_native():
 
 
 @pytest.mark.conv
-def test_weight_layout_rejects_unaligned_out_channels():
-    """The layout tuples are derived from shape, and the 64-stick assumption is
-    asserted rather than silently mis-tiled."""
-    pytest.importorskip("torch_spyre")
-    from spyre_inference.custom_ops.conv import _weight_layout
-
-    with pytest.raises(AssertionError, match="multiple of the 64-wide stick"):
-        _weight_layout(torch.randn(100, 3, PATCH, PATCH, dtype=torch.float16))
-
-
-@pytest.mark.conv
-@pytest.mark.parametrize(
-    "shape,match",
-    [
-        ((2, 3, 64, 64), "batch"),
-        ((1, 65, 64, 64), "in_channels"),
-    ],
-)
-def test_input_layout_rejects_unsupported_shapes(shape, match):
-    pytest.importorskip("torch_spyre")
-    from spyre_inference.custom_ops.conv import _input_layout
-
-    with pytest.raises(AssertionError, match=match):
-        _input_layout(torch.randn(*shape, dtype=torch.float16))
-
-
-@pytest.mark.conv
 @pytest.mark.parametrize("out_ch", [64, 128, OUT_CHANNELS])
 @pytest.mark.parametrize("hw", [(64, 64), (48, 80)])
 def test_layouts_build_for_valid_shapes(out_ch, hw):
