@@ -41,6 +41,17 @@ from .utils import convert
 
 logger = init_logger(__name__)
 
+# torch-spyre's per-core addressing limit (``work_division.MAX_SPAN_BYTES``,
+# 65535 * 4096 = 255.99 MB). A tensor whose per-core memory span exceeds this is
+# silently mis-addressed: torch-spyre only logs CRITICAL and keeps going, so an
+# on-device embedding gather returns the WRONG ROWS with no error.
+#
+# We compare against the *unsplit* local weight. Work division across cores can
+# only shrink a span, never grow it, so <= limit is safe on-device for every
+# possible split; > limit falls back to the CPU gather (sometimes conservative,
+# since a split might have fit, but never wrong).
+_MAX_SPAN_BYTES = 65535 * 4096
+
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
 class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
@@ -55,6 +66,16 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             )
         # Lazily-cached CPU copy of the weight for the CPU gather (see forward).
         self._cpu_weight = None
+        # Whether this weight's span exceeds what Spyre can address (see forward).
+        # `self.weight` is already the local TP shard, so sharding is accounted for.
+        span = self.weight.data.numel() * self.weight.data.element_size()
+        self._gather_on_cpu = span > _MAX_SPAN_BYTES
+        logger.info(
+            "SpyreVocabParallelEmbedding: weight span %.1f MB (limit %.1f MB) -> gathering on %s",
+            span / (1024 * 1024),
+            _MAX_SPAN_BYTES / (1024 * 1024),
+            "CPU" if self._gather_on_cpu else "device",
+        )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
@@ -77,16 +98,17 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             masked_input = input_
             keep = None
 
-        # torch-spyre's on-device embedding gather returns wrong values for this model
-        # (proven: forcing the gather to CPU is coherent; on-device — even after DMA-ing
-        # the result to a fresh buffer — is garbage). Gather on CPU from a cached CPU copy
-        # of the weight; only the small [tokens, hidden] result crosses back to Spyre.
-        if self._cpu_weight is None:
-            self._cpu_weight = self.weight.data.detach().to("cpu")
-            logger.info("SpyreVocabParallelEmbedding: gathering on CPU (on-device gather is wrong)")
-        ids = convert(masked_input, device="cpu").long()
-        output = F.embedding(ids, self._cpu_weight)
-        output = convert(output, device=input_.device)
+        # An over-limit weight cannot be addressed on-card, and the failure is silent
+        # (wrong rows, no error), so gather on CPU from a cached CPU copy; only the
+        # small [tokens, hidden] result crosses back to Spyre. Weights that fit stay
+        # on-card and avoid both the host copy and the round trip.
+        if self._gather_on_cpu:
+            if self._cpu_weight is None:
+                self._cpu_weight = self.weight.data.detach().to("cpu")
+            ids = convert(masked_input, device="cpu").long()
+            output = convert(F.embedding(ids, self._cpu_weight), device=input_.device)
+        else:
+            output = F.embedding(masked_input.long(), self.weight.data)
 
         if keep is not None:
             output = output * keep

@@ -641,6 +641,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _patch_pixtral_vision_rope() -> None:
         """Run Pixtral's 2D vision RoPE ON-CARD, expressing `rotate_half` as a matmul.
 
+        Serves the **HF-format** tower (`PixtralHFVisionModel`) only. Repos shipping
+        both formats auto-detect as mistral (`params.json` wins), which builds
+        `VisionTransformer` and uses `_patch_pixtral_vision_rope_vit` instead — so
+        this is inactive unless vLLM is started with `--config-format hf`.
+
         transformers' `apply_rotary_pos_emb`/`rotate_half` half-slice the head dim
         (`x[..., :d/2]` / `x[..., d/2:]`), which corrupts on Spyre — and it's a
         plain module-level function, not a vLLM CustomOp, so `register_oot` can't
@@ -669,7 +674,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
             # q, k: [batch, n_heads, patches, head_dim]; cos/sin: [patches, head_dim].
-            logger.info_once("Spyre vision patch ACTIVE: apply_rotary_pos_emb (HF tower)")
             dev = q.device
             rot_r = _rope_perm_matrix("half", q.shape[-1], dev)
             # cos/sin come from PixtralRotaryEmbedding (arange/sin/cos → may be CPU);
@@ -692,6 +696,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
     @staticmethod
     def _patch_pixtral_vision_rope_vit() -> None:
         """Run the mistral-native Pixtral `VisionTransformer` 2D-RoPE ON-CARD.
+
+        This is the tower built for `consolidated*.safetensors` checkpoints, i.e.
+        the default for Ministral/Pixtral repos. The HF-format counterpart is
+        `_patch_pixtral_vision_rope`.
 
         This `VisionTransformer` (mistral checkpoint format) has a *complex* rope
         whose `forward` also gathers per-token freqs with advanced indexing. Three
@@ -779,7 +787,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return _OnCardFreqsTable(self._freqs_cis, self.max_patches_per_side)
 
         def _apply_rotary_emb_vit(xq, xk, freqs_cis):
-            logger.info_once("Spyre vision patch ACTIVE: apply_rotary_emb_vit (mistral tower)")
             # xq, xk: [batch, patches, n_heads, head_dim] on Spyre.
             # freqs_cis: real [patches, 2, head_dim] on Spyre (gathered per token).
             p = _rope_perm_matrix("pair", xq.shape[-1], xq.device)
@@ -829,7 +836,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         stick = 64
 
         def _spyre_vision_sdpa(q, k, v, mask):
-            logger.info_once("Spyre vision patch ACTIVE: vision Attention SDPA (mistral tower)")
             # q, k, v: [B, H, L, D] on device. Pad L,D to the stick, SDPA on-card, crop.
             b, h, seq, d = q.shape
             scale = d**-0.5
@@ -949,7 +955,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
 
         def _forward(self, x, image_sizes):
-            logger.info_once("Spyre vision patch ACTIVE: PatchMerger permute-on-CPU")
             dev = x.device
             x_perm = self.permute(x.to("cpu"), image_sizes)  # unfold on CPU
             return self.merging_layer(convert(x_perm, device=dev))  # GEMM on-card
