@@ -44,13 +44,17 @@ logger = init_logger(__name__)
 # torch-spyre's per-core addressing limit (``work_division.MAX_SPAN_BYTES``,
 # 65535 * 4096 = 255.99 MB). A tensor whose per-core memory span exceeds this is
 # silently mis-addressed: torch-spyre only logs CRITICAL and keeps going, so an
-# on-device embedding gather returns the WRONG ROWS with no error.
+# on-device embedding gather returns the WRONG ROWS with no error. Watch for
+# "per-core tensor span X MB ... exceeds hardware limit" in the logs.
 #
-# We compare against the *unsplit* local weight. Work division across cores can
-# only shrink a span, never grow it, so <= limit is safe on-device for every
-# possible split; > limit falls back to the CPU gather (sometimes conservative,
-# since a split might have fit, but never wrong).
+# The embedding table is work-divided over 4 cores, so the per-core span is
+# a quarter of the local weight. Measured with an isolated F.embedding
+# spyre-vs-CPU sweep: every shape at or under the limit matched CPU, every shape
+# over it returned whole wrong rows.
+#   Ministral-3-14B: 131072/4 x 5120 x 2 = 320 MB -> over  -> CPU gather
+#   granite-8B:       49152/4 x 4096 x 2 =  96 MB -> under -> on-card gather
 _MAX_SPAN_BYTES = 65535 * 4096
+_EMBED_CORE_SPLIT = 4
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
@@ -66,12 +70,13 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             )
         # Lazily-cached CPU copy of the weight for the CPU gather (see forward).
         self._cpu_weight = None
-        # Whether this weight's span exceeds what Spyre can address (see forward).
-        # `self.weight` is already the local TP shard, so sharding is accounted for.
-        span = self.weight.data.numel() * self.weight.data.element_size()
+        # Whether this weight's per-core span exceeds what Spyre can address (see
+        # forward). `self.weight` is already the local TP shard, so TP is accounted
+        # for on top of the work-division split.
+        span = (self.weight.data.numel() // _EMBED_CORE_SPLIT) * self.weight.data.element_size()
         self._gather_on_cpu = span > _MAX_SPAN_BYTES
         logger.info(
-            "SpyreVocabParallelEmbedding: weight span %.1f MB (limit %.1f MB) -> gathering on %s",
+            "SpyreVocabParallelEmbedding: per-core span %.1f MB (limit %.1f MB) -> gathering on %s",
             span / (1024 * 1024),
             _MAX_SPAN_BYTES / (1024 * 1024),
             "CPU" if self._gather_on_cpu else "device",
