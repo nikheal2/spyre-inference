@@ -63,18 +63,6 @@ def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor |
 
     `weight_t` is the physically-transposed weight of shape `[in, out]`, so the
     matmul is a plain `x @ A` (the Spyre-fast layout), not `F.linear`'s `x @ Aᵀ`.
-
-    This used to end with a Spyre→CPU→Spyre round-trip: torch-spyre compiled each
-    op with a **static output buffer**, so every same-shape matmul (``qkv``/
-    ``o_proj``/``gate_up``/``down_proj`` across all decoder layers) wrote to one
-    fixed device address, and returning it directly let the next matmul clobber a
-    retained value (the residual stream), producing structurally-wrong output.
-    The round-trip DMA'd the result out of that shared pool.
-
-    torch-spyre no longer shares the buffer, so the round-trip was removed —
-    validated on this branch by text-only generation staying coherent without it,
-    in both eager and torch.compile. If structurally-wrong output (garbage text)
-    ever reappears across the board, restore the round-trip here first.
     """
     out = torch.matmul(x, weight_t)
     if bias is not None:

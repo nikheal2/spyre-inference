@@ -241,6 +241,9 @@ markers = [
     "attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py); slow, runs in its own CI job",
     "rotary: Spyre RoPE custom-op tests (tests/test_rotary_embedding.py)",
     "fp8: FP8 quantization tests (tests/test_fp8.py)",
+    "conv: Spyre Conv2d custom-op tests (tests/test_conv.py)",
+    "pixtral: Pixtral vision-tower patch tests (tests/test_pixtral_patches.py)",
+    "multimodal: End-to-end VLM tests (tests/test_multimodal.py); slow, needs a card",
 ]
 # --8<-- [end:test-markers-definition]
 

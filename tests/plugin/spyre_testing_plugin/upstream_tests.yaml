@@ -147,6 +147,28 @@ tests:
             override:
               model: ["BAAI/bge-m3"]
 
+    # VLM / multimodal. Nothing upstream is runnable on Spyre yet, but the entry
+    # is here so the path is collected and the blockers are recorded in one place
+    # rather than rediscovered — the Pixtral vision path (Ministral/Mistral3) has
+    # no upstream coverage at all today. Local coverage meanwhile lives in
+    # tests/test_pixtral_patches.py (patch-level) and tests/test_multimodal.py
+    # (end-to-end).
+    - rel_path: tests/models/multimodal/generation/test_common.py
+      allow_list:
+        - test: "test_single_image_models"
+          # pixtral_hf is the only Pixtral-family entry in VLM_TEST_SETTINGS and it
+          # is unusable on Spyre twice over: the model is FP8 (nm-testing/
+          # pixtral-12b-FP8-dynamic; FP8 quant is not supported on Spyre) and the
+          # entry carries large_gpu_mark(min_gb=48), which skips on a CPU/Spyre
+          # host regardless. Re-enable once an fp16 Pixtral entry exists upstream,
+          # or once we inject one via params.override.
+          mode: skip
+          tags: [model, multimodal, upstream, uses_subprocess]
+          params:
+            allow:
+              model_type:
+                - pixtral_hf
+
     - rel_path: tests/basic_correctness/test_basic_correctness.py
       allow_list:
         - test: "test_models"

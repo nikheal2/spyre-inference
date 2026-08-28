@@ -177,9 +177,11 @@ def test_embedding_does_not_fall_back_to_cpu() -> None:
     """torch-spyre handles aten.embedding.default on-device (no CPU fallback), so a
     multi-row F.embedding on-device must not emit a FallbackWarning.
 
-    The single-row gather works too (torch-spyre#3418; see
-    test_single_token_embedding_on_device), so SpyreVocabParallelEmbedding.forward
-    gathers on-device."""
+    NOTE: this only says the op *dispatches* on-device — it says nothing about the
+    values being right. `SpyreVocabParallelEmbedding.forward` no longer uses the
+    on-device gather: it returns numerically wrong values for large vocabularies,
+    so the gather runs on CPU (see `test_cpu_gather_is_used`). Keep this test as
+    the dispatch-level signal for when the on-device gather can be reinstated."""
     from torch_spyre.ops.fallbacks import FallbackWarning
 
     weight = torch.randn(128, 64, dtype=torch.float16, device="spyre")
@@ -195,13 +197,68 @@ def test_embedding_does_not_fall_back_to_cpu() -> None:
 
 @pytest.mark.vocab_parallel_embedding
 def test_single_token_embedding_on_device() -> None:
-    """Single-row embedding gather (single-token decode). Fixed by torch-spyre#3418;
-    guards the on-device gather in SpyreVocabParallelEmbedding.forward."""
+    """Single-row embedding gather (single-token decode). Fixed by torch-spyre#3418.
+
+    Dispatch/shape-level guard only — `SpyreVocabParallelEmbedding.forward` gathers
+    on CPU today (see `test_cpu_gather_is_used`)."""
     weight = torch.randn(128, 64, dtype=torch.float16, device="spyre")
     input_ids = torch.tensor([5], dtype=torch.int64, device="spyre")
 
     out = F.embedding(input_ids, weight)
     torch.testing.assert_close(out.cpu().float(), weight[5:6].cpu().float())
+
+
+@pytest.mark.vocab_parallel_embedding
+def test_cpu_gather_is_used(tp_group) -> None:
+    """The gather runs on CPU from a cached CPU copy of the weight.
+
+    Pins the branch's design decision so a later "optimisation" back to the
+    on-device gather is a deliberate, visible change rather than a silent
+    regression to garbage embeddings.
+    """
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    layer = VocabParallelEmbedding(128, 64, params_dtype=torch.float16)
+    layer.weight.data.normal_(std=0.02)
+    layer = layer.to("spyre")
+
+    assert layer._cpu_weight is None, "the CPU copy must be built lazily, on first forward"
+    layer(torch.tensor([1, 2, 3], dtype=torch.int64, device="spyre"))
+    assert layer._cpu_weight is not None
+    assert layer._cpu_weight.device.type == "cpu"
+
+
+@pytest.mark.vocab_parallel_embedding
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known gap: SpyreVocabParallelEmbedding caches a CPU copy of the weight on "
+        "the first forward and never invalidates it, so any later weight mutation is "
+        "silently ignored. Benign today because weight loading always completes "
+        "before the first forward, but it makes LoRA/adapter swaps and in-place "
+        "weight edits silently wrong. Fix by invalidating the cache on a weight "
+        "write (or building it at load time), then drop this xfail."
+    ),
+)
+def test_cpu_weight_cache_tracks_weight_updates(tp_group) -> None:
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    torch.manual_seed(0)
+    layer = VocabParallelEmbedding(128, 64, params_dtype=torch.float16)
+    layer.weight.data.normal_(std=0.02)
+    layer = layer.to("spyre")
+
+    input_ids = torch.tensor([1, 2, 3], dtype=torch.int64, device="spyre")
+    layer(input_ids)  # populates the CPU cache
+
+    layer.weight.data.zero_()
+    out = layer(input_ids)
+
+    torch.testing.assert_close(out.cpu().float(), torch.zeros(3, 64))
 
 
 if __name__ == "__main__":

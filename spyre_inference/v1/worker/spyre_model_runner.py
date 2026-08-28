@@ -669,6 +669,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
             # q, k: [batch, n_heads, patches, head_dim]; cos/sin: [patches, head_dim].
+            logger.info_once("Spyre vision patch ACTIVE: apply_rotary_pos_emb (HF tower)")
             dev = q.device
             rot_r = _rope_perm_matrix("half", q.shape[-1], dev)
             # cos/sin come from PixtralRotaryEmbedding (arange/sin/cos → may be CPU);
@@ -778,6 +779,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return _OnCardFreqsTable(self._freqs_cis, self.max_patches_per_side)
 
         def _apply_rotary_emb_vit(xq, xk, freqs_cis):
+            logger.info_once("Spyre vision patch ACTIVE: apply_rotary_emb_vit (mistral tower)")
             # xq, xk: [batch, patches, n_heads, head_dim] on Spyre.
             # freqs_cis: real [patches, 2, head_dim] on Spyre (gathered per token).
             p = _rope_perm_matrix("pair", xq.shape[-1], xq.device)
@@ -827,6 +829,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         stick = 64
 
         def _spyre_vision_sdpa(q, k, v, mask):
+            logger.info_once("Spyre vision patch ACTIVE: vision Attention SDPA (mistral tower)")
             # q, k, v: [B, H, L, D] on device. Pad L,D to the stick, SDPA on-card, crop.
             b, h, seq, d = q.shape
             scale = d**-0.5
@@ -946,6 +949,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
 
         def _forward(self, x, image_sizes):
+            logger.info_once("Spyre vision patch ACTIVE: PatchMerger permute-on-CPU")
             dev = x.device
             x_perm = self.permute(x.to("cpu"), image_sizes)  # unfold on CPU
             return self.merging_layer(convert(x_perm, device=dev))  # GEMM on-card

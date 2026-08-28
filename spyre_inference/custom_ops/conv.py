@@ -39,9 +39,7 @@ logger = init_logger(__name__)
 
 
 def _layouts_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Can this conv use the tiled on-card layouts below?
-
-    The layout tuples assume a single image, in-channels inside one 64-wide stick,
+    """The layout tuples assume a single image, in-channels inside one 64-wide stick,
     and out-channels tiling into whole sticks. That holds for a Pixtral/Ministral
     patch embed (1x3xHxW, out_channels a multiple of 64) but not for convs in
     general, and this class is registered OOT for *every* `Conv2dLayer` — so when
@@ -101,10 +99,6 @@ class SpyreConv2d(Conv2dLayer):
         self._w_dev: torch.Tensor | None = None
         # Mirror SpyreSiluAndMul: compile the on-card conv unless the outer
         # graph is already being traced (then it captures the eager call).
-        #
-        # dynamic=False is required, not a tuning choice: Spyre cannot handle
-        # dynamic shapes (SymInt), so every torch.compile in this codebase pins
-        # static shapes -- see TorchSpyreModelRunner._compile_for_spyre.
         #
         # Consequence for Pixtral, whose images vary in resolution: one Spyre
         # compile per distinct (H, W). Past torch._dynamo.config.cache_size_limit

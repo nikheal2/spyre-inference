@@ -111,8 +111,10 @@ EXCLUDED = {
     "cohere-melody",
     "gpt-oss",
     "peft",
-    # torch extras excluded elsewhere (torchaudio/torchvision via the root
-    # override; numba/ray are pure test deps for paths we don't run)
+    # torchaudio is excluded via the root override; numba/ray are pure test deps
+    # for paths we don't run. torchvision is now a real runtime dependency (the
+    # root override was dropped for VLM support), so it is excluded here only as
+    # a *test* dep — the runtime closure already provides it.
     "numba",
     "ray",
     "torchaudio",
