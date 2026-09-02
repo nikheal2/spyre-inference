@@ -107,7 +107,9 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
         """Place the conv weight into its tiled layout once, then cache."""
         if self._w_dev is None:
             w_cpu = self.weight.detach().to("cpu")
-            self._w_dev = w_cpu.to("spyre", device_layout=_weight_layout(w_cpu))
+            self._w_dev = w_cpu.to(  # ty: ignore[no-matching-overload]
+                "spyre", device_layout=_weight_layout(w_cpu)
+            )
         return self._w_dev
 
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
@@ -131,5 +133,7 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
         # Via CPU: CPU->spyre is the tested entry path, and a device-side
         # restickify would hit the same unsupported layout.
         x_cpu = x.to("cpu")
-        x_dev = x_cpu.to("spyre", device_layout=_input_layout(x_cpu))
+        x_dev = x_cpu.to(  # ty: ignore[no-matching-overload]
+            "spyre", device_layout=_input_layout(x_cpu)
+        )
         return self._conv_native(x_dev, self._weight_on_device(), self.bias)

@@ -131,7 +131,10 @@ def _llama4_attn_scale_op(
         llama_4_scaling_beta=beta,
         llama_4_scaling_original_max_position_embeddings=original_max_position_embeddings,
     )
-    scaling = MistralAttention._get_llama_4_attn_scale(stub, positions.to("cpu"))
+    scaling = MistralAttention._get_llama_4_attn_scale(
+        stub,  # ty: ignore[invalid-argument-type]
+        positions.to("cpu"),
+    )
     scaling = convert(scaling, device=positions.device, dtype=torch.float16)
     # Hold `positions` so its storage cannot be freed and its address reused.
     _llama4_scale_cache = (key, positions, scaling)
@@ -556,7 +559,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             orig_max = int(module.llama_4_scaling_original_max_position_embeddings)
 
             def _get_llama_4_attn_scale(positions: torch.Tensor) -> torch.Tensor:
-                return torch.ops.vllm.spyre_llama4_attn_scale(positions, beta, orig_max)
+                return torch.ops.vllm.spyre_llama4_attn_scale(
+                    positions,  # ty: ignore[invalid-argument-type]
+                    beta,  # ty: ignore[invalid-argument-type]
+                    orig_max,  # ty: ignore[invalid-argument-type]
+                )
 
             return _get_llama_4_attn_scale
 

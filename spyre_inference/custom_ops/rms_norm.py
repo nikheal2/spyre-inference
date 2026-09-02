@@ -95,7 +95,10 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
             residual = x
 
         # fp32 for the variance, matching upstream: x**2 overflows fp16 above |x| ~ 256.
-        x = torch.ops.vllm.spyre_rms_norm_fp32(x, self.variance_epsilon)
+        x = torch.ops.vllm.spyre_rms_norm_fp32(
+            x,  # ty: ignore[invalid-argument-type]
+            self.variance_epsilon,  # ty: ignore[invalid-argument-type]
+        )
         if self.has_weight:
             x = x * self.weight
 

@@ -56,6 +56,36 @@ def test_native_all_reduce_works(run_tp_probe) -> None:
 @pytest.mark.xfail(
     strict=True,
     reason=(
+        "spyre-comms cannot build a work schedule for a 5120-element fp16 "
+        "collective (80 sticks: past the 32-core width without dividing it), so "
+        "dxp_standalone exits 1. When this flips to passing, drop the row padding "
+        "from SpyreCommunicator.all_reduce."
+    ),
+)
+def test_all_reduce_hidden5120_decode_works(run_tp_probe) -> None:
+    run_tp_probe("all_reduce_hidden5120_decode", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+def test_all_reduce_hidden5120_row_padded_works(run_tp_probe) -> None:
+    """The workaround for the xfail above: pad to 160 sticks, reduce, drop the row."""
+    run_tp_probe("all_reduce_hidden5120_row_padded", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
         "torch-spyre's spyreccl backend stubs _allgather_base, so "
         "dist.all_gather_into_tensor fails even though libspyre_comms "
         "implements single-tensor allgather. When this flips to passing, "
