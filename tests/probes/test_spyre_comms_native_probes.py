@@ -75,6 +75,17 @@ def test_all_reduce_decode_padding_survives_many_rounds(run_tp_probe) -> None:
     spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
 )
+def test_compiled_all_reduce_padded_is_exact(run_tp_probe) -> None:
+    """The padded reduction under torch.compile, which is how the decoder runs it."""
+    run_tp_probe("compiled_all_reduce_padded", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
 @pytest.mark.xfail(
     strict=True,
     reason=(

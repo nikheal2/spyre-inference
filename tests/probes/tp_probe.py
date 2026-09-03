@@ -358,7 +358,56 @@ def probe_all_reduce_decode_padded_multiround(device, device_group, world_size, 
     print(f"[rank {rank}] {rounds} padded decode reductions all exact")
 
 
+def probe_compiled_all_reduce_padded(device, device_group, world_size, rank):
+    """The padded decode reduction as the compiled decoder actually runs it.
+
+    The eager probe passes, but `STOCK_TORCH_COMPILE` traces pad/all_reduce/unpad
+    into the block graph, where Inductor's reinplacing and layout passes get at
+    them. 32 separately-compiled blocks x 2 rounds mirrors the real decode; the
+    unpadded [2, 5120] control isolates the padding from the collective.
+    """
+    from spyre_inference.v1.pool import select_rows
+
+    gn = _group_name(device_group)
+    scale = float(sum(range(1, world_size + 1)))
+    base = (torch.arange(5120, dtype=torch.int32) % 97).to(torch.float16)
+
+    def padded_block(x):
+        padded = torch.nn.functional.pad(x, (0, 0, 0, 1))
+        out = torch.ops._c10d_functional.all_reduce(padded, "sum", gn)
+        out = torch.ops._c10d_functional.wait_tensor(out)
+        return select_rows(out, torch.arange(1, dtype=torch.int32))
+
+    def plain_block(x):
+        out = torch.ops._c10d_functional.all_reduce(x, "sum", gn)
+        return torch.ops._c10d_functional.wait_tensor(out)
+
+    for name, body, rows in (("padded[1,5120]", padded_block, 1), ("plain[2,5120]", plain_block, 2)):
+        fns = [torch.compile(body, dynamic=False) for _ in range(32)]
+        kept = []
+        for i, fn in enumerate(fns):
+            t = ((base + float(i)) * float(rank + 1)).reshape(1, 5120)
+            t = t.expand(rows, 5120).contiguous().to(device)
+            kept.append(fn(t))
+
+        bad = []
+        for i, got in enumerate(kept):
+            want = ((base + float(i)) * scale).reshape(1, 5120).expand(rows, 5120)
+            if not torch.equal(got.cpu(), want.contiguous()):
+                bad.append(i)
+        if bad:
+            got = kept[bad[0]].cpu()
+            want = ((base + float(bad[0])) * scale).reshape(1, 5120).expand(rows, 5120).contiguous()
+            idx = (got != want).nonzero()[0]
+            raise AssertionError(
+                f"{name}: {len(bad)} of 32 compiled blocks corrupted (first={bad[0]}); "
+                f"element {idx.tolist()} got {got[tuple(idx)]} want {want[tuple(idx)]}"
+            )
+        print(f"[rank {rank}] {name} compiled: 32 blocks exact")
+
+
 PROBES = {
+    "compiled_all_reduce_padded": probe_compiled_all_reduce_padded,
     "all_reduce_decode_padded_multiround": probe_all_reduce_decode_padded_multiround,
     "all_reduce_vision_flattened": probe_all_reduce_vision_flattened,
     "all_reduce_vision_rank3": probe_all_reduce_vision_rank3,
