@@ -79,6 +79,18 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         if input_.device.type == "cpu" or self._group_name is None:
             return super().all_reduce(input_)
 
+        # WORKAROUND, not a fix: deeptools' L3 scheduler asserts "Expect valid lower
+        # and upper bound parameters" (L3DlOpsScheduler.cpp) while chunking the
+        # collective's elementwise-sum kernel for some rank-3 shapes -- [1, 528, 1024]
+        # dies, [1, 3120, 1024] builds. spyre-comms passes the tensor's real shape
+        # through in eager, so reducing a flat view gives the scheduler a single
+        # dimension to chunk. Only rank > 2 is reshaped; the 2-D decoder shapes that
+        # work today are left exactly as they were.
+        orig_shape = input_.shape
+        flattened = input_.dim() > 2
+        if flattened:
+            input_ = input_.reshape(-1)
+
         pad_rows = collective_row_pad(input_)
         # TODO(remove before merge): records every collective the model issues, so a
         # dxp_standalone build failure can be tied to an exact element count.
@@ -90,13 +102,13 @@ class SpyreCommunicator(DeviceCommunicatorBase):
             _out_numel = input_.numel() + pad_rows * _row
             _sticks = _out_numel * input_.element_size() // _STICK_BYTES
             logger.warning_once(
-                "all_reduce shape=%s numel=%d pad_rows=%d -> numel=%d sticks=%d (%%32=%d)",
-                tuple(input_.shape),
+                "all_reduce shape=%s flat=%s numel=%d pad_rows=%d -> numel=%d sticks=%d",
+                tuple(orig_shape),
+                flattened,
                 input_.numel(),
                 pad_rows,
                 _out_numel,
                 _sticks,
-                _sticks % _COLLECTIVE_CORES,
             )
         reduced = input_
         if pad_rows:
@@ -121,6 +133,8 @@ class SpyreCommunicator(DeviceCommunicatorBase):
             # so the conversion inside select_rows would lower to `spyre::to_dtype_cpu`
             # -- an op registered for spyre tensors only -- on this CPU index tensor.
             out = select_rows(out, torch.arange(input_.shape[0], dtype=torch.int32))
+        if flattened:
+            out = out.reshape(orig_shape)
         return out
 
     # libspyre_comms allgather transfers each rank's buffer in 64-element chunks
