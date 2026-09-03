@@ -310,7 +310,56 @@ def probe_all_reduce_hidden5120_row_padded(device, device_group, world_size, ran
     torch.testing.assert_close(out.cpu(), torch.full((1, 5120), expected, dtype=torch.float16))
 
 
+def probe_all_reduce_decode_padded_multiround(device, device_group, world_size, rank):
+    """80 padded [1, 5120] reductions, as a 40-layer decode step issues them.
+
+    The decode reduction needs `collective_row_pad`, so every one of these goes
+    pad -> reduce -> unpad through the same same-shaped collective buffer. Results
+    are kept on device and only checked at the end: a result that aliases that
+    buffer is overwritten by the next round and shows up here, while a
+    check-as-you-go loop would read each value before it could be clobbered.
+
+    Values vary per round, so an overwrite cannot masquerade as a correct answer
+    the way a constant fill would.
+    """
+    from spyre_inference.distributed.spyre_communicator import collective_row_pad
+    from spyre_inference.v1.pool import select_rows
+
+    gn = _group_name(device_group)
+    scale = float(sum(range(1, world_size + 1)))
+    rounds = 80
+    base = (torch.arange(5120, dtype=torch.int32) % 97).to(torch.float16)
+
+    kept = []
+    for i in range(rounds):
+        t = ((base + float(i)) * float(rank + 1)).reshape(1, 5120).to(device)
+        pad_rows = collective_row_pad(t)
+        assert pad_rows == 1, pad_rows
+        padded = torch.nn.functional.pad(t, (0, 0, 0, pad_rows))
+        out = torch.ops._c10d_functional.all_reduce(padded, "sum", gn)
+        out = torch.ops._c10d_functional.wait_tensor(out)
+        kept.append(select_rows(out, torch.arange(1, dtype=torch.int32)))
+
+    bad_rounds = []
+    for i, got in enumerate(kept):
+        want = ((base + float(i)) * scale).reshape(1, 5120)
+        if not torch.equal(got.cpu(), want):
+            bad_rounds.append(i)
+    if bad_rounds:
+        first = bad_rounds[0]
+        got = kept[first].cpu()
+        want = ((base + float(first)) * scale).reshape(1, 5120)
+        idx = (got != want).nonzero()[0]
+        raise AssertionError(
+            f"{len(bad_rounds)} of {rounds} rounds corrupted (first={first}); "
+            f"round {first} element {idx.tolist()} got {got[tuple(idx)]} want "
+            f"{want[tuple(idx)]}. Rounds {bad_rounds[:8]}..."
+        )
+    print(f"[rank {rank}] {rounds} padded decode reductions all exact")
+
+
 PROBES = {
+    "all_reduce_decode_padded_multiround": probe_all_reduce_decode_padded_multiround,
     "all_reduce_vision_flattened": probe_all_reduce_vision_flattened,
     "all_reduce_vision_rank3": probe_all_reduce_vision_rank3,
     "all_reduce_hidden5120_decode": probe_all_reduce_hidden5120_decode,

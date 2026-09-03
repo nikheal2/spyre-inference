@@ -64,6 +64,17 @@ def test_all_reduce_vision_flattened_is_exact(run_tp_probe) -> None:
     spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
 )
+def test_all_reduce_decode_padding_survives_many_rounds(run_tp_probe) -> None:
+    """Does the decode row padding stay correct across a whole 40-layer step?"""
+    run_tp_probe("all_reduce_decode_padded_multiround", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
 @pytest.mark.xfail(
     strict=True,
     reason=(
