@@ -96,7 +96,10 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         if pad_rows:
             # index_select, not a slice: the result must not alias the collective's
             # output buffer, which the next same-shaped reduction overwrites.
-            out = select_rows(out, torch.arange(input_.shape[0]))
+            # int32 at creation, not int64: torch-spyre has no int64->int32 typecast,
+            # so the conversion inside select_rows would lower to `spyre::to_dtype_cpu`
+            # -- an op registered for spyre tensors only -- on this CPU index tensor.
+            out = select_rows(out, torch.arange(input_.shape[0], dtype=torch.int32))
         return out
 
     # libspyre_comms allgather transfers each rank's buffer in 64-element chunks
