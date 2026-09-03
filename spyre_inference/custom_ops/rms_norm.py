@@ -16,7 +16,8 @@
 
 Spyre constraints:
     - fp16->fp32 ops are not registered as Spyre kernels (torch_spyre/ops/eager.py),
-      so the promotion runs on CPU behind an opaque op and copies back.
+      so the promotion runs on CPU behind an opaque op and copies back. That round
+      trip is only paid by architectures that need it -- see ``_NEEDS_FP32_VARIANCE``.
 
 References:
     - Upstream RMSNorm: vllm/model_executor/layers/layernorm.py
@@ -25,6 +26,7 @@ References:
 from functools import lru_cache
 
 import torch
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.transformers.fusers.rms_norm import TPAwareRMSNorm
@@ -34,6 +36,12 @@ from .lazy_compile import CompileOutermost, compile_when_outermost
 from .utils import convert
 
 logger = init_logger(__name__)
+
+# Ministral-3-14B's hidden size (5120) puts activations above the |x| ~ 256 point
+# where fp16 x**2 overflows; smaller hidden sizes (e.g. 4096) haven't shown this in
+# practice. Promoting to fp32 costs a CPU round trip per norm, so only architectures
+# that actually need it pay for it.
+_NEEDS_FP32_VARIANCE = frozenset({"Mistral3ForConditionalGeneration"})
 
 
 def _rms_norm_fp32_op(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -51,6 +59,10 @@ def _rms_norm_fp32_op(x: torch.Tensor, eps: float) -> torch.Tensor:
 
 def _rms_norm_fp32_fake(x: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.empty_like(x)
+
+
+def _promotes_fp32(architectures: list[str]) -> bool:
+    return any(a in _NEEDS_FP32_VARIANCE for a in architectures)
 
 
 @lru_cache(maxsize=1)
@@ -75,7 +87,12 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        logger.info_once("SpyreRMSNorm: fp32 promotion runs on CPU via spyre_rms_norm_fp32.")
+        model_config = get_current_vllm_config().model_config
+        hf_config = getattr(model_config, "hf_config", None)
+        architectures = getattr(hf_config, "architectures", None) or []
+        self.spyre_promote_fp32 = _promotes_fp32(architectures)
+        if self.spyre_promote_fp32:
+            logger.info_once("SpyreRMSNorm: fp32 promotion runs on CPU via spyre_rms_norm_fp32.")
 
     @compile_when_outermost
     def forward_oot(
@@ -94,8 +111,11 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
             x = x + residual
             residual = x
 
-        # fp32 for the variance, matching upstream: x**2 overflows fp16 above |x| ~ 256.
-        x = torch.ops.vllm.spyre_rms_norm_fp32(x, self.variance_epsilon)
+        if self.spyre_promote_fp32:
+            x = torch.ops.vllm.spyre_rms_norm_fp32(x, self.variance_epsilon)
+        else:
+            variance = x.pow(2).mean(dim=-1, keepdim=True)
+            x = x * torch.rsqrt(variance + self.variance_epsilon)
         if self.has_weight:
             x = x * self.weight
 
