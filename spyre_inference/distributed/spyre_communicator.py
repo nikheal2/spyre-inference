@@ -82,18 +82,22 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         pad_rows = collective_row_pad(input_)
         # TODO(remove before merge): records every collective the model issues, so a
         # dxp_standalone build failure can be tied to an exact element count.
-        _row = input_.numel() // input_.shape[0] if input_.dim() >= 2 else 0
-        _out_numel = input_.numel() + pad_rows * _row
-        _sticks = _out_numel * input_.element_size() / _STICK_BYTES
-        logger.warning_once(
-            "all_reduce shape=%s numel=%d pad_rows=%d -> numel=%d sticks=%s (%%32=%s)",
-            tuple(input_.shape),
-            input_.numel(),
-            pad_rows,
-            _out_numel,
-            _sticks,
-            _sticks % _COLLECTIVE_CORES,
-        )
+        # `is_compiling()` guard is mandatory: Dynamo rejects logging.Logger calls
+        # inside a traced region, and this method is traced into the decoder blocks.
+        # It folds the branch away while tracing, so the eager vision path still logs.
+        if not torch.compiler.is_compiling():
+            _row = input_.numel() // input_.shape[0] if input_.dim() >= 2 else 0
+            _out_numel = input_.numel() + pad_rows * _row
+            _sticks = _out_numel * input_.element_size() // _STICK_BYTES
+            logger.warning_once(
+                "all_reduce shape=%s numel=%d pad_rows=%d -> numel=%d sticks=%d (%%32=%d)",
+                tuple(input_.shape),
+                input_.numel(),
+                pad_rows,
+                _out_numel,
+                _sticks,
+                _sticks % _COLLECTIVE_CORES,
+            )
         reduced = input_
         if pad_rows:
             # Rows, not the last dim: a row is a whole number of sticks, so the
