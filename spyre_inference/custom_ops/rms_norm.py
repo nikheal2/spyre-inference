@@ -89,14 +89,22 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
 
         model_config = get_current_vllm_config().model_config
         hf_config = getattr(model_config, "hf_config", None)
-        architectures = getattr(hf_config, "architectures", None) or []
+        architectures = tuple(getattr(hf_config, "architectures", None) or ())
         self.spyre_promote_fp32 = _promotes_fp32(architectures)
         # TODO(remove before merge): confirms the gate picks the right path per model.
-        logger.warning_once(
-            "SpyreRMSNorm: variance in %s (architectures=%s)",
-            "fp32 (CPU round-trip)" if self.spyre_promote_fp32 else "fp16 (on-card)",
-            architectures,
-        )
+        # lru_cache-backed _once loggers need hashable args -- `architectures` must
+        # stay a tuple, not the list hf_config gives back, or this silently raises
+        # TypeError instead of printing.
+        if self.spyre_promote_fp32:
+            logger.warning_once(
+                "SpyreRMSNorm: variance in fp32 (CPU round-trip); architectures=%s",
+                architectures,
+            )
+        else:
+            logger.warning_once(
+                "SpyreRMSNorm: variance in fp16 (on-card, no promotion); architectures=%s",
+                architectures,
+            )
 
     @compile_when_outermost
     def forward_oot(
