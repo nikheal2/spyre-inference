@@ -91,8 +91,12 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
         hf_config = getattr(model_config, "hf_config", None)
         architectures = getattr(hf_config, "architectures", None) or []
         self.spyre_promote_fp32 = _promotes_fp32(architectures)
-        if self.spyre_promote_fp32:
-            logger.info_once("SpyreRMSNorm: fp32 promotion runs on CPU via spyre_rms_norm_fp32.")
+        # TODO(remove before merge): confirms the gate picks the right path per model.
+        logger.warning_once(
+            "SpyreRMSNorm: variance in %s (architectures=%s)",
+            "fp32 (CPU round-trip)" if self.spyre_promote_fp32 else "fp16 (on-card)",
+            architectures,
+        )
 
     @compile_when_outermost
     def forward_oot(
