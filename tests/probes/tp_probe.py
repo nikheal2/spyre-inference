@@ -226,6 +226,56 @@ def probe_compiled_all_gather_lastdim_unaligned(device, device_group, world_size
         )
 
 
+def _vision_pattern(patches, rank, device):
+    """Position-dependent values, so a layout scramble cannot pass as correct.
+
+    ``idx % 97`` stays under 2048, where fp16 represents every integer exactly, so
+    the reduction is bit-exact and any mismatch is a real transport/layout error.
+    """
+    idx = torch.arange(patches * 1024, dtype=torch.int32)
+    values = (idx % 97).to(torch.float16) * float(rank + 1)
+    return values.reshape(1, patches, 1024).to(device)
+
+
+def probe_all_reduce_vision_flattened(device, device_group, world_size, rank):
+    """The vision o_proj reduction, reduced as a flat view then reshaped back.
+
+    528 is the patch count whose rank-3 collective made deeptools' L3 scheduler
+    assert; 3120 is the count that built. Both answer whether the flatten in
+    `SpyreCommunicator.all_reduce` is numerically sound on real hardware.
+    """
+    gn = _group_name(device_group)
+    scale = float(sum(range(1, world_size + 1)))
+    for patches in (528, 3120):
+        t = _vision_pattern(patches, rank, device)
+        out = torch.ops._c10d_functional.all_reduce(t.reshape(-1), "sum", gn)
+        out = torch.ops._c10d_functional.wait_tensor(out).reshape(t.shape)
+
+        expected = _vision_pattern(patches, 0, "cpu") * scale
+        actual = out.cpu()
+        if not torch.equal(actual, expected):
+            bad = (actual != expected).nonzero()
+            raise AssertionError(
+                f"patches={patches}: {bad.shape[0]} of {expected.numel()} elements wrong; "
+                f"first bad index {bad[0].tolist()} "
+                f"got {actual[tuple(bad[0])]} want {expected[tuple(bad[0])]}"
+            )
+        print(f"[rank {rank}] patches={patches} flattened all_reduce exact")
+
+
+def probe_all_reduce_vision_rank3(device, device_group, world_size, rank):
+    """The same reduction without flattening. 528 is expected to fail the build."""
+    gn = _group_name(device_group)
+    scale = float(sum(range(1, world_size + 1)))
+    for patches in (528, 3120):
+        t = _vision_pattern(patches, rank, device)
+        out = torch.ops._c10d_functional.all_reduce(t, "sum", gn)
+        out = torch.ops._c10d_functional.wait_tensor(out)
+        expected = _vision_pattern(patches, 0, "cpu") * scale
+        torch.testing.assert_close(out.cpu(), expected, atol=0.0, rtol=0.0)
+        print(f"[rank {rank}] patches={patches} rank-3 all_reduce exact")
+
+
 def probe_all_reduce_hidden5120_decode(device, device_group, world_size, rank):
     """Ministral's 1-token TP row-parallel decode. Expected to fail.
 
@@ -261,6 +311,8 @@ def probe_all_reduce_hidden5120_row_padded(device, device_group, world_size, ran
 
 
 PROBES = {
+    "all_reduce_vision_flattened": probe_all_reduce_vision_flattened,
+    "all_reduce_vision_rank3": probe_all_reduce_vision_rank3,
     "all_reduce_hidden5120_decode": probe_all_reduce_hidden5120_decode,
     "all_reduce_hidden5120_row_padded": probe_all_reduce_hidden5120_row_padded,
     "native_all_reduce": probe_native_all_reduce,
