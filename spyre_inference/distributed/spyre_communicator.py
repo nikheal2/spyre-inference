@@ -25,13 +25,39 @@ without needing a separate eager path.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
 
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.pool import select_rows
+
+# spyre-comms cannot build a work schedule for a collective whose 128-byte stick
+# count is above the 32-core width without dividing it: hidden 5120 is 80 sticks
+# per token, and dxp_standalone exits 1 on the 1-token TP=2 reduction.
+_COLLECTIVE_CORES = 32
+_STICK_BYTES = 128
+
+
+def collective_row_pad(input_: torch.Tensor) -> int:
+    """Zero rows to append so the element count spreads evenly over the cores."""
+    if input_.dim() < 2 or input_.shape[0] == 0:
+        return 0
+    rows = input_.shape[0]
+    row_bytes = (input_.numel() // rows) * input_.element_size()
+    if row_bytes % _STICK_BYTES:
+        return 0
+    row_sticks = row_bytes // _STICK_BYTES
+    sticks = rows * row_sticks
+    if sticks <= _COLLECTIVE_CORES or sticks % _COLLECTIVE_CORES == 0:
+        return 0
+    step = _COLLECTIVE_CORES // math.gcd(row_sticks, _COLLECTIVE_CORES)
+    return -(-rows // step) * step - rows
 
 
 class SpyreCommunicator(DeviceCommunicatorBase):
@@ -50,16 +76,28 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         if input_.device.type == "cpu" or self._group_name is None:
             return super().all_reduce(input_)
 
+        pad_rows = collective_row_pad(input_)
+        reduced = input_
+        if pad_rows:
+            # Rows, not the last dim: a row is a whole number of sticks, so the
+            # layout is unchanged and zeros are the identity for a sum.
+            reduced = F.pad(input_, (0, 0) * (input_.dim() - 1) + (0, pad_rows))
+
         # Out-of-place, unlike the base class's in-place `dist.all_reduce`: vLLM's
         # `torch.ops.vllm.all_reduce` wrapper declares no mutation, so under
         # torch.compile functionalization misses the overwrite and the graph
         # computes garbage. Inductor's reinplacing pass recovers the in-place op.
         out = torch.ops._c10d_functional.all_reduce(
-            input_,  # ty: ignore[invalid-argument-type]
+            reduced,  # ty: ignore[invalid-argument-type]
             "sum",  # ty: ignore[invalid-argument-type]
             self._group_name,  # ty: ignore[invalid-argument-type]
         )
-        return torch.ops._c10d_functional.wait_tensor(out)
+        out = torch.ops._c10d_functional.wait_tensor(out)
+        if pad_rows:
+            # index_select, not a slice: the result must not alias the collective's
+            # output buffer, which the next same-shaped reduction overwrites.
+            out = select_rows(out, torch.arange(input_.shape[0]))
+        return out
 
     # libspyre_comms allgather transfers each rank's buffer in 64-element chunks
     # along the gathered dim, so a shard whose size along `dim` is not a multiple

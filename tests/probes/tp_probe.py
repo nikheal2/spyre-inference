@@ -226,7 +226,43 @@ def probe_compiled_all_gather_lastdim_unaligned(device, device_group, world_size
         )
 
 
+def probe_all_reduce_hidden5120_decode(device, device_group, world_size, rank):
+    """Ministral's 1-token TP row-parallel decode. Expected to fail.
+
+    5120 fp16 elements is 80 sticks: above the 32-core width without dividing it,
+    so spyre-comms cannot build a work schedule and `dxp_standalone` exits 1.
+    """
+    gn = _group_name(device_group)
+    t = torch.full((1, 5120), float(rank + 1), dtype=torch.float16, device=device)
+    out = torch.ops._c10d_functional.all_reduce(t, "sum", gn)
+    out = torch.ops._c10d_functional.wait_tensor(out)
+    expected = float(sum(range(1, world_size + 1)))
+    torch.testing.assert_close(out.cpu(), torch.full((1, 5120), expected, dtype=torch.float16))
+
+
+def probe_all_reduce_hidden5120_row_padded(device, device_group, world_size, rank):
+    """The same reduction through the `SpyreCommunicator.all_reduce` row padding."""
+    from spyre_inference.distributed.spyre_communicator import collective_row_pad
+    from spyre_inference.v1.pool import select_rows
+
+    gn = _group_name(device_group)
+    t = torch.full((1, 5120), float(rank + 1), dtype=torch.float16, device=device)
+    pad_rows = collective_row_pad(t)
+    assert pad_rows == 1, pad_rows
+
+    padded = torch.nn.functional.pad(t, (0, 0, 0, pad_rows))
+    out = torch.ops._c10d_functional.all_reduce(padded, "sum", gn)
+    out = torch.ops._c10d_functional.wait_tensor(out)
+    out = select_rows(out, torch.arange(1))
+
+    expected = float(sum(range(1, world_size + 1)))
+    assert tuple(out.shape) == (1, 5120), out.shape
+    torch.testing.assert_close(out.cpu(), torch.full((1, 5120), expected, dtype=torch.float16))
+
+
 PROBES = {
+    "all_reduce_hidden5120_decode": probe_all_reduce_hidden5120_decode,
+    "all_reduce_hidden5120_row_padded": probe_all_reduce_hidden5120_row_padded,
     "native_all_reduce": probe_native_all_reduce,
     "native_all_gather_into_tensor": probe_native_all_gather_into_tensor,
     "native_all_gather_list": probe_native_all_gather_list,
