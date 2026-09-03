@@ -15,69 +15,20 @@
 """Spyre OOT replacement for RMSNorm.
 
 Spyre constraints:
-    - fp16->fp32 ops are not registered as Spyre kernels (torch_spyre/ops/eager.py),
-      so the promotion runs on CPU behind an opaque op and copies back. That round
-      trip is only paid by architectures that need it -- see ``_NEEDS_FP32_VARIANCE``.
+    - No dtype promotion to float32 (not yet supported in torch-spyre)
 
 References:
     - Upstream RMSNorm: vllm/model_executor/layers/layernorm.py
 """
 
-from functools import lru_cache
-
 import torch
-from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.transformers.fusers.rms_norm import TPAwareRMSNorm
-from vllm.utils.torch_utils import direct_register_custom_op
 
 from .lazy_compile import CompileOutermost, compile_when_outermost
-from .utils import convert
 
 logger = init_logger(__name__)
-
-# Ministral-3-14B's hidden size (5120) puts activations above the |x| ~ 256 point
-# where fp16 x**2 overflows; smaller hidden sizes (e.g. 4096) haven't shown this in
-# practice. Promoting to fp32 costs a CPU round trip per norm, so only architectures
-# that actually need it pay for it.
-_NEEDS_FP32_VARIANCE = frozenset({"Mistral3ForConditionalGeneration"})
-
-
-def _rms_norm_fp32_op(x: torch.Tensor, eps: float) -> torch.Tensor:
-    """Opaque-op body: the fp32 CPU core of RMSNorm (variance + rsqrt normalize).
-
-    torch-spyre registers no fp16->fp32 ops, so the promotion runs on CPU; as one
-    opaque node its ``mean`` never reaches Inductor's cpp backend, which cannot
-    codegen it. Single-output on purpose: a multi-output op lowers to a
-    ``MultiOutput`` buffer that torch-spyre's restickify pass asserts on.
-    """
-    xf = convert(x, device="cpu", dtype=torch.float32)
-    variance = xf.pow(2).mean(dim=-1, keepdim=True)
-    return convert(xf * torch.rsqrt(variance + eps), device=x.device, dtype=x.dtype)
-
-
-def _rms_norm_fp32_fake(x: torch.Tensor, eps: float) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-def _promotes_fp32(architectures: list[str]) -> bool:
-    return any(a in _NEEDS_FP32_VARIANCE for a in architectures)
-
-
-@lru_cache(maxsize=1)
-def register():
-    """Register ``torch.ops.vllm.spyre_rms_norm_fp32`` once.
-
-    CompositeExplicitAutograd so it dispatches on Spyre tensors while the body runs
-    on CPU (mirrors ``spyre_convert``)."""
-    direct_register_custom_op(
-        op_name="spyre_rms_norm_fp32",
-        op_func=_rms_norm_fp32_op,
-        fake_impl=_rms_norm_fp32_fake,
-        dispatch_key="CompositeExplicitAutograd",
-    )
-    logger.debug_once("Registered custom op: spyre_rms_norm_fp32")
 
 
 @RMSNorm.register_oot(name="RMSNorm")
@@ -87,24 +38,10 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        model_config = get_current_vllm_config().model_config
-        hf_config = getattr(model_config, "hf_config", None)
-        architectures = tuple(getattr(hf_config, "architectures", None) or ())
-        self.spyre_promote_fp32 = _promotes_fp32(architectures)
-        # TODO(remove before merge): confirms the gate picks the right path per model.
-        # lru_cache-backed _once loggers need hashable args -- `architectures` must
-        # stay a tuple, not the list hf_config gives back, or this silently raises
-        # TypeError instead of printing.
-        if self.spyre_promote_fp32:
-            logger.warning_once(
-                "SpyreRMSNorm: variance in fp32 (CPU round-trip); architectures=%s",
-                architectures,
-            )
-        else:
-            logger.warning_once(
-                "SpyreRMSNorm: variance in fp16 (on-card, no promotion); architectures=%s",
-                architectures,
-            )
+        logger.warning_once(
+            "SpyreRMSNorm: no dtype promotion is performed, "
+            "expect numerical differences to upstream vLLM."
+        )
 
     @compile_when_outermost
     def forward_oot(
@@ -117,21 +54,20 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
         if self.variance_size_override is not None:
             raise NotImplementedError("TODO: variance_size_override not yet implemented")
 
-        # Residual add stays on-device in fp16: upstream rounds the sum back to
-        # orig_dtype anyway, so the extra precision would reach only the variance.
         if residual is not None:
             x = x + residual
             residual = x
 
-        if self.spyre_promote_fp32:
-            x = torch.ops.vllm.spyre_rms_norm_fp32(x, self.variance_epsilon)
-        else:
-            variance = x.pow(2).mean(dim=-1, keepdim=True)
-            x = x * torch.rsqrt(variance + self.variance_epsilon)
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+
         if self.has_weight:
             x = x * self.weight
-
-        return x if residual is None else (x, residual)
+        if residual is None:
+            return x
+        else:
+            return x, residual
 
 
 # The norm fuser instantiates TPAwareRMSNorm and OOT dispatch keys on the concrete class
