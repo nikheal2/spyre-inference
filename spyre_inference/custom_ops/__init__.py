@@ -39,5 +39,6 @@ logger = init_logger(__name__)
 def register_all():
     logger.info("Registering custom ops for spyre_inference")
     register_spyre_fp8_linear_kernel()
+    rms_norm.register()
     utils.register()
     vocab_parallel_embedding.register()
