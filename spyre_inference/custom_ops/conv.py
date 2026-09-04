@@ -114,9 +114,8 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
 
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
-        # `_forward_conv`, not `forward_native`: a patch embed sets `enable_linear`
-        # (kernel == stride, no padding, groups == 1), so `forward_native` would pick
-        # the unfold/reshape `_forward_mulmat` this class exists to avoid.
+        # `_forward_conv`, not `forward_native`: a patch embed sets `enable_linear`, so
+        # `forward_native` picks the unfold/reshape path this class exists to avoid.
         if x.device.type != "spyre":
             # The tiled layouts move a tensor onto the card; applying them to a
             # CPU input is the opposite of what the caller asked for.

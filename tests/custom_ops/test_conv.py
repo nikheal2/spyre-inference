@@ -117,9 +117,8 @@ def test_unsupported_shape_falls_back_to_forward_native():
 
 @pytest.mark.conv
 def test_unsupported_patch_shape_falls_back_to_conv_not_mulmat():
-    """A patch embed sets `enable_linear`, so `forward_native` would route the fallback
-    into `_forward_mulmat` — the unfold/reshape this class exists to avoid. Both paths
-    are numerically equal, so this pins the route by making the wrong one raise."""
+    """`forward_native` would route a patch-embed fallback into `_forward_mulmat`. Both
+    paths are numerically equal, so this pins the route by making the wrong one raise."""
     from spyre_inference.custom_ops.conv import SpyreConv2d, _layouts_supported
 
     # kernel == stride and no padding -> enable_linear; out_channels 100 is not a

@@ -31,8 +31,7 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     compile, which wraps modules in `OptimizedModule` and breaks traversal.
     """
     # Both spellings: mistral-format Pixtral names the tower `vision_encoder`, HF-format
-    # Mistral3 names it `vision_tower`. Without this the patches below would rewrite
-    # vLLM's shared `pixtral` module on every text-only load too.
+    # Mistral3 `vision_tower`. Ungated, the patches rewrite vLLM's shared module.
     if not any(hasattr(model, attr) for attr in ("vision_encoder", "vision_tower")):
         return
 

@@ -450,9 +450,8 @@ class _SpyreModelWrapper:
                 "embed_input_ids got multimodal_embeddings without is_multimodal; the "
                 "CPU merge below needs the mask."
             )
-        # The text lookup goes straight to the model, skipping upstream's
-        # `masked_fill(is_multimodal, 0)`, so an out-of-vocab placeholder id would index
-        # the embedding table out of range.
+        # The text lookup skips upstream's `masked_fill(is_multimodal, 0)`, so an
+        # out-of-vocab placeholder id would index the embedding table out of range.
         if is_multimodal is not None and getattr(self._model, "_has_oov_mm_tokens", False):
             raise NotImplementedError(
                 "SpyreModelWrapper.embed_input_ids does not support models with "
@@ -587,9 +586,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Run Llama-4 attention temperature scaling on CPU via an opaque op, and move
         it before rope (see ``_make_forward``). Patches instances, so it must run after
         load and before ``torch.compile``."""
-        # Gated on the modules, not on an architecture allowlist: the class name needs
-        # no import, and a name gate silently skips the model it is for --
-        # `"mistral" not in "Ministral3ForCausalLM".lower()`.
+        # Gated on the modules, not an architecture allowlist: an allowlist silently
+        # skips the model it is for -- `"mistral" not in "Ministral3ForCausalLM"`.
         modules = list(self.model.modules())
         if not any(type(m).__name__ == "MistralAttention" for m in modules):
             return
