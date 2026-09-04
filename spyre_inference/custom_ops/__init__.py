@@ -41,4 +41,3 @@ def register_all():
     register_spyre_fp8_linear_kernel()
     rms_norm.register()
     utils.register()
-    vocab_parallel_embedding.register()
