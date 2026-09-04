@@ -22,6 +22,7 @@ References:
     - Upstream RMSNorm: vllm/model_executor/layers/layernorm.py
 """
 
+import os
 from functools import lru_cache
 
 import torch
@@ -34,6 +35,12 @@ from .lazy_compile import CompileOutermost, compile_when_outermost
 from .utils import convert
 
 logger = init_logger(__name__)
+
+# TEMPORARY, for the fp32-vs-fp16 attribution experiment. The commits that removed
+# `collective_row_pad` and restored fp32 promotion landed back to back, so the
+# "padding removed + fp16 variance" combination was never observed. Set
+# SPYRE_RMS_NORM_FP16=1 to test it. Delete this switch once attribution is settled.
+_FP16_VARIANCE = os.getenv("SPYRE_RMS_NORM_FP16", "0") == "1"
 
 
 def _rms_norm_fp32_op(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -75,7 +82,13 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        logger.info_once("SpyreRMSNorm: fp32 promotion runs on CPU via spyre_rms_norm_fp32.")
+        if _FP16_VARIANCE:
+            logger.warning_once(
+                "SpyreRMSNorm: EXPERIMENT -- variance in fp16 on device "
+                "(SPYRE_RMS_NORM_FP16=1). Not for production."
+            )
+        else:
+            logger.info_once("SpyreRMSNorm: fp32 promotion runs on CPU via spyre_rms_norm_fp32.")
 
     @compile_when_outermost
     def forward_oot(
@@ -95,10 +108,14 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
             residual = x
 
         # fp32 for the variance, matching upstream: x**2 overflows fp16 above |x| ~ 256.
-        x = torch.ops.vllm.spyre_rms_norm_fp32(
-            x,  # ty: ignore[invalid-argument-type]
-            self.variance_epsilon,  # ty: ignore[invalid-argument-type]
-        )
+        if _FP16_VARIANCE:
+            variance = x.pow(2).mean(dim=-1, keepdim=True)
+            x = x * torch.rsqrt(variance + self.variance_epsilon)
+        else:
+            x = torch.ops.vllm.spyre_rms_norm_fp32(
+                x,  # ty: ignore[invalid-argument-type]
+                self.variance_epsilon,  # ty: ignore[invalid-argument-type]
+            )
         if self.has_weight:
             x = x * self.weight
 
