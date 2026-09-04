@@ -317,6 +317,40 @@ def disable_norm_compile(model: torch.nn.Module) -> None:
         logger.info("Spyre: %d vision-tower norm(s) run eager (not compiled).", n)
 
 
+def patch_block_attention_mask() -> None:
+    """Build Pixtral's block-diagonal vision mask on CPU.
+
+    `generate_block_attention_mask` allocates on `patch_embeds.device` and zeroes one
+    `[start:end, start:end]` sub-block per image. One image is a single full-range
+    write, but N images are N strided sub-block writes, which are not stick-safe on
+    Spyre. `_padded_attn_mask` pulls the mask to CPU anyway, so building it there
+    removes the hazard and a pointless D2H at once.
+    """
+    try:
+        from transformers.models.pixtral import modeling_pixtral
+    except ImportError:
+        return
+
+    orig = getattr(modeling_pixtral, "generate_block_attention_mask", None)
+    if orig is None or getattr(orig, "_spyre_patched", False):
+        return
+
+    def _cpu_mask(patch_embeds_list, tensor):
+        if tensor.device.type != "spyre":
+            return orig(patch_embeds_list, tensor)
+        # Only `dtype` and the two leading dims are read off `tensor`, so a CPU
+        # stand-in of the same shape yields an identical mask without a D2H of
+        # patch_embeds itself.
+        stand_in = torch.empty((tensor.shape[0], tensor.shape[1]), dtype=tensor.dtype)
+        return orig(patch_embeds_list, stand_in)
+
+    _cpu_mask._spyre_patched = True
+    # vLLM imports this symbol inside the function body, so patching the module
+    # attribute is picked up at call time.
+    modeling_pixtral.generate_block_attention_mask = _cpu_mask  # ty: ignore[invalid-assignment]
+    logger.info("Spyre: Pixtral block attention mask built on CPU (N-image sub-block writes).")
+
+
 def patch_patch_merger() -> None:
     """Run Pixtral `PatchMerger.permute` (spatial s×s regroup) on CPU.
 
@@ -354,6 +388,7 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     # Must precede the attention patch, which resolves apply_rotary_emb_vit by name.
     patch_vision_rope_vit()
     patch_vision_attention()
+    patch_block_attention_mask()
     offload_projector_norm(model, device)
     patch_patch_merger()
     disable_norm_compile(model)

@@ -279,8 +279,11 @@ def probe_all_reduce_vision_rank3(device, device_group, world_size, rank):
 def probe_all_reduce_hidden5120_decode(device, device_group, world_size, rank):
     """Ministral's 1-token TP row-parallel decode. Expected to fail.
 
-    5120 fp16 elements is 80 sticks: above the 32-core width without dividing it,
-    so spyre-comms cannot build a work schedule and `dxp_standalone` exits 1.
+    Eager, spyre-comms cannot build a work schedule for this shape and
+    `dxp_standalone` exits 1; compiled, the same shape lowers to
+    `spyre::all_reduce_async` and works. The mechanism is not stick alignment --
+    [1, 5120] is 80 sticks (80 % 32 == 16) and compiles, while 322560 elements
+    (5040 sticks, also % 32 == 16) does not. Which sizes build is still unexplained.
     """
     gn = _group_name(device_group)
     t = torch.full((1, 5120), float(rank + 1), dtype=torch.float16, device=device)
@@ -288,8 +291,6 @@ def probe_all_reduce_hidden5120_decode(device, device_group, world_size, rank):
     out = torch.ops._c10d_functional.wait_tensor(out)
     expected = float(sum(range(1, world_size + 1)))
     torch.testing.assert_close(out.cpu(), torch.full((1, 5120), expected, dtype=torch.float16))
-
-
 
 
 def probe_compiled_all_reduce_padded(device, device_group, world_size, rank):
