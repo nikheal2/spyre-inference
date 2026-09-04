@@ -359,11 +359,13 @@ class _SpyreModelWrapper:
         model: nn.Module,
         spyre_device: torch.device,
         keep_outputs_on_device: bool = False,
+        shape_bucketer: SpyreShapeBucketer | None = None,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
+        object.__setattr__(self, "_shape_bucketer", shape_bucketer)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64
@@ -433,8 +435,26 @@ class _SpyreModelWrapper:
         images are present the merge is done on CPU, because upstream scatters image
         rows with a dim-0 boolean mask that Spyre cannot do.
         """
+        # Bucket the token count to the same sizes the body uses. Unlike the body,
+        # this runs in `_preprocess` on the raw scheduled count, so at TP>1 the
+        # vocab-parallel all_reduce would be `num_tokens * hidden` for every distinct
+        # prompt length: a fresh Deeptools collective schedule per length, some of
+        # which fail to build (`allreduce_plan(220160, ...)` -> dxp_standalone exit 1).
+        # Padding happens on CPU before the compiled kernel and the trim after it --
+        # padding *inside* a compiled collective corrupts output, see
+        # test_compiled_all_reduce_padded_is_exact.
+        num_tokens = input_ids.shape[0]
+        bucketer = self._shape_bucketer
+        padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
+        if padded_tokens is not None and padded_tokens != num_tokens:
+            input_ids = torch.nn.functional.pad(input_ids, (0, padded_tokens - num_tokens))
+        else:
+            padded_tokens = None
+
         input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
         inputs_embeds = self._model.embed_input_ids(input_ids)
+        if padded_tokens is not None:
+            inputs_embeds = select_rows(inputs_embeds, torch.arange(num_tokens))
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return inputs_embeds
@@ -667,15 +687,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
 
+        # Initialize bucket dispatcher for shape bucketing at runtime.
+        self.spyre_shape_bucketer = self._create_shape_bucketer()
+
         # Generative: D2H model outputs. Pooling: keep hidden_states on Spyre.
         self.model = _SpyreModelWrapper(
             self.model,
             self._spyre_device,
             keep_outputs_on_device=self._pooling_on_spyre,
+            shape_bucketer=self.spyre_shape_bucketer,
         )
-
-        # Initialize bucket dispatcher for shape bucketing at runtime.
-        self.spyre_shape_bucketer = self._create_shape_bucketer()
 
     @staticmethod
     def _model_has_spyre_fp8(model: nn.Module) -> bool:
