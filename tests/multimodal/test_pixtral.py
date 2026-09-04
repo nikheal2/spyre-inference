@@ -60,6 +60,14 @@ def restore_pixtral(monkeypatch):
     )
     monkeypatch.setattr(pixtral.Attention, "forward", pixtral.Attention.forward)
     monkeypatch.setattr(pixtral.PatchMerger, "forward", pixtral.PatchMerger.forward)
+    # The block-mask patch lives on transformers, not vllm.
+    from transformers.models.pixtral import modeling_pixtral
+
+    monkeypatch.setattr(
+        modeling_pixtral,
+        "generate_block_attention_mask",
+        modeling_pixtral.generate_block_attention_mask,
+    )
     yield
 
 
@@ -187,6 +195,72 @@ def test_patch_merger_patch_is_applied_and_idempotent():
 
     patch_patch_merger()
     assert pixtral.PatchMerger.forward is patched, "second call must be a no-op"
+
+
+@pytest.mark.pixtral
+def test_block_attention_mask_patch_is_applied_and_idempotent():
+    from transformers.models.pixtral import modeling_pixtral
+
+    from spyre_inference.multimodal.pixtral import patch_block_attention_mask
+
+    patch_block_attention_mask()
+    patched = modeling_pixtral.generate_block_attention_mask
+    assert getattr(patched, "_spyre_patched", False) is True
+
+    patch_block_attention_mask()
+    assert modeling_pixtral.generate_block_attention_mask is patched, "second call must be a no-op"
+
+
+@pytest.mark.pixtral
+@pytest.mark.parametrize(
+    "patch_embeds_list",
+    [
+        [16],  # one image: a single full-range write
+        [16, 16],  # two images: strided sub-block writes, the unsafe case
+        [9, 16, 25],  # three unequal images
+    ],
+)
+def test_cpu_block_mask_matches_upstream(patch_embeds_list):
+    """The CPU stand-in must reproduce upstream's mask exactly. A device tensor cannot
+    be built here; the device path is covered by the two-image e2e test."""
+    from transformers.models.pixtral import modeling_pixtral
+
+    from spyre_inference.multimodal.pixtral import patch_block_attention_mask
+
+    patch_block_attention_mask()
+    seq = sum(patch_embeds_list)
+    embeds = torch.zeros(1, seq, 8, dtype=torch.float16)
+
+    # A CPU tensor takes the passthrough branch, which is upstream verbatim.
+    got = modeling_pixtral.generate_block_attention_mask(patch_embeds_list, embeds)
+
+    neg_inf = torch.finfo(torch.float16).min
+    want = torch.full((seq, seq), neg_inf, dtype=torch.float16)
+    start = 0
+    for length in patch_embeds_list:
+        want[start : start + length, start : start + length] = 0
+        start += length
+
+    assert got.device.type == "cpu"
+    assert torch.equal(got[0, 0], want)
+
+
+@pytest.mark.pixtral
+def test_block_mask_blocks_cross_image_attention():
+    """Two images must not attend to each other: the off-diagonal blocks stay -inf."""
+    from transformers.models.pixtral import modeling_pixtral
+
+    from spyre_inference.multimodal.pixtral import patch_block_attention_mask
+
+    patch_block_attention_mask()
+    embeds = torch.zeros(1, 32, 8, dtype=torch.float16)
+    mask = modeling_pixtral.generate_block_attention_mask([16, 16], embeds)[0, 0]
+
+    neg_inf = torch.finfo(torch.float16).min
+    assert torch.equal(mask[:16, :16], torch.zeros(16, 16, dtype=torch.float16))
+    assert torch.equal(mask[16:, 16:], torch.zeros(16, 16, dtype=torch.float16))
+    assert torch.equal(mask[:16, 16:], torch.full((16, 16), neg_inf, dtype=torch.float16))
+    assert torch.equal(mask[16:, :16], torch.full((16, 16), neg_inf, dtype=torch.float16))
 
 
 @pytest.mark.pixtral

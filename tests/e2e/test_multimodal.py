@@ -33,7 +33,7 @@ MAX_MODEL_LEN = 4096
 MAX_TOKENS = 16
 
 
-def _synthetic_image_data_uri() -> str:
+def _synthetic_image_data_uri(size: int = 176, seed: int = 0) -> str:
     """A deterministic image built in-process — no network, no binary asset.
 
     Content does not matter; size does. 176x176 gives an 11x11 = 121 patch grid,
@@ -43,30 +43,34 @@ def _synthetic_image_data_uri() -> str:
 
     from PIL import Image
 
-    image = Image.new("RGB", (176, 176))
+    image = Image.new("RGB", (size, size))
     pixels = image.load()
-    for y in range(176):
-        for x in range(176):
-            pixels[x, y] = ((x * 7) % 256, (y * 5) % 256, ((x + y) * 3) % 256)
+    for y in range(size):
+        for x in range(size):
+            pixels[x, y] = (
+                (x * 7 + seed) % 256,
+                (y * 5 + seed) % 256,
+                ((x + y) * 3 + seed) % 256,
+            )
 
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-def _conversation(uri: str):
+def _conversation(*uris: str):
     return [
         {
             "role": "user",
             "content": [
-                {"type": "image_url", "image_url": {"url": uri}},
+                *({"type": "image_url", "image_url": {"url": u}} for u in uris),
                 {"type": "text", "text": "Describe this image in one short sentence."},
             ],
         }
     ]
 
 
-def _generate(conversations, enforce_eager: bool):
+def _generate(conversations, enforce_eager: bool, images_per_prompt: int = 1):
     from vllm import LLM, SamplingParams
 
     llm = LLM(
@@ -75,7 +79,7 @@ def _generate(conversations, enforce_eager: bool):
         max_num_seqs=len(conversations),
         dtype="float16",
         enforce_eager=enforce_eager,
-        limit_mm_per_prompt={"image": 1},
+        limit_mm_per_prompt={"image": images_per_prompt},
     )
     outputs = llm.chat(
         conversations,
@@ -98,6 +102,20 @@ def test_single_image_prompt_produces_output():
     (text,) = _generate([_conversation(uri)], enforce_eager=True)
 
     assert text.strip(), "empty generation from the multimodal path"
+
+
+@pytest.mark.multimodal
+@pytest.mark.uses_subprocess
+def test_two_image_prompt_produces_output():
+    """Two images make the vision mask non-trivial: a pair of strided sub-block writes
+    rather than one full-range write, which is what `patch_block_attention_mask` is for."""
+    if spyre_device_count() == 0:
+        pytest.skip("Spyre device not available")
+
+    uris = (_synthetic_image_data_uri(seed=0), _synthetic_image_data_uri(seed=97))
+    (text,) = _generate([_conversation(*uris)], enforce_eager=True, images_per_prompt=2)
+
+    assert text.strip(), "empty generation from the two-image multimodal path"
 
 
 if __name__ == "__main__":
