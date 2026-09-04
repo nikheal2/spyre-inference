@@ -115,6 +115,28 @@ def test_unsupported_shape_falls_back_to_forward_native():
     torch.testing.assert_close(layer.forward_oot(x), layer.forward_native(x))
 
 
+@pytest.mark.conv
+def test_unsupported_patch_shape_falls_back_to_conv_not_mulmat():
+    """A patch embed sets `enable_linear`, so `forward_native` would route the fallback
+    into `_forward_mulmat` — the unfold/reshape this class exists to avoid. Both paths
+    are numerically equal, so this pins the route by making the wrong one raise."""
+    from spyre_inference.custom_ops.conv import SpyreConv2d, _layouts_supported
+
+    # kernel == stride and no padding -> enable_linear; out_channels 100 is not a
+    # multiple of 64, so the tiled layouts do not apply and it must fall back.
+    layer = _layer(in_ch=3, out_ch=100, kernel=16, stride=16)
+    assert isinstance(layer, SpyreConv2d)
+    assert layer.enable_linear is True
+    x = torch.randn(1, 3, 32, 32, dtype=torch.float16)
+    assert _layouts_supported(x, layer.weight) is False
+
+    def _boom(_x):
+        raise AssertionError("fallback must not use the im2col/GEMM path")
+
+    layer._forward_mulmat = _boom
+    torch.testing.assert_close(layer.forward_oot(x), layer._forward_conv(x))
+
+
 # ---------------------------------------------------------------------------
 # Layout derivation (needs torch-spyre, not necessarily a card)
 # ---------------------------------------------------------------------------

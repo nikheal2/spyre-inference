@@ -114,21 +114,22 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
 
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
+        # `_forward_conv`, not `forward_native`: a patch embed sets `enable_linear`
+        # (kernel == stride, no padding, groups == 1), so `forward_native` would pick
+        # the unfold/reshape `_forward_mulmat` this class exists to avoid.
         if x.device.type != "spyre":
             # The tiled layouts move a tensor onto the card; applying them to a
             # CPU input is the opposite of what the caller asked for.
-            return self.forward_native(x)
+            return self._forward_conv(x)
         if not _layouts_supported(x, self.weight):
-            # Not patch-embed-shaped, so the tiled layouts do not apply. Stock
-            # im2col is correct here; it only fails for coprime patch grids.
             logger.warning_once(
                 "Spyre conv2d: shape %s (weight %s) outside the tiled-layout "
                 "assumptions (batch 1, in_channels <= 64, out_channels %% 64 == 0); "
-                "falling back to vLLM's stock Conv2dLayer path.",
+                "falling back to F.conv2d without them.",
                 tuple(x.shape),
                 tuple(self.weight.shape),
             )
-            return self.forward_native(x)
+            return self._forward_conv(x)
         logger.info_once("Spyre conv2d: on-card F.conv2d with tiled layouts")
         # Via CPU: CPU->spyre is the tested entry path, and a device-side
         # restickify would hit the same unsupported layout.

@@ -145,6 +145,21 @@ def test_scale_cache_misses_on_new_positions():
     assert not torch.equal(second, first)
 
 
+def test_scale_cache_misses_on_a_buffer_mutated_in_place():
+    """`positions` is freshly allocated per step today, so identity alone would do. The
+    endpoints are in the key so a persistent buffer written in place still misses."""
+    from spyre_inference.v1.worker.spyre_model_runner import _llama4_attn_scale_op
+
+    buffer = torch.arange(4, dtype=torch.int64) * 4096
+    first = _llama4_attn_scale_op(buffer, BETA, ORIG_MAX).clone()
+
+    # Same storage, same shape, new values: a data_ptr-only key would hit.
+    buffer.copy_(torch.arange(4, dtype=torch.int64) * 4096 + ORIG_MAX * 8)
+    second = _llama4_attn_scale_op(buffer, BETA, ORIG_MAX)
+
+    assert not torch.equal(second, first)
+
+
 # ---------------------------------------------------------------------------
 # The per-instance patch
 # ---------------------------------------------------------------------------

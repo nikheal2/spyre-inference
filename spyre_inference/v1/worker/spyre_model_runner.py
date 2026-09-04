@@ -117,9 +117,14 @@ def _llama4_attn_scale_op(
 
     from vllm.model_executor.models.mistral import MistralAttention
 
+    # Endpoints are in the key, not just the identity: `positions` is freshly allocated
+    # each step today, but a persistent buffer mutated in place would otherwise hit.
+    pos_cpu = positions.to("cpu")
     key = (
         positions.data_ptr(),
         tuple(positions.shape),
+        int(pos_cpu[0]),
+        int(pos_cpu[-1]),
         beta,
         original_max_position_embeddings,
         str(positions.device),
@@ -133,10 +138,11 @@ def _llama4_attn_scale_op(
     )
     scaling = MistralAttention._get_llama_4_attn_scale(
         stub,  # ty: ignore[invalid-argument-type]
-        positions.to("cpu"),
+        pos_cpu,
     )
     scaling = convert(scaling, device=positions.device, dtype=torch.float16)
-    # Hold `positions` so its storage cannot be freed and its address reused.
+    # Hold `positions` so its storage cannot be freed and its address reused: the
+    # endpoints in the key do not pin down a batch whose interior differs.
     _llama4_scale_cache = (key, positions, scaling)
     return scaling
 
@@ -438,6 +444,21 @@ class _SpyreModelWrapper:
         images are present the merge is done on CPU, because upstream scatters image
         rows with a dim-0 boolean mask that Spyre cannot do.
         """
+        has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
+        if has_mm and is_multimodal is None:
+            raise ValueError(
+                "embed_input_ids got multimodal_embeddings without is_multimodal; the "
+                "CPU merge below needs the mask."
+            )
+        # The text lookup goes straight to the model, skipping upstream's
+        # `masked_fill(is_multimodal, 0)`, so an out-of-vocab placeholder id would index
+        # the embedding table out of range.
+        if is_multimodal is not None and getattr(self._model, "_has_oov_mm_tokens", False):
+            raise NotImplementedError(
+                "SpyreModelWrapper.embed_input_ids does not support models with "
+                "out-of-vocab multimodal tokens; mask them before the text embedding."
+            )
+
         # Bucket the token count: this runs on the raw scheduled count, so at TP>1 the
         # vocab-parallel all_reduce is `num_tokens * hidden` for every distinct prompt
         # length, and some of those collective schedules fail to build. Pad on CPU and
@@ -455,7 +476,7 @@ class _SpyreModelWrapper:
         if padded_tokens is not None:
             inputs_embeds = select_rows(inputs_embeds, torch.arange(num_tokens))
 
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+        if not has_mm:
             return inputs_embeds
 
         from vllm.model_executor.models.utils import _merge_multimodal_embeddings
@@ -566,7 +587,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Run Llama-4 attention temperature scaling on CPU via an opaque op, and move
         it before rope (see ``_make_forward``). Patches instances, so it must run after
         load and before ``torch.compile``."""
-        from vllm.model_executor.models.mistral import MistralAttention
+        # Gated on the modules, not on an architecture allowlist: the class name needs
+        # no import, and a name gate silently skips the model it is for --
+        # `"mistral" not in "Ministral3ForCausalLM".lower()`.
+        modules = list(self.model.modules())
+        if not any(type(m).__name__ == "MistralAttention" for m in modules):
+            return
+
+        try:
+            from vllm.model_executor.models.mistral import MistralAttention
+        except ImportError:
+            logger.warning_once(
+                "Model has MistralAttention modules but "
+                "vllm.model_executor.models.mistral cannot be imported; the Spyre "
+                "llama-4 attention-scale patch is skipped and a model that needs the "
+                "scaling will run without it."
+            )
+            return
 
         _register_llama4_attn_scale_op()
 
@@ -583,7 +620,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
             return _get_llama_4_attn_scale
 
-        mistral_attns = [m for m in self.model.modules() if isinstance(m, MistralAttention)]
+        mistral_attns = [m for m in modules if isinstance(m, MistralAttention)]
 
         # A non-scaled model still carries the attribute (False), so a missing one
         # means upstream renamed it and the gate below would skip every layer.
