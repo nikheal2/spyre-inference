@@ -382,28 +382,47 @@ def probe_compiled_all_reduce_padded(device, device_group, world_size, rank):
         out = torch.ops._c10d_functional.all_reduce(x, "sum", gn)
         return torch.ops._c10d_functional.wait_tensor(out)
 
-    for name, body, rows in (("padded[1,5120]", padded_block, 1), ("plain[2,5120]", plain_block, 2)):
+    # Every config runs even after one fails: whether the *unpadded* collective is
+    # also corrupt under compile decides if padding is the cause or just a symptom.
+    configs = (
+        ("plain[2,5120]", plain_block, 2),
+        ("padded[1,5120]", padded_block, 1),
+        ("plain[1,5120]", plain_block, 1),
+    )
+    failures = []
+    for name, body, rows in configs:
         fns = [torch.compile(body, dynamic=False) for _ in range(32)]
         kept = []
-        for i, fn in enumerate(fns):
-            t = ((base + float(i)) * float(rank + 1)).reshape(1, 5120)
-            t = t.expand(rows, 5120).contiguous().to(device)
-            kept.append(fn(t))
+        try:
+            for i, fn in enumerate(fns):
+                t = ((base + float(i)) * float(rank + 1)).reshape(1, 5120)
+                t = t.expand(rows, 5120).contiguous().to(device)
+                kept.append(fn(t))
+        except Exception as exc:  # noqa: BLE001 -- an unbuildable config is a result
+            print(f"[rank {rank}] {name} compiled: RAISED {type(exc).__name__}: {exc}")
+            failures.append(name)
+            continue
 
         bad = []
         for i, got in enumerate(kept):
-            want = ((base + float(i)) * scale).reshape(1, 5120).expand(rows, 5120)
-            if not torch.equal(got.cpu(), want.contiguous()):
+            want = ((base + float(i)) * scale).reshape(1, 5120).expand(rows, 5120).contiguous()
+            if not torch.equal(got.cpu(), want):
                 bad.append(i)
         if bad:
             got = kept[bad[0]].cpu()
             want = ((base + float(bad[0])) * scale).reshape(1, 5120).expand(rows, 5120).contiguous()
             idx = (got != want).nonzero()[0]
-            raise AssertionError(
-                f"{name}: {len(bad)} of 32 compiled blocks corrupted (first={bad[0]}); "
-                f"element {idx.tolist()} got {got[tuple(idx)]} want {want[tuple(idx)]}"
+            print(
+                f"[rank {rank}] {name} compiled: {len(bad)}/32 blocks corrupted "
+                f"(first={bad[0]}), element {idx.tolist()} got {got[tuple(idx)]} "
+                f"want {want[tuple(idx)]}"
             )
-        print(f"[rank {rank}] {name} compiled: 32 blocks exact")
+            failures.append(name)
+        else:
+            print(f"[rank {rank}] {name} compiled: 32 blocks exact")
+
+    if failures:
+        raise AssertionError(f"corrupted under compile: {failures}")
 
 
 PROBES = {
