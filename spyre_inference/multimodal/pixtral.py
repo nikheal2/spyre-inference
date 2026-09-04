@@ -259,8 +259,7 @@ def patch_vision_rope_vit() -> None:
 
 
 def offload_projector_norm(model: torch.nn.Module, device: torch.device) -> None:
-    """Run Pixtral's `pre_mm_projector_norm` (RMSNorm) on CPU: not for the mean, which
-    already runs there via `spyre_rms_norm_fp32`, but for the `x * weight` that follows
+    """Run Pixtral's `pre_mm_projector_norm` on CPU: 
     ("Unsupported coordinate expression 195*c0/64 + c1/1024")."""
     for module_name, module in model.named_modules():
         if module_name.rsplit(".", 1)[-1] != "pre_mm_projector_norm":
