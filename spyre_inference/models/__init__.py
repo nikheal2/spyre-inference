@@ -40,6 +40,8 @@ _ADAPTED_ARCHS: dict[str, str] = {
     # Gemma4ForConditionalGeneration needs no entry of its own: it builds its
     # language model through the registry, so it picks this one up.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
+    "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
+    "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
     "TransformersForCausalLM": (
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"
