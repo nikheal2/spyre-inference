@@ -145,6 +145,9 @@ def run_multimodal(args):
     llm = LLM(
         model=args.model,
         tokenizer=args.model,
+        # Explicit, not `auto`: auto's mistral probe is a live Hub call, so passing a
+        # repo id on an offline host loads the unpatched HF tower instead.
+        config_format="mistral",
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tp,

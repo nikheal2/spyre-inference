@@ -89,6 +89,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
     allocate_staging_buffers,
+    mark_warmup_complete,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 from spyre_inference.v1.pool import (
@@ -314,7 +315,10 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
 
     def __call__(self, *args, **kwargs):
-        # Convert integer tensor inputs to Spyre int64
+        # Convert integer tensor inputs to Spyre int64. Do not use int32:
+        # stock torch-spyre SDSC cannot schedule integer add (warmup crash
+        # ``0_add``). RoBERTa ``position_ids + padding_idx`` is applied on CPU
+        # in models/roberta.py.
         def _convert_int(t):
             if (
                 t is not None
@@ -724,10 +728,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     def _compile_blocks(self, fullgraph: bool = True) -> int:
         num_blocks = 0
+        # Models that re-register a slice of `layers` (e.g. gemma-4's self-/cross-decoder)
+        # alias blocks across lists; recompiling one is harmless but would double the count.
+        seen: set[int] = set()
         for blocks in _repeated_block_lists(cast(nn.Module, self.model)):
             for block in blocks:
-                if isinstance(block, PPMissingLayer):
+                if isinstance(block, PPMissingLayer) or id(block) in seen:
                     continue
+                seen.add(id(block))
                 # In place: rebinding blocks[i] to the returned OptimizedModule reparents
                 # the block under `_orig_mod`, renaming every parameter and breaking
                 # reload_weights and save_sharded_state.
@@ -853,6 +861,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             total,
             time.time() - t0,
         )
+        # Past the early returns: with recording off, first-use compiles are intended.
+        mark_warmup_complete()
 
     def _resolve_builder_attn_bucketer(self) -> SpyreAttnBucketer | None:
         """The attention bucketer the metadata builders dispatch against.

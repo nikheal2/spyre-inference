@@ -23,7 +23,10 @@ dependencies = [
     # in `override-dependencies` only constrains the version if something else
     # requests torchvision, it does not install it.
     # Version left out: resolved against the pinned torch from the pytorch-cpu index.
-    "torchvision",
+    # Excluded on Power/Z: the index has no modern wheel there, and unmarked this
+    # resolves to the 2018 py2.py3 torchvision 0.2.0, which installs but cannot
+    # satisfy the transformers import. VLM is x86_64-only for now.
+    "torchvision; platform_machine not in 's390x, ppc64le'",
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
@@ -71,8 +74,10 @@ override-dependencies = [
 
     # Declared in [project.dependencies] too; this entry exists to neutralise any
     # version constraint a transitive dep (e.g. transformers) puts on torchvision,
-    # so it resolves against the pinned torch from the pytorch-cpu index.
-    "torchvision",
+    # so it resolves against the pinned torch from the pytorch-cpu index. Same
+    # arch marker as the direct dep, so a transitive requester cannot pull the
+    # stale 0.2.0 wheel back in on Power/Z.
+    "torchvision; platform_machine not in 's390x, ppc64le'",
 
     # (transformers imports it at module level via loss_rnnt.py)
     "torchaudio; sys_platform == 'never'",
@@ -119,7 +124,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.28.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "5e715ea70c4aa9e76e45b7fbae6b92a6d7658764" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "76978116cb44020b50c8df1a1822d5178629922a" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
