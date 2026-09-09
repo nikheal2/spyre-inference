@@ -50,8 +50,6 @@ def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor |
     `weight_t` is the physically-transposed weight of shape `[in, out]`, so the
     matmul is a plain `x @ A` (the Spyre-fast layout), not `F.linear`'s `x @ Aᵀ`.
 
-    Batched (3-D) input goes straight through: torch-spyre#4155 used to compute
-    3-D @ 2-D wrongly under torch.compile, which needed a fold to 2-D here.
     """
     out = torch.matmul(x, weight_t)
     if bias is not None:

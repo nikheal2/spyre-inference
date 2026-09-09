@@ -331,8 +331,7 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     except ImportError:
         return
 
-    # True whenever xformers imports on a non-CUDA platform, and then the vision mask is
-    # a BlockDiagonalMask rather than the tensor `_padded_attn_mask` slices.
+    # True whenever xformers merely imports: upstream only disables it on CUDA B200.
     if getattr(pixtral, "USE_XFORMERS_OPS", False):
         raise RuntimeError(
             "xformers is installed; Pixtral on Spyre needs the non-xformers mask path. "
