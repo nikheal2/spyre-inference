@@ -59,7 +59,7 @@ overrides = [
     { name = "torch", marker = "platform_machine != 'ppc64le'", specifier = "==2.13.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine == 'ppc64le'", git = "https://github.com/pytorch/pytorch?tag=v2.13.0" },
     { name = "torchaudio", marker = "sys_platform == 'never'" },
-    { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torchvision", marker = "platform_machine not in 's390x, ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "triton", marker = "sys_platform == 'never'" },
 ]
 
@@ -4688,9 +4688,9 @@ dependencies = [
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and sys_platform != 'darwin'" },
     { name = "torch-spyre", extra = ["cpsat"] },
-    { name = "torchvision", version = "0.2.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'ppc64le' and sys_platform == 'linux') or (platform_machine == 's390x' and sys_platform == 'linux')" },
-    { name = "torchvision", version = "0.29.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and sys_platform == 'darwin'" },
-    { name = "torchvision", version = "0.29.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and platform_machine != 's390x' and sys_platform == 'linux') or (platform_machine == 'ppc64le' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
+    { name = "torchvision", version = "0.2.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'ppc64le' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 's390x' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux')" },
+    { name = "torchvision", version = "0.29.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "torchvision", version = "0.29.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and platform_machine != 's390x' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'ppc64le' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'linux')" },
     { name = "vllm" },
 ]
 
@@ -4705,7 +4705,7 @@ requires-dist = [
     { name = "torch", marker = "platform_machine != 'ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine == 'ppc64le'", git = "https://github.com/pytorch/pytorch?tag=v2.13.0" },
     { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=76978116cb44020b50c8df1a1822d5178629922a" },
-    { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torchvision", marker = "platform_machine not in 's390x, ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.28.0" },
 ]
 
