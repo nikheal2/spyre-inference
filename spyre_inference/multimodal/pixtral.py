@@ -124,12 +124,6 @@ def padded_sdpa(
         q = F.pad(q, pad)
         k = F.pad(k, pad)
         v = F.pad(v, pad)
-    else:
-        # Offset operands read as offset 0 (torch-spyre#3770), so SDPA is silently
-        # wrong here; the padded branch escapes it only because F.pad materializes.
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
 
     out = F.scaled_dot_product_attention(
         q,
@@ -337,7 +331,8 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     except ImportError:
         return
 
-    # True whenever xformers merely imports: upstream only disables it on CUDA B200.
+    # True whenever xformers imports on a non-CUDA platform, and then the vision mask is
+    # a BlockDiagonalMask rather than the tensor `_padded_attn_mask` slices.
     if getattr(pixtral, "USE_XFORMERS_OPS", False):
         raise RuntimeError(
             "xformers is installed; Pixtral on Spyre needs the non-xformers mask path. "
