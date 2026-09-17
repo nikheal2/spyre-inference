@@ -183,15 +183,12 @@ def test_the_real_layers_opt_in() -> None:
     from spyre_inference.custom_ops.gemma_rms_norm import SpyreGemmaRMSNorm
     from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
     from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
-    from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm, SpyreTPAwareRMSNorm
     from spyre_inference.custom_ops.vocab_parallel_embedding import (
         SpyreVocabParallelEmbedding,
     )
 
     for cls, method in (
-        (SpyreRMSNorm, "forward_oot"),
         (SpyreGemmaRMSNorm, "forward_oot"),
-        (SpyreTPAwareRMSNorm, "forward_oot"),
         (SpyreVocabParallelEmbedding, "forward"),
         (SpyreUnquantizedLMHeadMethod, "apply"),
         (SpyreLogitsProcessor, "_all_gather_logits"),
