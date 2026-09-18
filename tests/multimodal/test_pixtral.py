@@ -296,11 +296,11 @@ class _FreqsStub:
     """Stands in for a `VisionTransformer`: the patched `freqs_cis` property reads
     only `args`, `max_patches_per_side`, `_freqs_cis` and `device`."""
 
-    def __init__(self):
+    def __init__(self, device: str = "cpu"):
         self.args = _vision_args()
         self.max_patches_per_side = MAX_PATCHES_PER_SIDE
         self._freqs_cis = None
-        self.device = torch.device("cpu")
+        self.device = torch.device(device)
 
 
 def _positions(num_patches: int) -> torch.Tensor:
@@ -335,12 +335,13 @@ def test_real_rope_matches_upstream_complex_rope(num_patches):
     complex_gathered = complex_table[positions[:, 0], positions[:, 1]]
     expected_q, expected_k = original_apply(xq, xk, complex_gathered)
 
-    # Spyre rewrite: real table, flat index_select gather, pair-swap matmul.
+    # Spyre rewrite: real table, host-side gather, pair-swap matmul.
     patch_vision_rope_vit()
     table = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())
     real_gathered = table[(positions[:, 0], positions[:, 1])]
-    assert real_gathered.shape == (num_patches, 2, HEAD_DIM)
-    assert not real_gathered.is_complex(), "the table must be real — Spyre has no complex dtype"
+    for factor in real_gathered:
+        assert factor.shape == (1, num_patches, 1, HEAD_DIM)
+        assert not factor.is_complex(), "the table must be real — Spyre has no complex dtype"
 
     actual_q, actual_k = pixtral.apply_rotary_emb_vit(xq, xk, real_gathered)
 
@@ -350,9 +351,8 @@ def test_real_rope_matches_upstream_complex_rope(num_patches):
 
 @pytest.mark.pixtral
 def test_flat_index_gather_matches_2d_index():
-    """The `_OnCardFreqsTable` wrapper folds `(row, col)` into `row*W + col` and
-    uses `index_select` (Spyre has no `aten::index`). That flattening must agree
-    with a plain 2-D advanced index."""
+    """The freqs-table wrapper folds `(row, col)` into `row*W + col` and splits the
+    packed table into cos/sin. Both must agree with a plain 2-D advanced index."""
     from spyre_inference.multimodal.pixtral import patch_vision_rope_vit
 
     patch_vision_rope_vit()
@@ -362,9 +362,34 @@ def test_flat_index_gather_matches_2d_index():
     flat = stub._freqs_cis.reshape(MAX_PATCHES_PER_SIDE, MAX_PATCHES_PER_SIDE, 2, HEAD_DIM)
 
     positions = _positions(23)
-    gathered = table[(positions[:, 0], positions[:, 1])]
+    cos, sin = table[(positions[:, 0], positions[:, 1])]
+    expected = flat[positions[:, 0], positions[:, 1]]  # (23, 2, head_dim)
 
-    torch.testing.assert_close(gathered, flat[positions[:, 0], positions[:, 1]])
+    torch.testing.assert_close(cos, expected[:, 0, :][None, :, None, :])
+    torch.testing.assert_close(sin, expected[:, 1, :][None, :, None, :])
+
+
+@pytest.mark.pixtral
+def test_gathered_rope_factors_are_contiguous_and_table_stays_on_host():
+    """Both factors must be contiguous, offset-0 buffers, and the packed table must
+    never be moved to the device.
+
+    A strided or offset operand is re-materialized by torch-spyre's eager dispatch on
+    every one of its 48 uses (q and k, 24 layers), which is the copy this gather exists
+    to avoid."""
+    from spyre_inference.multimodal.pixtral import patch_vision_rope_vit
+
+    patch_vision_rope_vit()
+
+    stub = _FreqsStub()
+    table = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(stub)
+    positions = _positions(67)
+    factors = table[(positions[:, 0], positions[:, 1])]
+
+    for factor in factors:
+        assert factor.is_contiguous()
+        assert factor.storage_offset() == 0
+    assert stub._freqs_cis.device.type == "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +590,28 @@ def test_rope_rotate_matmul_matches_cpu_on_spyre(num_patches):
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.rotary
+def test_rope_factors_land_on_the_card_unchanged():
+    """The host-side gather must upload the same values it computes, with nothing
+    left on CPU for a later op to trip over."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    from spyre_inference.multimodal.pixtral import patch_vision_rope_vit
+
+    patch_vision_rope_vit()
+
+    positions = _positions(CORRUPTING_PATCHES)
+    idx = (positions[:, 0], positions[:, 1])
+    prop = pixtral.VisionTransformer.__dict__["freqs_cis"]
+    expected = prop.fget(_FreqsStub())[idx]
+    actual = prop.fget(_FreqsStub("spyre"))[idx]
+
+    for got, want in zip(actual, expected):
+        assert got.device.type == "spyre"
+        torch.testing.assert_close(got.cpu(), want)
+
+
 @pytest.mark.pixtral
 @pytest.mark.parametrize("num_patches", [64, CORRUPTING_PATCHES])
 def test_padded_vision_attention_matches_cpu_on_spyre(tp_group, num_patches):
@@ -595,19 +642,21 @@ def test_padded_vision_attention_matches_cpu_on_spyre(tp_group, num_patches):
     patch_vision_attention()
 
     positions = _positions(num_patches)
-    table = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())
-    freqs_cis = table[(positions[:, 0], positions[:, 1])]
+    # The gather targets the tower's device, so build the factors once per side.
+    table_cpu = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())
+    table_dev = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub("spyre"))
+    idx = (positions[:, 0], positions[:, 1])
 
     torch.manual_seed(37)
     x = torch.randn(1, num_patches, HIDDEN_SIZE, dtype=torch.float16)
     # Kept on CPU: the padded mask is assembled host-side and Spyre has no bool.
     mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
 
-    expected = pixtral.Attention.forward(layer, x, mask, freqs_cis)
+    expected = pixtral.Attention.forward(layer, x, mask, table_cpu[idx])
 
     device = torch.device("spyre")
     layer = layer.to(device)
-    actual = pixtral.Attention.forward(layer, x.to(device), mask, freqs_cis.to(device))
+    actual = pixtral.Attention.forward(layer, x.to(device), mask, table_dev[idx])
 
     assert actual.shape == expected.shape == (1, num_patches, HIDDEN_SIZE)
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
