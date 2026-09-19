@@ -124,6 +124,46 @@ def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
     return tuple(result)
 
 
+def _default_kv_buckets(max_model_len: int, block_size: int) -> list[int]:
+    """Powers of two from ``block_size``, plus the 1.5x midpoint from 8 blocks up.
+
+    Every kernel pays for its bucket, not the real length: the batched decode
+    kernel runs one chunk per ``blocks_per_chunk`` padded blocks, so a pure doubling
+    ladder can make a context just past a power of two cost nearly twice what it
+    needs. Midpoints cap that at 1.5x where it matters -- the short buckets stay
+    geometric, since padding them costs little and each bucket is a recorded variant.
+    """
+    pow2 = _powers_of_two_up_to(max_model_len, start=block_size)
+    mids = {3 * b // 2 for b in pow2 if b >= 8 * block_size and 3 * b // 2 < max_model_len}
+    return sorted({*pow2, *mids})
+
+
+def _default_num_seqs_buckets(max_num_seqs: int) -> list[int]:
+    """Batch sizes where the batched decode kernel's ``blocks_per_chunk`` steps up.
+
+    Its cost is one chunk per ``blocks_per_chunk`` blocks, and ``blocks_per_chunk``
+    is ``_SPYRE_CORE_COUNT // num_seqs``: padding 10 sequences to 16 halves it
+    against a bucket of 10. Walking down from ``max_num_seqs``, a bucket is added
+    wherever it buys at least 1.5x more blocks per chunk than the one above, and
+    ``_MIN_BATCHED_SEQS`` always closes the ladder (its chunk is the widest). Past
+    the core count every chunk is one block wide and its cost grows with the batch,
+    so the ladder is plain powers of two there.
+    """
+    buckets = [max_num_seqs]
+    if max_num_seqs > _SPYRE_CORE_COUNT:
+        buckets += _powers_of_two_up_to(max_num_seqs, start=_SPYRE_CORE_COUNT)
+    per_chunk = max(1, _SPYRE_CORE_COUNT // max_num_seqs)
+    while True:
+        num_seqs = _SPYRE_CORE_COUNT // -(-3 * per_chunk // 2)
+        if num_seqs < _MIN_BATCHED_SEQS:
+            break
+        buckets.append(num_seqs)
+        per_chunk = _SPYRE_CORE_COUNT // num_seqs
+    if max_num_seqs >= _MIN_BATCHED_SEQS:
+        buckets.append(_MIN_BATCHED_SEQS)
+    return sorted(set(buckets))
+
+
 def _resolve_buckets(
     raw: str | None, limit: int, name: str, default: Callable[[], list[int]]
 ) -> list[int]:
@@ -184,15 +224,14 @@ class SpyreAttnBucketer:
                 block_size,
             )
 
-        # Default: powers of two from _MIN_BATCHED_SEQS up to max_num_seqs, the
-        # batch sizes the batched decode kernel can be asked for.
+        # Default: see _default_num_seqs_buckets.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self._num_seqs_buckets: list[int] = (
             _resolve_buckets(
                 envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
                 max_num_seqs,
                 "SPYRE_ATTN_NUM_SEQS_BUCKETS",
-                lambda: list(_powers_of_two_up_to(max_num_seqs, start=_MIN_BATCHED_SEQS)),
+                lambda: _default_num_seqs_buckets(max_num_seqs),
             )
             if max_num_seqs >= _MIN_BATCHED_SEQS
             else []
@@ -209,14 +248,14 @@ class SpyreAttnBucketer:
             lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
         )
 
-        # Default: powers of two from block_size up to max_model_len. Geometric
-        # because the recorded set is a product of both axes; the extra padding
-        # each bucket costs is absorbed by the mask.
+        # Default: near-geometric (see _default_kv_buckets) because the recorded
+        # set is a product of both axes; the extra padding each bucket costs is
+        # absorbed by the mask.
         self._kv_buckets: list[int] = _resolve_buckets(
             envs.SPYRE_ATTN_KV_BUCKETS,
             max_model_len,
             "SPYRE_ATTN_KV_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_model_len, start=block_size)),
+            lambda: _default_kv_buckets(max_model_len, block_size),
         )
 
         # num_blocks is what the kernel specializes on. Derived from the kv

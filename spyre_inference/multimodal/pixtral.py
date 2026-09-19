@@ -26,8 +26,10 @@ from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
+from vllm.config import CompilationMode, get_cached_compilation_config
 from vllm.logger import init_logger
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
@@ -147,6 +149,13 @@ def padded_sdpa(
     return out
 
 
+@torch.compiler.disable
+def _bucketed_sdpa(q, k, v, bias, scale):
+    # Outside the block graph: traced with the rope/reshape producers of q/k/v, the
+    # SDPA decomposition's named-dim seeding fails ("reshape split a named dim").
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=bias, scale=scale)
+
+
 def patch_vision_attention() -> None:
     """Replace Pixtral's vision `Attention.forward` with the padded on-card SDPA.
 
@@ -177,7 +186,15 @@ def patch_vision_attention() -> None:
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        out = padded_sdpa(q, k, v, mask)
+        if isinstance(mask, KeyPaddingBias):
+            # The tower already padded L to a stick-aligned bucket (`patch_vision_tower`).
+            # Materialized inside the block graph, so the eager SDPA gets fresh
+            # offset-0 buffers instead of paying three device copies of its own.
+            out = _bucketed_sdpa(
+                q.contiguous(), k.contiguous(), v.contiguous(), mask.bias, self.head_dim**-0.5
+            )
+        else:
+            out = padded_sdpa(q, k, v, mask)
         out = out.transpose(1, 2).reshape(batch, patches, self.n_heads * self.head_dim)
         out, _ = self.o_proj(out)
         return out
@@ -195,6 +212,20 @@ class RopeCosSin(NamedTuple):
 
     cos: torch.Tensor
     sin: torch.Tensor
+
+
+class TowerRope(NamedTuple):
+    """`RopeCosSin` plus the pair-swap matrix, as the patched tower hands it to blocks."""
+
+    cos: torch.Tensor
+    sin: torch.Tensor
+    perm: torch.Tensor
+
+
+class KeyPaddingBias(NamedTuple):
+    """Additive `[1, 1, 1, L_b]` bias masking the tower's padded keys."""
+
+    bias: torch.Tensor
 
 
 def patch_vision_rope_vit() -> None:
@@ -231,11 +262,20 @@ def patch_vision_rope_vit() -> None:
             self._device = device
 
         def __getitem__(self, idx) -> RopeCosSin:
-            # Upstream indexes with `positions[:, 0], positions[:, 1]`; fold them into
-            # one flat index and gather on the host, where advanced indexing exists.
+            # Upstream indexes with `positions[:, 0], positions[:, 1]`.
             row, col = idx
+            return self.factors(row, col)
+
+        def factors(self, row, col, padded_len: int | None = None) -> RopeCosSin:
+            # Fold (row, col) into one flat index and gather on the host, where
+            # advanced indexing exists.
             flat = (row.to("cpu") * self._width + col.to("cpu")).to(torch.int64)
             gathered = self._table[flat]  # (seq, 2, head_dim)
+            if padded_len is not None and padded_len > gathered.shape[0]:
+                # Identity rotation (cos=1, sin=0) on the tower's pad rows.
+                pad = torch.zeros(padded_len - gathered.shape[0], *gathered.shape[1:])
+                pad[:, 0, :] = 1.0
+                gathered = torch.cat([gathered, pad.to(gathered.dtype)])
             # Contiguous before the upload: every layer broadcasts these over heads,
             # and a strided or offset operand is copied again on the device.
             cos = gathered[:, 0, :][None, :, None, :].contiguous()
@@ -266,13 +306,17 @@ def patch_vision_rope_vit() -> None:
 
     def _apply_rotary_emb_vit(xq, xk, freqs_cis):
         # xq, xk: [batch, patches, n_heads, head_dim].
-        if not isinstance(freqs_cis, RopeCosSin):
+        if not isinstance(freqs_cis, (RopeCosSin, TowerRope)):
             raise TypeError(
                 "Spyre vision rope expects the RopeCosSin pair produced by the patched "
                 f"VisionTransformer.freqs_cis, got {type(freqs_cis).__name__}"
             )
-        p = rope_perm_matrix("pair", xq.shape[-1], xq.device)
-        cos, sin = freqs_cis
+        if isinstance(freqs_cis, TowerRope):
+            # Hoisted out of the compiled block: the cached constant is not traceable.
+            cos, sin, p = freqs_cis
+        else:
+            p = rope_perm_matrix("pair", xq.shape[-1], xq.device)
+            cos, sin = freqs_cis
 
         return (
             rope_rotate_matmul(xq, cos, sin, p).type_as(xq),
@@ -347,15 +391,141 @@ def patch_patch_merger() -> None:
     )
 
 
+def vision_seq_buckets() -> list[int]:
+    """Stick-aligned sequence buckets the tower pads each image to.
+
+    Every bucket is one compiled graph per block shape, so they are coarse:
+    multiples of 256 up to 2048, then of 1024 (the largest image, 110² patches,
+    lands in 12288). `SPYRE_VISION_SEQ_BUCKETS` overrides them.
+    """
+    override = envs.SPYRE_VISION_SEQ_BUCKETS
+    if override:
+        buckets = sorted({_align_up(int(b)) for b in override.split(",") if b.strip()})
+    else:
+        buckets = list(range(256, 2048 + 1, 256)) + list(range(3072, 12288 + 1, 1024))
+    return buckets
+
+
+def vision_seq_bucket(seq: int) -> int:
+    for bucket in vision_seq_buckets():
+        if bucket >= seq:
+            return bucket
+    return _align_up(seq)
+
+
+@cache
+def _key_padding_bias(seq: int, seq_pad: int, device: torch.device) -> torch.Tensor:
+    bias = torch.zeros(1, 1, 1, seq_pad, dtype=torch.float16)
+    bias[..., seq:] = torch.finfo(torch.float16).min
+    return convert(bias, device=device)
+
+
+def _patch_weight(tower) -> torch.Tensor:
+    """Patch-conv weight as a `[C·k·k padded to 64, D]` GEMM operand, built once."""
+    w = getattr(tower, "_spyre_patch_w", None)
+    if w is None or w.device != tower.patch_conv.weight.device:
+        conv_w = tower.patch_conv.weight.detach().to("cpu")
+        w = conv_w.flatten(1)
+        w = F.pad(w, (0, _align_up(w.shape[1]) - w.shape[1])).t().contiguous()
+        w = convert(w, device=tower.patch_conv.weight.device, dtype=tower.dtype)
+        tower._spyre_patch_w = w
+    return w
+
+
+def _patch_embed(tower, img: torch.Tensor, hp: int, wp: int, seq_pad: int) -> torch.Tensor:
+    """The stride == kernel patch conv as host patchify + one on-card GEMM.
+
+    The on-card conv lowers a 14-wide kernel through a CPU `unfold` fallback and a
+    per-call weight round trip. Rows come out in the conv's `flatten(2).permute`
+    order, already zero-padded to the tower's bucket (a zero row stays zero through
+    the GEMM and `ln_pre`), so the image is uploaded once and nothing is padded
+    on the card.
+    """
+    ps = tower.args.patch_size
+    w = _patch_weight(tower)
+    c = img.shape[0]
+    patches = (
+        img.to("cpu")[:, : hp * ps, : wp * ps]
+        .reshape(c, hp, ps, wp, ps)
+        .permute(1, 3, 0, 2, 4)
+        .reshape(hp * wp, c * ps * ps)
+    )
+    x = torch.zeros(1, seq_pad, w.shape[0], dtype=tower.dtype)
+    x[0, : hp * wp, : patches.shape[1]] = patches
+    return torch.matmul(convert(x, device=w.device), w)
+
+
+def patch_vision_tower() -> None:
+    """Run the Pixtral `VisionTransformer` one image at a time at a bucketed length.
+
+    Upstream concatenates every image into one sequence behind an O(L²) block mask
+    and leaves each op to see the raw, per-image patch count. Here each image is
+    padded once, after `ln_pre`, to a stick-aligned bucket and cropped once at the
+    end: pad rows get identity rope and are masked as keys by a `[1, 1, 1, L_b]` bias,
+    and norm/linear/MLP are row-independent, so they cannot reach real tokens. Every
+    block then sees one static shape per bucket, which is what lets
+    `compile_vision_blocks` turn ~30 eager launches per block into one graph.
+    """
+    try:
+        from vllm.model_executor.models import pixtral
+    except ImportError:
+        return
+
+    vt_cls = getattr(pixtral, "VisionTransformer", None)
+    if vt_cls is None or getattr(vt_cls.forward, "_spyre_patched", False):
+        return
+
+    def _forward(self, images):
+        outs = []
+        for img in images:
+            ps = self.args.patch_size
+            hp, wp = img.shape[-2] // ps, img.shape[-1] // ps
+            seq = hp * wp
+            seq_pad = vision_seq_bucket(seq)
+            x = self.ln_pre(_patch_embed(self, img, hp, wp, seq_pad))
+            rows = torch.arange(hp).repeat_interleave(wp)
+            cols = torch.arange(wp).repeat(hp)
+            cos, sin = self.freqs_cis.factors(rows, cols, seq_pad)
+            rope = TowerRope(cos, sin, rope_perm_matrix("pair", cos.shape[-1], x.device))
+            mask = KeyPaddingBias(_key_padding_bias(seq, seq_pad, x.device))
+            x = self.transformer(x, mask=mask, freqs_cis=rope)
+            # Offset-0 prefix: safe to leave as a view.
+            outs.append(x[0, :seq])
+        return tuple(outs)
+
+    _forward._spyre_patched = True
+    vt_cls.forward = _forward  # ty: ignore[invalid-assignment]
+    # `_SpyreModelWrapper.embed_multimodal` leaves the pixels on the host for this.
+    vt_cls._spyre_host_images = True  # ty: ignore[unresolved-attribute]
+    logger.info(
+        "Spyre: patched Pixtral VisionTransformer to run per image at a bucketed, "
+        "stick-aligned length (buckets %s).",
+        vision_seq_buckets(),
+    )
+
+
+def compile_vision_blocks(model: torch.nn.Module) -> int:
+    """Compile each vision `TransformerBlock` in place as one static graph."""
+    from vllm.model_executor.models import pixtral
+
+    tower = getattr(model, "vision_encoder", None)
+    if not isinstance(tower, pixtral.VisionTransformer):
+        return 0
+    num = 0
+    for block in tower.transformer.layers:
+        # In place, like `_compile_blocks`: rebinding would rename the parameters.
+        # fullgraph=False: SDPA is deliberately left between the two graphs.
+        block.compile(backend="inductor", fullgraph=False, dynamic=False)
+        num += 1
+    return num
+
+
 def apply(model: torch.nn.Module, device: torch.device) -> None:
     """Install every Pixtral vision-tower workaround, in dependency order.
 
     The patch-embedding conv is absent on purpose: `SpyreConv2d` in
-    `custom_ops/conv.py` handles it through OOT dispatch.
-
-    `model` and `device` are unused: every remaining patch rewrites upstream module
-    attributes rather than a loaded instance. They stay for the `apply(model, device)`
-    contract the sibling architecture modules share.
+    `custom_ops/conv.py` handles it through OOT dispatch. The patches rewrite
+    upstream module attributes; `model` is only touched to compile the tower's blocks.
     """
     try:
         from vllm.model_executor.models import pixtral
@@ -372,5 +542,12 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     # Must precede the attention patch, which resolves apply_rotary_emb_vit by name.
     patch_vision_rope_vit()
     patch_vision_attention()
+    patch_vision_tower()
     patch_block_attention_mask()
     patch_patch_merger()
+
+    compile_mode = get_cached_compilation_config().mode
+    if envs.SPYRE_VISION_COMPILE and compile_mode is not CompilationMode.NONE:
+        num = compile_vision_blocks(model)
+        if num:
+            logger.info("Wrapped %d Pixtral vision blocks for per-block compile.", num)

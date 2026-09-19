@@ -99,19 +99,21 @@ lists. Each is clamped to its limit: entries above `--max-model-len` (KV) or
 every schedulable length keeps a bucket.
 
 ```bash
-export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: powers of two from block_size
+export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: powers of two from block_size, 1.5x midpoints from 8 blocks
 export SPYRE_ATTN_QUERY_BUCKETS=1,512         # 1 = decode; 512 = prefill chunk
 ```
 
-The default KV buckets are geometric (powers of two) precisely because the recorded set
+The default KV buckets are near-geometric (powers of two, with a 1.5x midpoint from 8
+blocks up so a long context pads by at most 1.5x) precisely because the recorded set
 is a product. If your context never exceeds 2048, dropping the higher powers removes
 variants from warmup at no serving cost.
 
 With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; the
 head-major layout has no batched kernel and ignores it), warmup also records it over the
 KV-length × num-sequences grid. `SPYRE_ATTN_NUM_SEQS_BUCKETS`
-(default: powers of two from 4 to `--max-num-seqs`) is the extra lever there, and the same
-keep-it-short advice applies.
+(default: `4, 6, 10, 16, 32`, where the kernel's blocks-per-chunk grows 1.5x, then powers
+of two up to `--max-num-seqs`) is the extra lever there, and the same keep-it-short advice
+applies.
 
 ## pyproject.toml Reference
 

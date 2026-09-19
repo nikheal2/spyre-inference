@@ -60,6 +60,8 @@ def restore_pixtral(monkeypatch):
     )
     monkeypatch.setattr(pixtral.Attention, "forward", pixtral.Attention.forward)
     monkeypatch.setattr(pixtral.PatchMerger, "forward", pixtral.PatchMerger.forward)
+    monkeypatch.setattr(pixtral.VisionTransformer, "forward", pixtral.VisionTransformer.forward)
+    monkeypatch.setattr(pixtral.VisionTransformer, "_spyre_host_images", False, raising=False)
     # The block-mask patch lives on transformers, not vllm.
     from transformers.models.pixtral import modeling_pixtral
 
@@ -285,6 +287,95 @@ def test_apply_rejects_an_xformers_install(monkeypatch):
 
     with pytest.raises(RuntimeError, match="xformers"):
         spyre_pixtral.apply(torch.nn.Module(), torch.device("cpu"))
+
+
+# ---------------------------------------------------------------------------
+# 2b. Bucketed per-image tower
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.pixtral
+def test_vision_seq_buckets_are_stick_aligned_and_cover_the_largest_image():
+    from spyre_inference.multimodal.pixtral import vision_seq_bucket, vision_seq_buckets
+
+    buckets = vision_seq_buckets()
+    assert all(b % 64 == 0 for b in buckets)
+    assert buckets == sorted(buckets)
+    assert vision_seq_bucket(1) == buckets[0]
+    assert vision_seq_bucket(400) == 512
+    assert vision_seq_bucket(110 * 110) == 12288
+
+
+@pytest.mark.pixtral
+def test_vision_seq_bucket_override(monkeypatch):
+    from spyre_inference import envs
+    from spyre_inference.multimodal.pixtral import vision_seq_bucket
+
+    monkeypatch.setenv("SPYRE_VISION_SEQ_BUCKETS", "100,448")
+    monkeypatch.delitem(envs._cache, "SPYRE_VISION_SEQ_BUCKETS", raising=False)
+    try:
+        assert vision_seq_bucket(90) == 128  # rounded up to the stick
+        assert vision_seq_bucket(400) == 448
+        assert vision_seq_bucket(449) == 512  # past the last bucket: stick-aligned
+    finally:
+        envs._cache.pop("SPYRE_VISION_SEQ_BUCKETS", None)
+
+
+@pytest.mark.pixtral
+@pytest.mark.parametrize("grid", [(7, 6), (4, 8)])
+def test_host_patchify_gemm_matches_conv(tp_group, grid):
+    """Host patchify + GEMM must equal the stride == kernel conv followed by upstream's
+    `flatten(2).permute`, with the rows past the image zero."""
+    from spyre_inference.multimodal.pixtral import _patch_embed
+
+    tower = pixtral.VisionTransformer(_vision_args()).to(torch.float16)
+    torch.manual_seed(5)
+    tower.patch_conv.weight.data.normal_(std=0.02)
+    hp, wp = grid
+    ps = tower.args.patch_size
+    img = torch.randn(3, hp * ps, wp * ps)
+
+    want = tower.patch_conv(img.unsqueeze(0).to(torch.float16)).flatten(2).permute(0, 2, 1)
+    got = _patch_embed(tower, img, hp, wp, seq_pad=64)
+
+    assert got.shape == (1, 64, HIDDEN_SIZE)
+    torch.testing.assert_close(got[:, : hp * wp].float(), want.float(), atol=2e-2, rtol=2e-2)
+    assert torch.count_nonzero(got[:, hp * wp :]) == 0
+
+
+@pytest.mark.pixtral
+def test_bucketed_tower_matches_upstream(tp_group):
+    """Per-image towers padded to a bucket must equal upstream's block-masked tower on
+    every image's real tokens: pad rows are row-independent through norm/linear/MLP
+    and masked as keys in attention."""
+    from spyre_inference.multimodal import pixtral as spyre_pixtral
+
+    args = _vision_args()
+    tower = pixtral.VisionTransformer(args).to(torch.float16)
+    torch.manual_seed(7)
+    for name, param in tower.named_parameters():
+        if "norm" in name:
+            param.data.fill_(1.0)
+        else:
+            param.data.normal_(std=0.02)
+    _finish_weight_loading(tower)
+
+    torch.manual_seed(11)
+    ps = args.patch_size
+    images = [torch.randn(3, 7 * ps, 6 * ps), torch.randn(3, 4 * ps, 8 * ps)]
+
+    expected = tower([img.to(torch.float16) for img in images])
+    tower._freqs_cis = None  # upstream cached its complex table under the same name
+
+    spyre_pixtral.patch_vision_rope_vit()
+    spyre_pixtral.patch_vision_attention()
+    spyre_pixtral.patch_vision_tower()
+    actual = tower(images)
+
+    assert len(actual) == len(expected) == 2
+    for got, want in zip(actual, expected):
+        assert got.shape == want.shape
+        torch.testing.assert_close(got.float(), want.float(), atol=2e-2, rtol=2e-2)
 
 
 # ---------------------------------------------------------------------------

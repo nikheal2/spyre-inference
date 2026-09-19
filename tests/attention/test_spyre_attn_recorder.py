@@ -706,9 +706,14 @@ class TestRecordBatchedDecode:
 
     def test_real_decode_batch_lands_on_a_recorded_key(self, builder):
         """A batch the scheduler could hand over must realize a key warmup enumerated."""
+        from vllm.config import get_current_vllm_config
+
         from tests.attention.test_spyre_attn import _padded_mask_metadata
 
-        bucketer = builder._attn_bucketer = make_bucketer()
+        # _padded_mask_metadata builds its own builder from the current config, so the
+        # warmup keys must come from a bucketer on that config's batch limit.
+        max_num_seqs = get_current_vllm_config().scheduler_config.max_num_seqs
+        bucketer = builder._attn_bucketer = make_bucketer(max_num_seqs=max_num_seqs)
         keys = {
             (v.num_seqs, v.blocks_per_chunk, v.num_chunks)
             for v in bucketer.batched_decode_variants()

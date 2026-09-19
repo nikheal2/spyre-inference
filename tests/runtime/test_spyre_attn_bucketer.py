@@ -43,8 +43,15 @@ def make_config(
 
 
 def _list_pow2(limit: int, start: int = 1) -> list[int]:
-    """[start, 2*start, ..., limit], the buckets the kv axis defaults to."""
+    """[start, 2*start, ..., limit]."""
     return list(_powers_of_two_up_to(limit, start=start))
+
+
+def _default_kv(limit: int, block_size: int) -> list[int]:
+    """The kv axis default: powers of two plus the 1.5x midpoints from 8 blocks up."""
+    pow2 = _list_pow2(limit, start=block_size)
+    mids = [3 * b // 2 for b in pow2 if b >= 8 * block_size and 3 * b // 2 < limit]
+    return sorted({*pow2, *mids})
 
 
 @pytest.fixture()
@@ -61,9 +68,14 @@ def _clear_env_cache(monkeypatch):
 
 
 class TestBuckets:
-    def test_kv_buckets_are_powers_of_two_to_max_model_len(self, bucketer):
-        assert bucketer.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE)
-        assert bucketer.kv_buckets[-1] == 2048
+    def test_kv_buckets_are_near_geometric_to_max_model_len(self, bucketer):
+        """Doubling up to 8 blocks, then doubling with the 1.5x midpoint between."""
+        assert bucketer.kv_buckets == [64, 128, 256, 512, 768, 1024, 1536, 2048]
+        assert bucketer.kv_buckets == _default_kv(2048, BLOCK_SIZE)
+
+    def test_kv_buckets_never_pad_long_contexts_past_one_and_a_half(self, bucketer):
+        for kv_len in range(8 * BLOCK_SIZE + 1, 2049):
+            assert bucketer.find_kv_bucket(kv_len) <= 1.5 * kv_len
 
     def test_kv_buckets_start_at_block_size(self, bucketer):
         """Buckets below block_size all collapse to num_blocks == 1, so the
@@ -73,14 +85,14 @@ class TestBuckets:
     @pytest.mark.parametrize("block_size", [64, 128, 256])
     def test_kv_buckets_start_tracks_block_size(self, block_size):
         b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=block_size))
-        assert b.kv_buckets == _list_pow2(4096, start=block_size)
+        assert b.kv_buckets == _default_kv(4096, block_size)
 
     def test_kv_buckets_round_non_power_of_two_block_size_up(self):
         """The platform only forces block_size to a multiple of 64, so a
         non-power-of-two value is reachable; buckets stay a clean doubling
         sequence by starting at the next power of two."""
         b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=192))
-        assert b.kv_buckets == [256, 512, 1024, 2048, 4096]
+        assert b.kv_buckets == [256, 512, 1024, 2048, 3072, 4096]
 
     def test_query_buckets_lead_with_decode_case(self, bucketer):
         assert bucketer.query_buckets[0] == 1
@@ -96,7 +108,7 @@ class TestBuckets:
 
     def test_buckets_include_non_power_of_two_limit(self):
         b = SpyreAttnBucketer(make_config(max_model_len=3000, max_num_batched_tokens=100))
-        assert b.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE) + [3000]
+        assert b.kv_buckets == _default_kv(2048, BLOCK_SIZE) + [3000]
         assert b.query_buckets == [1, 100]
 
     def test_largest_bucket_is_always_the_limit(self):
@@ -207,9 +219,21 @@ class TestVariants:
 
     def test_num_seqs_buckets_ladder_from_min_batched_to_max_num_seqs(self):
         """Below _MIN_BATCHED_SEQS a batch takes the per-seq loop, so the ladder
-        starts there rather than at 1, and tops out at max_num_seqs."""
-        assert SpyreAttnBucketer(make_config(max_num_seqs=8)).num_seqs_buckets == [4, 8]
+        starts there, and tops out at max_num_seqs."""
+        assert SpyreAttnBucketer(make_config(max_num_seqs=8)).num_seqs_buckets == [4, 5, 8]
         assert SpyreAttnBucketer(make_config(max_num_seqs=6)).num_seqs_buckets == [4, 6]
+
+    def test_num_seqs_buckets_step_blocks_per_chunk_by_one_and_a_half(self):
+        """A bucket is only worth its recorded variants where it widens the chunk:
+        10 sequences take 3 blocks a chunk, padded to 16 they take 2."""
+        b = SpyreAttnBucketer(make_config(max_num_seqs=32))
+        assert b.num_seqs_buckets == [4, 6, 10, 16, 32]
+        per_chunk = [batched_decode_chunking(n, 64)[0] for n in b.num_seqs_buckets]
+        assert all(lo >= 1.5 * hi for lo, hi in zip(per_chunk, per_chunk[1:]))
+
+    def test_num_seqs_buckets_double_past_the_core_count(self):
+        b = SpyreAttnBucketer(make_config(max_num_seqs=128))
+        assert b.num_seqs_buckets == [4, 6, 10, 16, 32, 64, 128]
 
     @pytest.mark.parametrize("max_num_seqs", [1, 2, 3])
     def test_num_seqs_buckets_empty_below_min_batched(self, max_num_seqs, monkeypatch):

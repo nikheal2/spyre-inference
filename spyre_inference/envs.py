@@ -41,6 +41,9 @@ if TYPE_CHECKING:
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
+    SPYRE_VISION_COMPILE: bool = True
+    SPYRE_NUMA_BIND: bool = True
+    SPYRE_VISION_SEQ_BUCKETS: str | None = None
 
 _cache: dict[str, Any] = {}
 
@@ -63,13 +66,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compiling each variant lazily on first use.
     "SPYRE_ATTN_RECORD": lambda: bool(int(os.getenv("SPYRE_ATTN_RECORD", "1"))),
     # Comma-separated kv_len buckets to record, unset uses the default buckets of
-    # powers of two from block_size up to max_model_len.
+    # powers of two from block_size up to max_model_len, plus the 1.5x midpoint
+    # between each pair from 8 blocks up.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
     # Comma-separated query_len buckets to record, unset uses the default buckets
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
-    # default buckets of powers of two from 4 up to max_num_seqs.
+    # batch sizes where the kernel's blocks-per-chunk grows 1.5x (4, 6, 10, 16, 32),
+    # then powers of two up to max_num_seqs.
     "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),
     # Which KV cache layout the decoder attention backend uses, within a page:
     #  - "token_major": [num_blocks, block_size, num_kv_heads, head_size] (default)
@@ -99,6 +104,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.
     "SPYRE_UPDATE_THREAD_CONFIG": lambda: bool(int(os.getenv("SPYRE_UPDATE_THREAD_CONFIG", "1"))),
+    # When "1" (default), bind each worker's threads to the CPUs on its card's NUMA
+    # node. "0" leaves scheduling to the OS.
+    "SPYRE_NUMA_BIND": lambda: bool(int(os.getenv("SPYRE_NUMA_BIND", "1"))),
+    # When "1" (default), compile each Pixtral vision-tower block as one graph unless
+    # the model runs eager. "0" keeps the tower op-by-op.
+    "SPYRE_VISION_COMPILE": lambda: bool(int(os.getenv("SPYRE_VISION_COMPILE", "1"))),
+    # Comma-separated patch-count buckets the Pixtral vision tower pads each image
+    # to (rounded up to 64), unset uses multiples of 256 up to 2048, then of 1024.
+    "SPYRE_VISION_SEQ_BUCKETS": lambda: os.getenv("SPYRE_VISION_SEQ_BUCKETS"),
 }
 # --8<-- [end:env-vars-definition]
 

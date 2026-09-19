@@ -47,13 +47,49 @@ logger = init_logger(__name__)
 def _get_spyre_pcie_address(local_rank: int) -> str:
     requested_devices = envs.SPYRE_DEVICES
     if not requested_devices:
-        return "unknown"
+        # `torch.spyre.set_device(local_rank)` selects the card at that world rank.
+        return os.environ.get(f"AIU_WORLD_RANK_{local_rank}", "unknown")
 
     requested_indices = [index.strip() for index in requested_devices.split(",") if index.strip()]
     if local_rank >= len(requested_indices):
         return "unknown"
 
     return os.environ.get(f"AIU_WORLD_RANK_{requested_indices[local_rank]}", "unknown")
+
+
+def _parse_cpulist(cpulist: str) -> set[int]:
+    cpus: set[int] = set()
+    for part in cpulist.strip().split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        cpus.update(range(int(lo), int(hi or lo) + 1))
+    return cpus
+
+
+def _bind_to_card_numa_node(pcie_address: str) -> None:
+    """Restrict every thread of this process to the CPUs local to its card.
+
+    Each launch runs host-side job-plan prep and DMA to the card synchronously, so a
+    worker scheduled on the far socket pays a cross-socket hop on every kernel; on a
+    two-socket host that measured as a 2-3x slower tower when it happened.
+    """
+    try:
+        with open(f"/sys/bus/pci/devices/{pcie_address}/local_cpulist") as f:
+            local = _parse_cpulist(f.read())
+    except (OSError, ValueError):
+        logger.info("Spyre NUMA bind skipped: no local_cpulist for card %s", pcie_address)
+        return
+    cpus = local & os.sched_getaffinity(0)
+    if not cpus or cpus == os.sched_getaffinity(0):
+        return
+    # sched_setaffinity binds one thread; threads started before this keep their mask.
+    for tid in os.listdir("/proc/self/task"):
+        try:
+            os.sched_setaffinity(int(tid), cpus)
+        except OSError:
+            pass
+    logger.info("Spyre worker bound to the %d CPUs local to card %s", len(cpus), pcie_address)
 
 
 def monkey_patch_torch_profiler_activity_map():
@@ -103,6 +139,10 @@ class TorchSpyreWorker(Worker):
         os.environ.setdefault("WORLD_SIZE", str(world_size))
         os.environ.setdefault("LOCAL_RANK", str(self.local_rank))
         os.environ.setdefault("LOCAL_WORLD_SIZE", str(world_size))
+
+        # Before torch_spyre starts its runtime threads, so they inherit the mask.
+        if envs.SPYRE_NUMA_BIND:
+            _bind_to_card_numa_node(_get_spyre_pcie_address(self.local_rank))
 
         # Trigger torch_spyre's autoload manually now that the env vars
         # are set. Autoload registers the `spyre` device and the

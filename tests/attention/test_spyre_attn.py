@@ -2525,7 +2525,8 @@ def _num_blocks_buckets(block_size: int = 64) -> list[int]:
         pytest.param(65, 2, id="kv65_to_2"),
         pytest.param(300, 8, id="kv300_to_8"),
         pytest.param(256, 4, id="kv256_exact_noop"),
-        pytest.param(1025, 32, id="kv1025_to_32"),
+        pytest.param(1025, 24, id="kv1025_to_24_midpoint"),
+        pytest.param(1537, 32, id="kv1537_to_32"),
     ],
 )
 def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expected):

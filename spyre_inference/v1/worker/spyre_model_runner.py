@@ -286,6 +286,31 @@ def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
     return block_lists
 
 
+def _host_embed_table(model: nn.Module, vllm_config: VllmConfig) -> torch.Tensor | None:
+    """The CPU token-embedding table of a multimodal TP=1 model, taken before the move.
+
+    Only multimodal models embed through `embed_input_ids` on every step; text-only
+    models feed token ids to the compiled graph, so they have no use for it.
+    """
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+    from vllm.model_executor.models.interfaces import supports_multimodal
+
+    if not supports_multimodal(model) or vllm_config.parallel_config.tensor_parallel_size != 1:
+        return None
+    tables = [
+        m
+        for m in model.modules()
+        if isinstance(m, VocabParallelEmbedding) and not isinstance(m, ParallelLMHead)
+    ]
+    if len(tables) != 1 or tables[0].weight.device.type != "cpu":
+        return None
+    # No copy: the move to the card rebinds the parameter and leaves this storage to us.
+    return tables[0].weight.detach()
+
+
 class _SpyreModelWrapper:
     """Transparent wrapper that converts model inputs/outputs at the boundary.
 
@@ -312,9 +337,13 @@ class _SpyreModelWrapper:
         keep_outputs_on_device: bool = False,
         logits_row_buckets: list[int] | None = None,
         shape_bucketer: SpyreShapeBucketer | None = None,
+        host_embed_table: torch.Tensor | None = None,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
+        # CPU copy of the token-embedding table; validated against the card on first use.
+        object.__setattr__(self, "_host_embed_table", host_embed_table)
+        object.__setattr__(self, "_host_embed_verified", False)
         object.__setattr__(self, "_spyre_device", spyre_device)
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
@@ -342,6 +371,10 @@ class _SpyreModelWrapper:
         for key in kwargs:
             val = kwargs.get(key)
             kwargs_converted[key] = _convert_int(val)
+        # Host-staged embeddings (see `_host_embed_input_ids`): one whole-tensor upload.
+        inputs_embeds = kwargs_converted.get("inputs_embeds")
+        if isinstance(inputs_embeds, torch.Tensor) and inputs_embeds.device.type == "cpu":
+            kwargs_converted["inputs_embeds"] = convert(inputs_embeds, device=self._spyre_device)
 
         # The Llama-4 scale cache keys on `positions` identity, blind to an in-place rewrite.
         reset_llama4_scale_cache()
@@ -376,7 +409,10 @@ class _SpyreModelWrapper:
                 return convert(t, dtype=torch.float16, device=self._spyre_device)
             return t
 
-        kwargs = tree_map(_to_spyre_float, kwargs)
+        # The patched Pixtral tower patchifies on the host, so its pixels skip the trip.
+        tower = getattr(self._model, "vision_encoder", None)
+        if not getattr(tower, "_spyre_host_images", False):
+            kwargs = tree_map(_to_spyre_float, kwargs)
         out = self._model.embed_multimodal(**kwargs)
         return out
 
@@ -390,9 +426,10 @@ class _SpyreModelWrapper:
         """Text-token embedding + multimodal merge, Spyre-aware.
 
         Like ``embed_multimodal``, this is reached through ``__getattr__`` with
-        ``input_ids`` still on CPU. The text lookup runs on-card either way; when
-        images are present the merge is done on CPU, because upstream scatters image
-        rows with a dim-0 boolean mask that Spyre cannot do.
+        ``input_ids`` still on CPU. The text lookup runs on the host when the wrapper
+        holds a host table (see ``_host_embed_input_ids``), else on-card; when images
+        are present the merge is done on CPU, because upstream scatters image rows
+        with a dim-0 boolean mask that Spyre cannot do.
         """
         has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
         if has_mm and is_multimodal is None:
@@ -407,6 +444,13 @@ class _SpyreModelWrapper:
                 "SpyreModelWrapper.embed_input_ids does not support models with "
                 "out-of-vocab multimodal tokens; mask them before the text embedding."
             )
+
+        if self._host_embed_table is not None:
+            inputs_embeds = self._host_embed_input_ids(input_ids)
+            if inputs_embeds is not None:
+                if not has_mm:
+                    return inputs_embeds
+                return self._merge_on_host(inputs_embeds, multimodal_embeddings, is_multimodal)
 
         # Bucket the token count: this runs on the raw scheduled count, so at TP>1 the
         # vocab-parallel all_reduce is `num_tokens * hidden` for every distinct prompt
@@ -428,19 +472,58 @@ class _SpyreModelWrapper:
         if not has_mm:
             return inputs_embeds
 
+        merged = self._merge_on_host(
+            convert(inputs_embeds, device="cpu"), multimodal_embeddings, is_multimodal
+        )
+        return convert(merged, device=self._spyre_device)
+
+    @staticmethod
+    def _merge_on_host(inputs_embeds, multimodal_embeddings, is_multimodal):
         from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 
-        inputs_embeds = convert(inputs_embeds, device="cpu")
         mm_embeds_cpu = tree_map(
             lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
             multimodal_embeddings,
         )
-        merged = _merge_multimodal_embeddings(
+        return _merge_multimodal_embeddings(
             inputs_embeds=inputs_embeds,
             multimodal_embeddings=mm_embeds_cpu,
             is_multimodal=is_multimodal.to("cpu"),
         )
-        return convert(merged, device=self._spyre_device)
+
+    def _host_embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+        """Token embeddings gathered from the host copy of the table, on CPU.
+
+        A multimodal model embeds every step here, decode included, and the runner
+        copies the result into its `inputs_embeds[:num_tokens]` buffer. On the card
+        that is a lookup plus a crop and a slice copy at the raw token count -- a
+        fresh kernel (and a re-tile round trip through the host) per distinct count.
+        With a host table the buffer is host-side too (`load_model`), so the step's
+        only device work is the one upload of the padded batch in `__call__`. The
+        first call is checked against the card's lookup; on a mismatch the host path
+        turns itself off.
+        """
+        table = self._host_embed_table
+        ids = input_ids.to("cpu", torch.long)
+        embeds = table[ids]
+        if self._host_embed_verified:
+            return embeds
+        on_card = convert(
+            self._model.embed_input_ids(convert(ids, dtype=torch.int64, device=self._spyre_device)),
+            device="cpu",
+        )
+        # Compared after a trip through the card: its fp16 is not bit-identical to IEEE.
+        uploaded = convert(convert(embeds, device=self._spyre_device), device="cpu")
+        if not torch.equal(on_card, uploaded):
+            logger.warning(
+                "Host token-embedding lookup disagrees with the card's; using the "
+                "on-card path for embed_input_ids."
+            )
+            object.__setattr__(self, "_host_embed_table", None)
+            return None
+        object.__setattr__(self, "_host_embed_verified", True)
+        logger.info("embed_input_ids: gathering token embeddings on the host.")
+        return embeds
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
@@ -581,6 +664,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
+        host_embed_table = _host_embed_table(self.model, self.vllm_config)
+
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
@@ -617,7 +702,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
             ),
             shape_bucketer=bucketer,
+            host_embed_table=host_embed_table,
         )
+        if host_embed_table is not None:
+            # Host-side staging for `_host_embed_input_ids`: the runner's
+            # `inputs_embeds.gpu[:n].copy_(...)` becomes a memcpy.
+            self.inputs_embeds = SpyreCpuGpuBuffer(
+                *self.inputs_embeds.cpu.shape,
+                cpu_dtype=self.inputs_embeds.cpu.dtype,
+                gpu_dtype=self.inputs_embeds.cpu.dtype,
+                device=torch.device("cpu"),
+                pin_memory=False,
+                with_numpy=False,
+            )
 
     @staticmethod
     def _model_has_spyre_fp8(model: nn.Module) -> bool:

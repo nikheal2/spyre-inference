@@ -270,13 +270,16 @@ by `probs @ V` and stays resident either way.
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
-  to `max_model_len` (avoids per-step recompilation on Spyre)
+  to `max_model_len`, plus a 1.5x midpoint between each pair from 8 blocks up (avoids
+  per-step recompilation on Spyre)
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
   default; not on the head-major layout):
-  powers of two from 4 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); the decode-batch
-  kernel is recorded over the `(num_blocks, num_seqs)` grid
+  the batch sizes where the kernel's `blocks_per_chunk = 32 // num_seqs` grows 1.5x
+  (`4, 6, 10, 16, 32`), then powers of two up to `max_num_seqs`
+  (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); the decode-batch kernel is recorded over the
+  `(num_blocks, num_seqs)` grid
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
 - **Block size**: Must be a multiple of 64. The default is 128, and a user-supplied
   `block_size` is rounded up to the next multiple of 64
