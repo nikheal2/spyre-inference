@@ -22,6 +22,7 @@ monkeypatch and `apply()` is the only entry point.
 from __future__ import annotations
 
 from functools import cache
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -98,13 +99,33 @@ def patch_vision_attention() -> None:
     )
 
 
+class RopeCosSin(NamedTuple):
+    """Head-expanded `[1, patches, n_heads, head_dim]` rope factors, one upload each."""
+
+    cos: torch.Tensor
+    sin: torch.Tensor
+
+
 def patch_vision_rope_vit() -> None:
     """Run the Pixtral `VisionTransformer` 2D-RoPE on-card.
 
     Upstream's rope is complex and gathers per-token freqs by advanced indexing;
-    Spyre has neither `complex64` nor `aten::index.Tensor_out`. So `freqs_cis`
-    becomes a real packed cos/sin table gathered with `index_select`, and
-    `apply_rotary_emb_vit` becomes `x·cos + (x @ P)·sin` over the full stick width.
+    Spyre has neither `complex64` nor `aten::index.Tensor_out`. So `freqs_cis` becomes
+    a real packed cos/sin table and `apply_rotary_emb_vit` becomes
+    `x·cos + (x @ P)·sin` over the full stick width.
+
+    The table stays on the host and the per-image gather runs there, so a forward
+    uploads two contiguous `[1, patches, n_heads, head_dim]` tensors and nothing else.
+    Both the gather and the head expansion are host work on purpose:
+
+    - Gathering on-card needs `index_select` and then a slice of cos and sin out of the
+      `[patches, 2, head_dim]` result, one of them at a nonzero storage offset, which
+      torch-spyre's eager dispatch re-materializes on each of the 2×layers uses.
+    - Leaving cos/sin broadcastable at `[1, patches, 1, head_dim]` makes every
+      `x * cos` an eager 1→n_heads broadcast. Those measured 14.3 ms each — 10× the
+      full 64×64 rope matmul they accompany — and there are two per tensor per layer,
+      96 in a 24-layer tower. One host materialize replaces all of them, at 6 MB per
+      factor per image.
     """
     try:
         from vllm.model_executor.models import pixtral
@@ -116,22 +137,34 @@ def patch_vision_rope_vit() -> None:
     if orig is None or vt is None or getattr(orig, "_spyre_patched", False):
         return
 
-    class _OnCardFreqsTable:
-        """Real freqs table on Spyre, gathered per-token by flat `index_select`."""
+    class _CpuFreqsTable:
+        """Host-side freqs table; `__getitem__` returns device-ready cos/sin."""
 
-        def __init__(self, table: torch.Tensor, width: int):
-            self._table = table  # (H*W, 2, head_dim) on Spyre
+        def __init__(self, table: torch.Tensor, width: int, n_heads: int, device: torch.device):
+            self._table = table  # (H*W, 2, head_dim) on CPU
             self._width = width
+            self._n_heads = n_heads
+            self._device = device
 
-        def __getitem__(self, idx):
-            # `positions[:, 1]` has storage_offset=1, which the device needs
-            # stick-aligned, so fold both columns into a flat index on CPU first.
+        def __getitem__(self, idx) -> RopeCosSin:
+            # Upstream indexes with `positions[:, 0], positions[:, 1]`; fold them into
+            # one flat index and gather on the host, where advanced indexing exists.
             row, col = idx
             flat = (row.to("cpu") * self._width + col.to("cpu")).to(torch.int64)
-            flat = convert(flat, device=self._table.device, dtype=torch.int64)
-            return self._table.index_select(0, flat)  # (seq, 2, head_dim)
+            gathered = self._table[flat]  # (seq, 2, head_dim)
+            seq, _, head_dim = gathered.shape
+            shape = (1, seq, self._n_heads, head_dim)
+            cos, sin = (
+                convert(
+                    gathered[:, i, :][None, :, None, :].expand(shape).contiguous(),
+                    device=self._device,
+                    dtype=torch.float16,
+                )
+                for i in (0, 1)
+            )
+            return RopeCosSin(cos, sin)
 
-    def _freqs_cis_ondev(self):
+    def _freqs_cis_cpu(self):
         # Packed real table (H*W, 2, head_dim): [..., 0, :]=cos, [..., 1, :]=sin.
         if self._freqs_cis is None:
             fc = pixtral.precompute_freqs_cis_2d(
@@ -148,15 +181,22 @@ def patch_vision_rope_vit() -> None:
             self._freqs_cis = packed.reshape(-1, packed.shape[-2], packed.shape[-1]).to(
                 torch.float16
             )  # (H*W, 2, head_dim) on CPU
-        if self._freqs_cis.device != self.device:
-            self._freqs_cis = convert(self._freqs_cis, device=self.device, dtype=torch.float16)
-        return _OnCardFreqsTable(self._freqs_cis, self.max_patches_per_side)
+        return _CpuFreqsTable(
+            self._freqs_cis,
+            self.max_patches_per_side,
+            self.args.num_attention_heads,
+            self.device,
+        )
 
     def _apply_rotary_emb_vit(xq, xk, freqs_cis):
-        # xq, xk: [batch, patches, n_heads, head_dim]; freqs_cis: [patches, 2, head_dim].
+        # xq, xk: [batch, patches, n_heads, head_dim].
+        if not isinstance(freqs_cis, RopeCosSin):
+            raise TypeError(
+                "Spyre vision rope expects the RopeCosSin pair produced by the patched "
+                f"VisionTransformer.freqs_cis, got {type(freqs_cis).__name__}"
+            )
         p = rope_perm_matrix("pair", xq.shape[-1], xq.device)
-        cos = freqs_cis[:, 0, :][None, :, None, :]  # [1, patches, 1, head_dim]
-        sin = freqs_cis[:, 1, :][None, :, None, :]
+        cos, sin = freqs_cis
 
         return (
             rope_rotate_matmul(xq, cos, sin, p).type_as(xq),
@@ -165,10 +205,11 @@ def patch_vision_rope_vit() -> None:
 
     _apply_rotary_emb_vit._spyre_patched = True
     pixtral.apply_rotary_emb_vit = _apply_rotary_emb_vit  # ty: ignore[invalid-assignment]
-    vt.freqs_cis = property(_freqs_cis_ondev)
+    vt.freqs_cis = property(_freqs_cis_cpu)
     logger.info(
-        "Spyre: patched Pixtral VisionTransformer 2D-RoPE to on-card real "
-        "rotation (index_select freqs gather + pair-swap matmul)."
+        "Spyre: patched Pixtral VisionTransformer 2D-RoPE to real rotation with a "
+        "host-side freqs gather (two head-expanded cos/sin uploads per image, "
+        "pair-swap matmul)."
     )
 
 

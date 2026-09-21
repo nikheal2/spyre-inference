@@ -31,7 +31,24 @@ def align_up(n: int, align: int = STICK) -> int:
 
 
 # Attribute under which a source mask caches its padded counterpart `(key, padded)`.
+# `padded` is None when the source attends everywhere; see `_padded_attn_mask`.
 _MASK_ATTR = "_spyre_padded_mask"
+
+# Largest `n_pad / seq_pad` at which the mask may be dropped for the fused kernel.
+# Dropping it leaves the zero-padded keys attended: each scores exactly 0 and adds
+# nothing through its zero `v` row, but it still takes softmax mass off the real keys,
+# shrinking the output by at most that ratio. 0.5% at Pixtral's 3120→3136 — below fp16
+# tower noise — but 22% at CLIP's 50→64, which is why this is a ratio and not a flag.
+_MASKLESS_PAD_BOUND = 0.01
+
+
+def _mask_attends_everywhere(mc: torch.Tensor) -> bool:
+    """True when a CPU source mask permits every (query, key) pair."""
+    if mc.dtype == torch.bool:
+        return bool(mc.all())
+    # Additive form. A nonzero constant would be softmax-invariant too, but no caller
+    # produces one, so only the all-zero case is claimed.
+    return bool((mc == 0).all())
 
 
 def _padded_attn_mask(
@@ -41,22 +58,33 @@ def _padded_attn_mask(
     seq_pad: int,
     dtype: torch.dtype,
     device: torch.device,
-) -> torch.Tensor:
-    """Additive `[b, 1, seq_pad, seq_pad]` mask on `device`.
+) -> torch.Tensor | None:
+    """Additive `[b, 1, seq_pad, seq_pad]` mask on `device`, or None to attend everywhere.
 
-    O(L²) and shared by every layer, so it is cached on the source mask: one upload
-    per image, released with its source.
+    None is returned when the source mask permits every pair *and* the key padding is
+    within `_MASKLESS_PAD_BOUND`. The first is the single-image case — a block-diagonal
+    mask over one block is all-ones and carries no information — and the second is what
+    keeps the dropped `-inf` columns harmless. `padded_sdpa` then calls SDPA with no
+    `attn_mask`, the only form that reaches the fused attention kernel; see its
+    docstring for what that is worth.
+
+    O(L²) and shared by every layer, so both outcomes are cached on the source mask:
+    one upload per image, released with its source.
     """
     key = (b, seq, seq_pad, dtype, str(device))
     cached = getattr(mask, _MASK_ATTR, None)
     if cached is not None and cached[0] == key:
         return cached[1]
 
+    mc = convert(mask, "cpu")
+    if (seq_pad - seq) / seq_pad <= _MASKLESS_PAD_BOUND and _mask_attends_everywhere(mc):
+        setattr(mask, _MASK_ATTR, (key, None))
+        return None
+
     # Assembled on CPU: strided slice-assign is not stick-safe on Spyre.
     neg_inf = torch.finfo(dtype).min
     m = torch.zeros(b, 1, seq_pad, seq_pad, dtype=dtype)
     m[:, :, :, seq:] = neg_inf  # padded keys never attended
-    mc = convert(mask, "cpu")
     if mc.dtype == torch.bool:
         m[:, :, :seq, :seq] = torch.zeros(seq, seq, dtype=dtype).masked_fill(
             ~mc.reshape(seq, seq), neg_inf
@@ -81,8 +109,20 @@ def padded_sdpa(
 
     At a sequence length coprime with the stick, stock SDPA either fails to
     restickify a batch-matmul operand or returns silently wrong values, so the
-    padding is a correctness requirement rather than a tuning choice. Padded keys are
-    masked to `-inf` and padded queries cropped off.
+    padding is a correctness requirement rather than a tuning choice. Padded queries
+    are cropped off the output.
+
+    A mask that attends everywhere is dropped rather than materialized, because
+    `attn_mask=None` is the only form that reaches the fused attention kernel. With a
+    mask, Spyre softmaxes a *materialized* score matrix in three passes over memory —
+    at Pixtral's 3136 patches that is 314 MB live per layer plus a 39 MB mask read per
+    pass, and it measured 172 ms/layer against 12 ms for the fused kernel.
+
+    The cost is the padded keys, which then have no `-inf` column: the output shrinks
+    by at most `n_pad / seq_pad` (see `_MASKLESS_PAD_BOUND`, which is why a long,
+    barely-padded sequence takes this path and a short one does not). Head-dim padding
+    is exact either way — its `q`/`k` lanes are zero, so they add nothing to the dot
+    product, and its `v` lanes are cropped off.
 
     `scale` defaults to the head dim seen here, which assumes `q`/`k`/`v` arrive unpadded
     so the padding cannot change it. Pass it explicitly when the head dim is already
@@ -114,6 +154,7 @@ def padded_sdpa(
         k,
         v,
         attn_mask=_padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device),
+        is_causal=False,
         scale=scale,
         enable_gqa=enable_gqa,
     )
