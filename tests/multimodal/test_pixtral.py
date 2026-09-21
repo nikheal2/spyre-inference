@@ -611,15 +611,21 @@ def test_padded_sdpa_passes_no_attn_mask_on_the_fused_path(monkeypatch, seq, mas
 
 
 @pytest.mark.pixtral
-def test_maskless_padding_error_stays_under_the_pad_share():
+def test_maskless_padding_error_stays_under_the_pad_share(monkeypatch):
     """Dropping the mask leaves the zero-padded keys attended, so they take softmax
     mass off the real keys. The output shrink is bounded by `n_pad / seq_pad` — 0.5%
-    at Pixtral's 3120→3136. Pinned here because it is the price of the fused path and
+    at Pixtral's 3120→3136. Pinned here because it is the price of the *SDPA* path and
     a regression in it would otherwise be invisible.
+
+    Tiling is forced off: the tiled kernel masks the straddling block instead and so
+    does not pay this error at all — see the exactness test below.
     """
     import torch.nn.functional as F
 
+    from spyre_inference import envs
     from spyre_inference.multimodal.utils import align_up, padded_sdpa
+
+    monkeypatch.setattr(envs, "SPYRE_VISION_TILED_ATTN", False, raising=False)
 
     seq, heads, dim = 3120, 4, 64
     pad_share = (align_up(seq) - seq) / align_up(seq)
@@ -635,6 +641,246 @@ def test_maskless_padding_error_stays_under_the_pad_share():
     assert actual.shape == exact.shape
     relative = (actual - exact).abs().mean() / exact.abs().mean()
     assert relative < pad_share, f"{relative:.3%} exceeds the {pad_share:.3%} pad share"
+
+
+# ---------------------------------------------------------------------------
+# 3c-bis. Tiled vision attention (multimodal/utils.py)
+#
+# The kernel exists because SDPA on Spyre materializes the whole [B, H, L, L] score
+# matrix — 314 MB per Pixtral layer, streamed three times, 172 ms/layer. These
+# exercise `_tiled_attention` directly rather than through `torch.compile`, which is
+# only about how the loop reaches the device, not what it computes.
+# ---------------------------------------------------------------------------
+
+
+def _exact_attention(q, k, v, seq, scale):
+    """Attention over the real keys only — what the tiled path must reproduce."""
+    import torch.nn.functional as F
+
+    return F.scaled_dot_product_attention(q, k[:, :, :seq, :], v[:, :, :seq, :], scale=scale)
+
+
+def _tiled_operands(seq, heads=2, dim=64, batch=1, dtype=torch.float32, seed=0):
+    """`[B, H, seq_pad, D]` q/k/v with the padded key/value rows zeroed, as `F.pad` leaves them."""
+    from spyre_inference.multimodal.utils import align_up
+
+    torch.manual_seed(seed)
+    seq_pad = align_up(seq)
+    q, k, v = (torch.randn(batch, heads, seq_pad, dim, dtype=dtype) for _ in range(3))
+    k[:, :, seq:, :] = 0
+    v[:, :, seq:, :] = 0
+    return q, k, v, seq_pad
+
+
+@pytest.mark.pixtral
+@pytest.mark.parametrize(
+    "seq,block",
+    [
+        (3120, 448),  # Pixtral 728x840; block divides seq_pad exactly
+        (3120, 512),  # ragged last block, 64 wide — the common case at the default block
+        (1024, 512),  # exact division, no straddling block at all
+        (1088, 512),  # 512 + 512 + 64
+        (2048, 512),
+    ],
+)
+def test_tiled_attention_matches_exact_attention(seq, block):
+    """The online softmax must equal attention over the real keys.
+
+    This is the property the whole kernel exists to preserve: blocking changes how the
+    softmax is accumulated, never what it converges to.
+    """
+    from spyre_inference.multimodal.utils import _tile_plan, _tiled_attention
+
+    dim = 64
+    q, k, v, seq_pad = _tiled_operands(seq, dim=dim)
+    scale = dim**-0.5
+
+    indices, tail = _tile_plan(seq, seq_pad, block, q.dtype, q.device)
+    got = _tiled_attention(q, k, v, indices, tail, scale)[:, :, :seq, :]
+    want = _exact_attention(q, k, v, seq, scale)[:, :, :seq, :]
+
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.pixtral
+@pytest.mark.parametrize("batch,heads", [(1, 2), (2, 4), (1, 16), (3, 8)])
+def test_tiled_attention_handles_batch_and_head_counts(batch, heads):
+    """Blocking is over the key axis only, so B and H must pass through untouched.
+
+    A short sequence on purpose: this pins the B/H axes, and the reference builds a
+    dense `[B, H, L, L]` score matrix that would be hundreds of MB at tower scale.
+    """
+    from spyre_inference.multimodal.utils import _tile_plan, _tiled_attention
+
+    seq, dim = 1024, 64
+    q, k, v, seq_pad = _tiled_operands(seq, heads=heads, dim=dim, batch=batch)
+    scale = dim**-0.5
+
+    indices, tail = _tile_plan(seq, seq_pad, 512, q.dtype, q.device)
+    got = _tiled_attention(q, k, v, indices, tail, scale)[:, :, :seq, :]
+    want = _exact_attention(q, k, v, seq, scale)[:, :, :seq, :]
+
+    assert got.shape == (batch, heads, seq, dim)
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.pixtral
+def test_tail_mask_is_what_makes_key_padding_exact():
+    """Without the straddling block's mask the zero-padded keys stay attended and the
+    output shrinks by roughly `n_pad / seq_pad` — the same error the SDPA path accepts.
+    The mask is `[1, 1, 1, block]`, so exactness here costs O(block), not O(L²)."""
+    from spyre_inference.multimodal.utils import _tile_plan, _tiled_attention
+
+    seq, dim = 3120, 64
+    q, k, v, seq_pad = _tiled_operands(seq, dim=dim)
+    scale = dim**-0.5
+    want = _exact_attention(q, k, v, seq, scale)[:, :, :seq, :]
+
+    indices, tail = _tile_plan(seq, seq_pad, 512, q.dtype, q.device)
+    assert tail is not None and tail.shape == (1, 1, 1, 64)
+
+    def rel(out):
+        return ((out[:, :, :seq, :] - want).abs().mean() / want.abs().mean()).item()
+
+    masked = rel(_tiled_attention(q, k, v, indices, tail, scale))
+    unmasked = rel(_tiled_attention(q, k, v, indices, None, scale))
+
+    assert masked < 1e-5, f"tiled path should be exact, got {masked:.2e}"
+    assert unmasked > 100 * masked, "the tail mask is doing nothing — is the plan wrong?"
+
+
+@pytest.mark.pixtral
+@pytest.mark.parametrize("seq,block", [(3120, 512), (3120, 448), (1088, 512), (4672, 1024)])
+def test_tile_plan_blocks_are_stick_aligned_and_reach_every_real_key(seq, block):
+    """Every block width must land on the stick — it is the `p @ v` reduction axis —
+    and the blocks together must cover `0..seq` without running past `seq_pad`."""
+    from spyre_inference.multimodal.utils import STICK, _tile_plan, align_up
+
+    seq_pad = align_up(seq)
+    indices, _ = _tile_plan(seq, seq_pad, block, torch.float32, torch.device("cpu"))
+
+    covered = 0
+    for i, idx in enumerate(indices):
+        width = idx.numel()
+        assert width % STICK == 0, f"block {i} width {width} is not stick-aligned"
+        assert int(idx[0]) == i * block, "blocks must start on their stride"
+        covered = int(idx[-1]) + 1
+        assert covered <= seq_pad, "gathered past the padded length"
+    assert covered >= seq, "the last block does not reach the final real key"
+    # No block may consist only of padding: its scores would be uniformly -inf.
+    assert (len(indices) - 1) * block < seq
+
+
+@pytest.mark.pixtral
+def test_tile_plan_is_cached_per_shape():
+    """The plan uploads index tensors, and every layer of a tower asks for the same
+    one. Rebuilding it per layer would be pure H2D traffic."""
+    from spyre_inference.multimodal.utils import _tile_plan
+
+    args = (3120, 3136, 512, torch.float32, torch.device("cpu"))
+    first = _tile_plan(*args)
+    assert _tile_plan(*args) is first
+    assert _tile_plan(3120, 3136, 448, torch.float32, torch.device("cpu")) is not first
+
+
+@pytest.mark.pixtral
+@pytest.mark.parametrize(
+    "seq_pad,expect_tiled",
+    [
+        (512, False),  # below _TILE_MIN_SEQ: the score matrix is already small
+        (1024, True),
+        (3136, True),
+    ],
+)
+def test_kv_block_size_skips_short_sequences(seq_pad, expect_tiled):
+    from spyre_inference.multimodal.utils import _kv_block_size
+
+    block = _kv_block_size(seq_pad)
+    assert (block is not None) is expect_tiled
+    if block is not None:
+        assert block % 64 == 0 and block < seq_pad
+
+
+@pytest.mark.pixtral
+def test_block_width_doubles_rather_than_unrolling_without_bound():
+    """`dynamic=False` unrolls the block loop, so the graph grows with the block count.
+    Past the ceiling the kernel takes a wider block instead."""
+    from spyre_inference.multimodal.utils import _TILE_MAX_BLOCKS, _kv_block_size
+
+    for seq_pad in (1024, 3136, 16384, 65536):
+        block = _kv_block_size(seq_pad)
+        if block is None:
+            continue
+        assert (seq_pad + block - 1) // block <= _TILE_MAX_BLOCKS
+
+
+@pytest.mark.pixtral
+@pytest.mark.parametrize(
+    "seq,mask_kind,gqa,tiled",
+    [
+        (1024, "full", False, True),  # the case the kernel was written for
+        (1024, "tril", False, False),  # a real mask must be tiled too — not supported yet
+        (64, "full", False, False),  # short tower (CLIP-scale): SDPA is fine
+        (1024, "full", True, False),  # GQA: k/v have fewer heads than q
+    ],
+)
+def test_padded_sdpa_routes_only_the_intended_case_to_the_tiled_kernel(
+    monkeypatch, seq, mask_kind, gqa, tiled
+):
+    """Gemma 4's real masks and the generic ViT path must keep the lowering they are
+    already validated against; only long unmasked non-GQA towers switch.
+
+    `_tiled_attention_compiled` is stubbed with the eager kernel: what is under test is
+    the routing decision, not `torch.compile`.
+    """
+    from spyre_inference.multimodal import utils
+
+    calls = {"tiled": 0, "sdpa": 0}
+    real_sdpa = utils.F.scaled_dot_product_attention
+
+    def spy_tiled(*a, **kw):
+        calls["tiled"] += 1
+        return utils._tiled_attention(*a, **kw)
+
+    def spy_sdpa(*a, **kw):
+        calls["sdpa"] += 1
+        return real_sdpa(*a, **kw)
+
+    monkeypatch.setattr(utils, "_tiled_attention_compiled", spy_tiled)
+    monkeypatch.setattr(utils.F, "scaled_dot_product_attention", spy_sdpa)
+
+    heads, kv_heads, dim = 4, (1 if gqa else 4), 64
+    q = torch.randn(1, heads, seq, dim)
+    k = torch.randn(1, kv_heads, seq, dim)
+    v = torch.randn(1, kv_heads, seq, dim)
+    mask = torch.ones(seq, seq, dtype=torch.bool)
+    if mask_kind == "tril":
+        mask = mask.tril()
+
+    utils.padded_sdpa(q, k, v, mask, enable_gqa=gqa)
+
+    assert calls["tiled"] == (1 if tiled else 0)
+    assert calls["sdpa"] == (0 if tiled else 1)
+
+
+@pytest.mark.pixtral
+def test_tiled_attention_can_be_turned_off_by_env():
+    """A perf change on this backend needs an escape hatch that does not need a rebuild."""
+    import os
+
+    from spyre_inference import envs
+    from spyre_inference.multimodal.utils import _use_tiled_attention
+
+    q = torch.zeros(1, 4, 3136, 64)
+    envs.clear_env_cache()
+    try:
+        assert _use_tiled_attention(None, 3136, False, q, q) is not None
+        os.environ["SPYRE_VISION_TILED_ATTN"] = "0"
+        envs.clear_env_cache()
+        assert _use_tiled_attention(None, 3136, False, q, q) is None
+    finally:
+        os.environ.pop("SPYRE_VISION_TILED_ATTN", None)
+        envs.clear_env_cache()
 
 
 # ---------------------------------------------------------------------------

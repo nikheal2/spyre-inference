@@ -41,6 +41,8 @@ if TYPE_CHECKING:
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
+    SPYRE_VISION_TILED_ATTN: bool = True
+    SPYRE_VISION_TILED_ATTN_BLOCK: int = 512
 
 _cache: dict[str, Any] = {}
 
@@ -99,6 +101,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.
     "SPYRE_UPDATE_THREAD_CONFIG": lambda: bool(int(os.getenv("SPYRE_UPDATE_THREAD_CONFIG", "1"))),
+    # When "1" (default), long vision-tower sequences attend through the tiled
+    # online-softmax kernel in multimodal/utils.py instead of SDPA, which on Spyre
+    # materializes the whole [B, H, L, L] score matrix. "0" forces SDPA everywhere.
+    "SPYRE_VISION_TILED_ATTN": lambda: bool(int(os.getenv("SPYRE_VISION_TILED_ATTN", "1"))),
+    # Target key-block width, in tokens, for the tiled vision attention kernel. Rounded
+    # up to the 64-element stick and doubled while the block count exceeds the unroll
+    # ceiling. Larger blocks mean fewer unrolled iterations but a larger live score tile.
+    "SPYRE_VISION_TILED_ATTN_BLOCK": lambda: int(
+        os.getenv("SPYRE_VISION_TILED_ATTN_BLOCK", "512")
+    ),
 }
 # --8<-- [end:env-vars-definition]
 
