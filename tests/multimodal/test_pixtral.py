@@ -330,11 +330,11 @@ class _FreqsStub:
     """Stands in for a `VisionTransformer`: the patched `freqs_cis` property reads
     only `args`, `max_patches_per_side`, `_freqs_cis` and `device`."""
 
-    def __init__(self):
+    def __init__(self, device: torch.device | str = "cpu"):
         self.args = _vision_args()
         self.max_patches_per_side = MAX_PATCHES_PER_SIDE
         self._freqs_cis = None
-        self.device = torch.device("cpu")
+        self.device = torch.device(device)
 
 
 def _positions(num_patches: int) -> torch.Tensor:
@@ -369,12 +369,12 @@ def test_real_rope_matches_upstream_complex_rope(num_patches):
     complex_gathered = complex_table[positions[:, 0], positions[:, 1]]
     expected_q, expected_k = original_apply(xq, xk, complex_gathered)
 
-    # Spyre rewrite: real table, flat index_select gather, pair-swap matmul.
     patch_vision_rope_vit()
     table = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())
     real_gathered = table[(positions[:, 0], positions[:, 1])]
-    assert real_gathered.shape == (num_patches, 2, HEAD_DIM)
-    assert not real_gathered.is_complex(), "the table must be real — Spyre has no complex dtype"
+    for factor in real_gathered:
+        assert factor.shape == (1, num_patches, NUM_HEADS, HEAD_DIM)
+        assert not factor.is_complex(), "the table must be real — Spyre has no complex dtype"
 
     actual_q, actual_k = pixtral.apply_rotary_emb_vit(xq, xk, real_gathered)
 
@@ -384,9 +384,7 @@ def test_real_rope_matches_upstream_complex_rope(num_patches):
 
 @pytest.mark.pixtral
 def test_flat_index_gather_matches_2d_index():
-    """The `_OnCardFreqsTable` wrapper folds `(row, col)` into `row*W + col` and
-    uses `index_select` (Spyre has no `aten::index`). That flattening must agree
-    with a plain 2-D advanced index."""
+    """The `row*W + col` folding must agree with a plain 2-D advanced index."""
     from spyre_inference.multimodal.pixtral import patch_vision_rope_vit
 
     patch_vision_rope_vit()
@@ -396,9 +394,30 @@ def test_flat_index_gather_matches_2d_index():
     flat = stub._freqs_cis.reshape(MAX_PATCHES_PER_SIDE, MAX_PATCHES_PER_SIDE, 2, HEAD_DIM)
 
     positions = _positions(23)
-    gathered = table[(positions[:, 0], positions[:, 1])]
+    cos, sin = table[(positions[:, 0], positions[:, 1])]
+    expected = flat[positions[:, 0], positions[:, 1]]  # (23, 2, HEAD_DIM)
 
-    torch.testing.assert_close(gathered, flat[positions[:, 0], positions[:, 1]])
+    # Every head carries the same row.
+    torch.testing.assert_close(cos[0, :, 0, :], expected[:, 0, :])
+    torch.testing.assert_close(sin[0, :, 0, :], expected[:, 1, :])
+
+
+@pytest.mark.pixtral
+def test_rope_factors_are_expanded_over_heads():
+    """cos/sin must arrive materialized at `[1, L, H, D]`: a broadcastable
+    `[1, L, 1, D]` has no on-device lowering and falls back to the host."""
+    from spyre_inference.multimodal.pixtral import patch_vision_rope_vit
+
+    patch_vision_rope_vit()
+
+    table = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())
+    cos, sin = table[(_positions(23)[:, 0], _positions(23)[:, 1])]
+
+    for factor in (cos, sin):
+        assert factor.shape == (1, 23, NUM_HEADS, HEAD_DIM)
+        assert factor.is_contiguous(), "a strided operand is re-materialized per use"
+        # A real expansion, not a stride-0 view masquerading as one.
+        assert factor.stride(2) == HEAD_DIM
 
 
 # ---------------------------------------------------------------------------
@@ -629,19 +648,21 @@ def test_padded_vision_attention_matches_cpu_on_spyre(tp_group, num_patches):
     patch_vision_attention()
 
     positions = _positions(num_patches)
-    table = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())
-    freqs_cis = table[(positions[:, 0], positions[:, 1])]
+    idx = (positions[:, 0], positions[:, 1])
+    device = torch.device("spyre")
+    # The table uploads its own cos/sin, so it is built once per target device.
+    freqs_cpu = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())[idx]
+    freqs_dev = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub(device))[idx]
 
     torch.manual_seed(37)
     x = torch.randn(1, num_patches, HIDDEN_SIZE, dtype=torch.float16)
     # Kept on CPU: the padded mask is assembled host-side and Spyre has no bool.
     mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
 
-    expected = pixtral.Attention.forward(layer, x, mask, freqs_cis)
+    expected = pixtral.Attention.forward(layer, x, mask, freqs_cpu)
 
-    device = torch.device("spyre")
     layer = layer.to(device)
-    actual = pixtral.Attention.forward(layer, x.to(device), mask, freqs_cis.to(device))
+    actual = pixtral.Attention.forward(layer, x.to(device), mask, freqs_dev)
 
     assert actual.shape == expected.shape == (1, num_patches, HIDDEN_SIZE)
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
