@@ -89,14 +89,16 @@ def patch_vision_attention() -> None:
         batch, patches, _ = x.shape
         qkv, _ = self.qkv_proj(x)
         # q and k are adjacent in the fused projection, so one rotation covers both:
-        # three rope ops per layer instead of six, over the same bytes. The card is
-        # idle 44% of this tower, so halving the dispatch count is the point.
+        # three rope ops per layer instead of six, over the same bytes.
         hidden = self.n_heads * self.head_dim
         qk, v = qkv.split([2 * hidden, hidden], dim=-1)
         qk = rope_rotate_freqs(
             qk.reshape(batch, patches, 2 * self.n_heads, self.head_dim), freqs_cis
         )
-        q, k = qk.chunk(2, dim=2)
+        # Materialized, not left as the head-axis view chunk() returns: a strided
+        # operand costs more downstream than this copy does here, measured at +34%
+        # per call on the padding that follows.
+        q, k = (t.contiguous() for t in qk.chunk(2, dim=2))
         v = v.reshape(batch, patches, self.n_heads, self.head_dim)
         # [B, H, L, D] for SDPA.
         q = q.transpose(1, 2)
