@@ -22,7 +22,6 @@ monkeypatch and `apply()` is the only entry point.
 from __future__ import annotations
 
 from functools import cache
-from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -56,6 +55,18 @@ def rope_rotate_matmul(x, cos, sin, m: torch.Tensor):
     return x * cos + torch.matmul(x, m) * sin
 
 
+def rope_rotate_freqs(x, freqs_cis: torch.Tensor):
+    """Rotate `[batch, patches, heads, head_dim]` by a packed `[patches, 2, head_dim]` table.
+
+    `heads` is unconstrained: cos and sin broadcast from `[1, patches, 1, head_dim]` and
+    `m` applies to the last dim only, so q and k can be rotated as one `2*n_heads` tensor.
+    """
+    p = rope_perm_matrix("pair", x.shape[-1], x.device)
+    cos = freqs_cis[:, 0, :][None, :, None, :]
+    sin = freqs_cis[:, 1, :][None, :, None, :]
+    return rope_rotate_matmul(x, cos, sin, p).type_as(x)
+
+
 def patch_vision_attention() -> None:
     """Replace Pixtral's vision `Attention.forward` with the padded on-card SDPA.
 
@@ -77,11 +88,16 @@ def patch_vision_attention() -> None:
     def _forward(self, x, mask, freqs_cis):
         batch, patches, _ = x.shape
         qkv, _ = self.qkv_proj(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.reshape(batch, patches, self.n_heads, self.head_dim)
-        k = k.reshape(batch, patches, self.n_heads, self.head_dim)
+        # q and k are adjacent in the fused projection, so one rotation covers both:
+        # three rope ops per layer instead of six, over the same bytes. The card is
+        # idle 44% of this tower, so halving the dispatch count is the point.
+        hidden = self.n_heads * self.head_dim
+        qk, v = qkv.split([2 * hidden, hidden], dim=-1)
+        qk = rope_rotate_freqs(
+            qk.reshape(batch, patches, 2 * self.n_heads, self.head_dim), freqs_cis
+        )
+        q, k = qk.chunk(2, dim=2)
         v = v.reshape(batch, patches, self.n_heads, self.head_dim)
-        q, k = pixtral.apply_rotary_emb_vit(q, k, freqs_cis=freqs_cis)
         # [B, H, L, D] for SDPA.
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -99,24 +115,13 @@ def patch_vision_attention() -> None:
     )
 
 
-class RopeCosSin(NamedTuple):
-    """Head-expanded `[1, patches, n_heads, head_dim]` rope factors, one upload each."""
-
-    cos: torch.Tensor
-    sin: torch.Tensor
-
-
 def patch_vision_rope_vit() -> None:
     """Run the Pixtral `VisionTransformer` 2D-RoPE on-card.
 
     Upstream's rope is complex and gathers per-token freqs by advanced indexing;
-    Spyre has neither `complex64` nor `aten::index.Tensor_out`. So `freqs_cis` becomes
-    a real packed cos/sin table and `apply_rotary_emb_vit` becomes
-    `x·cos + (x @ P)·sin` over the full stick width.
-
-    The gather and the head expansion both run on the host: a broadcast along a
-    non-stick dimension has no on-device lowering, and an on-card gather leaves cos
-    at a nonzero storage offset that eager dispatch re-materializes on every use.
+    Spyre has neither `complex64` nor `aten::index.Tensor_out`. So `freqs_cis`
+    becomes a real packed cos/sin table gathered with `index_select`, and
+    `apply_rotary_emb_vit` becomes `x·cos + (x @ P)·sin` over the full stick width.
     """
     try:
         from vllm.model_executor.models import pixtral
@@ -128,33 +133,22 @@ def patch_vision_rope_vit() -> None:
     if orig is None or vt is None or getattr(orig, "_spyre_patched", False):
         return
 
-    class _CpuFreqsTable:
-        """Host-side freqs table; `__getitem__` returns device-ready cos/sin."""
+    class _OnCardFreqsTable:
+        """Real freqs table on Spyre, gathered per-token by flat `index_select`."""
 
-        def __init__(self, table: torch.Tensor, width: int, n_heads: int, device: torch.device):
-            self._table = table  # (H*W, 2, head_dim) on CPU
+        def __init__(self, table: torch.Tensor, width: int):
+            self._table = table  # (H*W, 2, head_dim) on Spyre
             self._width = width
-            self._n_heads = n_heads
-            self._device = device
 
-        def __getitem__(self, idx) -> RopeCosSin:
-            # Folded into one flat index: Spyre has no `aten::index.Tensor_out`.
+        def __getitem__(self, idx):
+            # `positions[:, 1]` has storage_offset=1, which the device needs
+            # stick-aligned, so fold both columns into a flat index on CPU first.
             row, col = idx
             flat = (row.to("cpu") * self._width + col.to("cpu")).to(torch.int64)
-            gathered = self._table[flat]  # (seq, 2, head_dim)
-            seq, _, head_dim = gathered.shape
-            shape = (1, seq, self._n_heads, head_dim)
-            cos, sin = (
-                convert(
-                    gathered[:, i, :][None, :, None, :].expand(shape).contiguous(),
-                    device=self._device,
-                    dtype=torch.float16,
-                )
-                for i in (0, 1)
-            )
-            return RopeCosSin(cos, sin)
+            flat = convert(flat, device=self._table.device, dtype=torch.int64)
+            return self._table.index_select(0, flat)  # (seq, 2, head_dim)
 
-    def _freqs_cis_cpu(self):
+    def _freqs_cis_ondev(self):
         # Packed real table (H*W, 2, head_dim): [..., 0, :]=cos, [..., 1, :]=sin.
         if self._freqs_cis is None:
             fc = pixtral.precompute_freqs_cis_2d(
@@ -171,35 +165,21 @@ def patch_vision_rope_vit() -> None:
             self._freqs_cis = packed.reshape(-1, packed.shape[-2], packed.shape[-1]).to(
                 torch.float16
             )  # (H*W, 2, head_dim) on CPU
-        return _CpuFreqsTable(
-            self._freqs_cis,
-            self.max_patches_per_side,
-            self.args.num_attention_heads,
-            self.device,
-        )
+        if self._freqs_cis.device != self.device:
+            self._freqs_cis = convert(self._freqs_cis, device=self.device, dtype=torch.float16)
+        return _OnCardFreqsTable(self._freqs_cis, self.max_patches_per_side)
 
     def _apply_rotary_emb_vit(xq, xk, freqs_cis):
-        # xq, xk: [batch, patches, n_heads, head_dim].
-        if not isinstance(freqs_cis, RopeCosSin):
-            raise TypeError(
-                "Spyre vision rope expects the RopeCosSin pair produced by the patched "
-                f"VisionTransformer.freqs_cis, got {type(freqs_cis).__name__}"
-            )
-        p = rope_perm_matrix("pair", xq.shape[-1], xq.device)
-        cos, sin = freqs_cis
-
-        return (
-            rope_rotate_matmul(xq, cos, sin, p).type_as(xq),
-            rope_rotate_matmul(xk, cos, sin, p).type_as(xk),
-        )
+        # Upstream's two-tensor entry point, kept for callers outside this package.
+        # The patched vision Attention rotates q and k together instead.
+        return rope_rotate_freqs(xq, freqs_cis), rope_rotate_freqs(xk, freqs_cis)
 
     _apply_rotary_emb_vit._spyre_patched = True
     pixtral.apply_rotary_emb_vit = _apply_rotary_emb_vit  # ty: ignore[invalid-assignment]
-    vt.freqs_cis = property(_freqs_cis_cpu)
+    vt.freqs_cis = property(_freqs_cis_ondev)
     logger.info(
-        "Spyre: patched Pixtral VisionTransformer 2D-RoPE to real rotation with a "
-        "host-side freqs gather (two head-expanded cos/sin uploads per image, "
-        "pair-swap matmul)."
+        "Spyre: patched Pixtral VisionTransformer 2D-RoPE to on-card real "
+        "rotation (index_select freqs gather + pair-swap matmul)."
     )
 
 
