@@ -196,9 +196,11 @@ in every mode, including `enforce_eager`, because its fp32 weight multiply has n
 eager form. `lm_head` was never in the compiled region; `compute_logits` is a separate
 call on the wrapper.
 
-Vision towers stay eager, except block classes in `_compilable_vision_block_classes`
-(Pixtral's `TransformerBlock`). At TP>1 their all_reduces then build the comms plan once
-instead of on every eager call. Each new image size compiles once.
+Vision towers are never compiled per block. Pixtral's tower instead compiles its
+24-layer walk as one graph, plus the adapter as a second (`multimodal.compile_vision_encoder`),
+in either granularity; at TP>1 its all_reduces then build the comms plan once instead of
+on every eager call. `ln_pre`, the rope index, the mask and the patch merger's unfold stay
+eager: each needs the CPU. Each new image size compiles the stack once.
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
 grows with layer count.

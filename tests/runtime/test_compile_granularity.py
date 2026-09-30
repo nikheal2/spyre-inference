@@ -373,7 +373,9 @@ def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
     assert all(layer._compiled_call_impl is not None for layer in decoder_layers)
 
 
-def test_vlm_compiles_pixtral_vision_blocks_but_not_other_towers() -> None:
+def test_vlm_leaves_pixtral_vision_blocks_to_the_layer_stack_graph() -> None:
+    """Pixtral's tower compiles as one layer-stack graph (`compile_vision_encoder`), so
+    per-block discovery must skip its blocks like any other tower's."""
     from vllm.model_executor.models import pixtral
 
     def pixtral_block() -> nn.Module:
@@ -408,10 +410,10 @@ def test_vlm_compiles_pixtral_vision_blocks_but_not_other_towers() -> None:
     model = VLM()
     pixtral_layers = model.vision_encoder.transformer.layers
     decoder_layers = model.language_model.layers
-    assert _repeated_block_lists(model) == [pixtral_layers, decoder_layers]
+    assert _repeated_block_lists(model) == [decoder_layers]
 
-    assert _runner(model)._compile_blocks() == 5
-    assert all(block._compiled_call_impl is not None for block in pixtral_layers)
+    assert _runner(model)._compile_blocks() == 3
+    assert all(block._compiled_call_impl is None for block in pixtral_layers)
     assert all(block._compiled_call_impl is None for block in model.vision_model.layers)
 
 

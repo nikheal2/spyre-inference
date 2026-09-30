@@ -242,6 +242,70 @@ def test_transformer_mask_patch_passes_cpu_mask_through():
     assert all(m is mask for m in seen)
 
 
+def _stub_transformer(num_layers: int = 2) -> torch.nn.Module:
+    """A real `pixtral.Transformer` without ``__init__``, which needs a config."""
+    tr = pixtral.Transformer.__new__(pixtral.Transformer)
+    torch.nn.Module.__init__(tr)
+    tr.layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(num_layers)])
+    return tr
+
+
+@pytest.mark.pixtral
+def test_compile_vision_encoder_installs_one_layer_stack_and_the_adapter():
+    """Wrapping only; tracing happens on the first image, so no device is needed."""
+    from spyre_inference.multimodal import compile_vision_encoder
+    from spyre_inference.multimodal.pixtral import _LAYER_STACK_ATTR
+
+    model = torch.nn.Module()
+    model.vision_encoder = pixtral.VisionTransformer.__new__(pixtral.VisionTransformer)
+    torch.nn.Module.__init__(model.vision_encoder)
+    model.vision_encoder.transformer = _stub_transformer()
+    model.vision_language_adapter = torch.nn.Linear(4, 4)
+
+    assert compile_vision_encoder(model) is True
+    stack = getattr(model.vision_encoder.transformer, _LAYER_STACK_ATTR)
+    assert model.vision_language_adapter._compiled_call_impl is not None
+    layers = model.vision_encoder.transformer.layers
+    assert all(layer._compiled_call_impl is None for layer in layers)
+
+    assert compile_vision_encoder(model) is True
+    assert getattr(model.vision_encoder.transformer, _LAYER_STACK_ATTR) is stack, (
+        "second call must keep the installed stack"
+    )
+
+
+@pytest.mark.pixtral
+def test_compile_vision_encoder_ignores_other_towers():
+    from spyre_inference.multimodal import compile_vision_encoder
+
+    model = torch.nn.Module()
+    model.vision_tower = torch.nn.Module()
+    assert compile_vision_encoder(model) is False
+
+
+@pytest.mark.pixtral
+def test_transformer_forward_routes_through_the_layer_stack():
+    """With a stack installed, the patched forward hands it the whole layer walk."""
+    from spyre_inference.multimodal.pixtral import _LAYER_STACK_ATTR, patch_transformer_mask
+
+    patch_transformer_mask()
+    tr = _stub_transformer()
+    calls = []
+
+    def fake_stack(x, mask, freqs_cis):
+        calls.append((x, mask, freqs_cis))
+        return x + 7
+
+    setattr(tr, _LAYER_STACK_ATTR, fake_stack)
+    x = torch.zeros(1, 3, 4)
+    mask = torch.ones(3, 3, dtype=torch.bool)
+
+    out = pixtral.Transformer.forward(tr, x, mask, None)
+
+    assert torch.equal(out, x + 7)
+    assert len(calls) == 1 and calls[0][1] is mask
+
+
 @pytest.mark.pixtral
 def test_patch_merger_patch_is_applied_and_idempotent():
     from spyre_inference.multimodal.pixtral import patch_patch_merger

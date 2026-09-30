@@ -226,11 +226,54 @@ def patch_block_attention_mask() -> None:
     logger.info("Spyre: Pixtral block attention mask built on CPU (N-image sub-block writes).")
 
 
-def patch_transformer_mask() -> None:
-    """Pad and upload the vision attention mask once per image, ahead of the blocks.
+_LAYER_STACK_ATTR = "spyre_layer_stack"
 
-    `_padded_attn_mask`'s attribute cache does not survive a compiled block, so inside
-    one every layer would re-upload the O(L²) mask.
+
+def _run_layer_stack(transformer: nn.Module, x, mask, freqs_cis):
+    for layer in transformer.layers:
+        x = layer(x, mask=mask, freqs_cis=freqs_cis)
+    return x
+
+
+def compile_vision_encoder(model: nn.Module) -> bool:
+    """Compile the vision `Transformer`'s layer walk as one graph, plus the adapter.
+
+    `embed_multimodal` is outside the runner's block and whole-model graphs, so the
+    tower is compiled here. Only the layer stack: the rest of the tower has CPU steps
+    (`ln_pre` round trip, rope index, mask, patch-merger unfold). `dynamic=False`, so
+    each new image size compiles the stack once. True when a stack is installed.
+    """
+    try:
+        from vllm.model_executor.models import pixtral
+    except ImportError:
+        return False
+
+    found = False
+    for module in model.modules():
+        if not isinstance(module, pixtral.Transformer):
+            continue
+        found = True
+        if hasattr(module, _LAYER_STACK_ATTR):
+            continue
+
+        def stack(x, mask, freqs_cis, transformer=module):
+            return _run_layer_stack(transformer, x, mask, freqs_cis)
+
+        compiled = torch.compile(stack, backend="inductor", fullgraph=True, dynamic=False)
+        setattr(module, _LAYER_STACK_ATTR, compiled)
+
+    adapter = getattr(model, "vision_language_adapter", None)
+    if found and adapter is not None:
+        adapter.compile(backend="inductor", fullgraph=True, dynamic=False)
+    return found
+
+
+def patch_transformer_mask() -> None:
+    """Pad and upload the vision attention mask once per image, ahead of the layers.
+
+    `_padded_attn_mask`'s attribute cache does not survive a compiled graph, so inside
+    one every layer would re-upload the O(L²) mask. With `compile_vision_encoder`, the
+    layer walk after the mask runs as one graph.
     """
     try:
         from vllm.model_executor.models import pixtral
@@ -245,9 +288,10 @@ def patch_transformer_mask() -> None:
         if x.device.type == "spyre":
             batch, seq, _ = x.shape
             mask = _padded_attn_mask(mask, batch, seq, align_up(seq), x.dtype, x.device)
-        for layer in self.layers:
-            x = layer(x, mask=mask, freqs_cis=freqs_cis)
-        return x
+        stack = getattr(self, _LAYER_STACK_ATTR, None)
+        if stack is not None:
+            return stack(x, mask, freqs_cis)
+        return _run_layer_stack(self, x, mask, freqs_cis)
 
     _forward._spyre_patched = True
     tr_cls.forward = _forward
@@ -317,7 +361,7 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     The patch-embedding conv is absent on purpose: `SpyreConv2d` in
     `custom_ops/conv.py` handles it through OOT dispatch.
 
-    Must run after the weights reach `device` and before blocks compile
+    Must run after the weights reach `device` and before `compile_vision_encoder`
     (`install_rope_perm`).
     """
     try:

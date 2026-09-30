@@ -70,3 +70,15 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     hf_config = getattr(model, "config", None)
     if getattr(hf_config, "model_type", None) == "clip":
         clip.apply(model, device)
+
+
+def compile_vision_encoder(model: torch.nn.Module) -> bool:
+    """Compile a vision encoder the runner's block/whole-model graphs cannot reach.
+
+    True when one was installed. Call after `apply_multimodal_patches`, and only when
+    compilation is enabled.
+    """
+    vision_encoder = getattr(model, "vision_encoder", None)
+    if type(vision_encoder).__name__ == "VisionTransformer":
+        return pixtral.compile_vision_encoder(model)
+    return False

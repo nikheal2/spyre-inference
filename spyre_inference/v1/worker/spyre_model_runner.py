@@ -87,7 +87,7 @@ from spyre_inference.custom_ops.mlp_pad import (
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
-from spyre_inference.multimodal import apply_multimodal_patches
+from spyre_inference.multimodal import apply_multimodal_patches, compile_vision_encoder
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
@@ -295,7 +295,6 @@ def _is_decoder_attention_like(module: nn.Module) -> bool:
     # ``sdpa``). Only text-decoder wrappers are configured to dispatch through
     # vLLM's KV-cache attention implementation. Transformers may prefix the
     # implementation with ``paged|`` when it enables its paged-cache wrapper.
-    # Vision blocks are selected separately (`_compilable_vision_block_classes`).
     implementation = getattr(getattr(module, "config", None), "_attn_implementation", "") or ""
     return isinstance(getattr(module, "layer_idx", None), int) and "vllm" in implementation.split(
         "|"
@@ -310,33 +309,18 @@ def _is_vision_tower_path(qualname: str) -> bool:
     return any(part in _VISION_TOWER_NAME_PARTS for part in qualname.split("."))
 
 
-def _compilable_vision_block_classes() -> tuple[type[nn.Module], ...]:
-    """Vision-tower block classes verified to compile per block on Spyre.
-
-    Compiled, the tower's TP all_reduces build their comms plan once; eager rebuilds
-    it on every call.
-    """
-    try:
-        from vllm.model_executor.models import pixtral
-    except ImportError:
-        return ()
-    return (pixtral.TransformerBlock,)
-
-
 def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
     block_lists = []
-    vision_block_classes = _compilable_vision_block_classes()
     for qualname, module in model.named_modules():
         if not isinstance(module, nn.ModuleList):
             continue
+        # Encoder-only towers never compile per block, even if a block's class name
+        # looks like attention (Qwen2_5_VLVisionAttention); a tower that compiles does
+        # so through `compile_vision_encoder`. Decoder lists are never named these.
+        if _is_vision_tower_path(qualname):
+            continue
         blocks = [b for b in module if not isinstance(b, PPMissingLayer)]
         if not blocks:
-            continue
-        # Other encoder-only towers stay eager even if a block's class name looks like
-        # attention (Qwen2_5_VLVisionAttention). Decoder lists are never named these.
-        if _is_vision_tower_path(qualname):
-            if all(isinstance(b, vision_block_classes) for b in blocks):
-                block_lists.append(module)
             continue
         # nn.Module.modules() yields the module itself, so a list of bare Attention
         # layers (Zamba2's dpa_list) would match and "compile" one opaque call per entry.
@@ -464,7 +448,7 @@ class _SpyreModelWrapper:
             return t
 
         kwargs = tree_map(_to_spyre_float, kwargs)
-        # Vision-tower ops outside compiled blocks run eager, so each Spyre op with a
+        # Vision-tower ops outside a compiled layer stack run eager, so each Spyre op with a
         # decomposition reaches it through torch-spyre's lazily-compiled PrivateUse1
         # kernel, which compiles without fullgraph. Decompositions built on for_each_tile
         # (SDPA since torch-spyre#4550) emit a scan whose while_loop lowering reads the
@@ -803,6 +787,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         uses_fp8 = self._model_has_spyre_fp8(cast(nn.Module, self.model))
         fullgraph = not uses_fp8
         model_name = type(self.model).__name__
+
+        # `embed_multimodal` runs outside both the block graphs and the whole-model graph.
+        if compile_vision_encoder(cast(nn.Module, self.model)):
+            logger.info("Wrapped the %s vision encoder's layer stack as one graph.", model_name)
 
         if granularity == "block":
             defeated_by = _block_sharing_defeated_by()
