@@ -203,6 +203,10 @@ in every mode, including `enforce_eager`, because its fp32 weight multiply has n
 eager form. `lm_head` is never in a block graph either — `compute_logits` is a separate call
 on the wrapper — so its projection compiles its own graph, over row widths warmup pads onto (see [Decoder compile buckets](../user_guide/configuration.md#decoder-compile-buckets)).
 
+Vision towers stay eager, except block classes in `_compilable_vision_block_classes`
+(Pixtral's `TransformerBlock`). At TP>1 their all_reduces then build the comms plan once
+instead of on every eager call. Each new image size compiles once.
+
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
 grows with layer count.
 
