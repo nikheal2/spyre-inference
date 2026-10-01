@@ -199,7 +199,7 @@ jobs:
         with:
           name: run-id
           path: run-id.txt
-          retention-days: 1
+          retention-days: 14
 
   # Pin the test-durations artifact this run's shard jobs weight their partition
   # by: one run id resolved once, so every shard of a suite reads identical

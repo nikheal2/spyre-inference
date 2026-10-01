@@ -183,6 +183,7 @@ jobs:
           echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' •', a['name']) for a in json.load(sys.stdin)]"
 
       - name: Download XML artifacts
+        id: download-artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -192,7 +193,13 @@ jobs:
           import json, os, subprocess, sys
           from pathlib import Path
 
-          artifacts = json.loads(os.environ['ARTIFACTS'])
+          # Only the JUnit reports and the id sidecars are read below. Skipping the rest
+          # (coverage, durations, failed-suite) keeps one broken download from failing the ingest.
+          ID_ARTIFACTS = {"run-id", "artifact-id"}
+          artifacts = [
+              a for a in json.loads(os.environ['ARTIFACTS'])
+              if a['name'].startswith("junit-") or a['name'] in ID_ARTIFACTS
+          ]
           repo  = os.environ['GITHUB_REPOSITORY']
           for a in artifacts:
               print(f"Downloading: {a['name']} (id={a['id']})")
@@ -221,21 +228,11 @@ jobs:
       # The orchestrator's threaded run_id, uploaded as an artifact because this workflow runs on
       # workflow_run and so cannot read the triggering run's inputs. Empty on a GHA-initiated run
       # or a manual re-ingest, in which case the ingest derives its own id from the run coordinate.
-      - name: Resolve orchestrator run_id
+      - name: Resolve threaded run_id
         id: resolve-run-id
         run: |
-          # Two producers upload the same value under different names: integration-tests.yaml
-          # writes "orchestrator-run-id", and _test_matrix.yaml (used by test_each_commit) writes
-          # "run-id". Both ride in via the download-every-artifact step above, so read whichever
-          # is present rather than adding a second API round-trip for one of them.
-          RID=""
-          for f in xml_artifacts/orchestrator-run-id/run-id.txt \
-                   xml_artifacts/run-id/run-id.txt; do
-            if [[ -f "$f" ]]; then
-              RID="$(tr -d '[:space:]' < "$f")"
-              [[ -n "$RID" ]] && break
-            fi
-          done
+          # _test_matrix.yaml uploads it as "run-id"; it rides in with the XML downloaded above.
+          RID="$(tr -d '[:space:]' < xml_artifacts/run-id/run-id.txt 2>/dev/null || true)"
           echo "Threaded run_id: ${RID:-<none, ingest will derive from the run coordinate>}"
           echo "run_id=${RID}" >> "${GITHUB_OUTPUT}"
 
