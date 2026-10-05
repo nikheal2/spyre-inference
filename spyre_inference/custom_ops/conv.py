@@ -14,11 +14,17 @@
 
 """Spyre-specific Conv2d implementation (Pixtral/Ministral vision patch embed).
 
-vLLM lowers a patch conv to im2col + GEMM, whose on-device reshape produces a
-sub-stick `copy_from_d2d` expression torch-spyre cannot lay out for patch grids
-coprime with the 64-wide stick. So run the real `F.conv2d` on-card instead, with
-the weight and input placed into explicit `SpyreTensorLayout`s. Layout tuples are
-derived from shapes, so any out-channel count and image size work.
+torch-spyre's direct conv2d lowering runs a conv natively on the card, but only
+for a 2- or 3-tap kernel over a whole number of 64-wide channel sticks. A patch
+embed (3 channels, 14x14 kernel) misses both, so it decomposes to
+`spyre::unfold`, which round-trips the image through the CPU.
+
+A patch conv (kernel == stride, no padding) is rewritten into one the direct path
+accepts: space-to-depth the image by ``b = k / 2`` (or ``k / 3``), so every
+``b x b`` pixel block becomes one pixel with ``C*b*b`` channels, zero-padded to a
+whole stick. The ``k``-tap conv over the image is then exactly a 2- (or 3-) tap,
+stride-2 (or 3) conv over the blocks, with the weight repacked the same way once
+at load. Tensors go channel-last so the channels land on the stick.
 """
 
 import torch
@@ -31,61 +37,69 @@ from .utils import convert
 
 logger = init_logger(__name__)
 
+_STICK = 64  # fp16 elements per 128-byte stick
+_DIRECT_KERNELS = (2, 3)  # kernel taps torch-spyre's direct conv2d lowering accepts
 
-def _layouts_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Whether the layout tuples below apply: one image, in-channels within a stick,
-    out-channels a whole number of sticks.
+Plan = tuple[tuple[int, int], tuple[int, int]]  # (repacked kernel, space-to-depth block)
 
-    True for a Pixtral patch embed, not for convs in general — and this class is
-    registered OOT for *every* `Conv2dLayer`, so fall back rather than assert.
+
+def _repack_plan(layer: Conv2dLayer) -> Plan | None:
+    """The repacked kernel and block size per axis, or None if `layer` cannot be
+    rewritten (not a patch conv, or a kernel with no 2 or 3 factor).
+
+    This class is registered OOT for *every* `Conv2dLayer`, so anything else keeps
+    the stock path.
     """
-    if x.dim() != 4 or weight.dim() != 4:
-        return False
-    b, c = x.shape[0], x.shape[1]
-    return b == 1 and c <= 64 and weight.shape[0] % 64 == 0
+    if not layer.enable_linear or any(d != 1 for d in layer.dilation):
+        return None
+    kernel = []
+    for k in layer.kernel_size:
+        tap = next((t for t in _DIRECT_KERNELS if k % t == 0), None)
+        if tap is None:
+            return None
+        kernel.append(tap)
+    kh, kw = kernel
+    return (kh, kw), (layer.kernel_size[0] // kh, layer.kernel_size[1] // kw)
 
 
-def _weight_layout(weight: torch.Tensor):
-    """SpyreTensorLayout for a conv weight (O, C, K1, K2), sticked on out-channels.
+def _packed_channels(in_channels: int, plan: Plan) -> int:
+    (_, _), (bh, bw) = plan
+    return -(-in_channels * bh * bw // _STICK) * _STICK
 
-    The stick walks the out-channel dim (host stride C*K1*K2), tiling it into O//64.
+
+def _pack_input(x: torch.Tensor, plan: Plan, channels: int) -> torch.Tensor:
+    """[N, C, H, W] -> channel-last [N, H', W', channels] of ``b x b`` pixel blocks.
+
+    Crops the border a stride-k conv never reads, so the repacked conv's windows
+    cover the width exactly (the direct path rejects a ragged width).
     """
-    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
-
-    o, c, k1, k2 = weight.shape
-    assert o % 64 == 0, f"conv out_channels {o} must be a multiple of the 64-wide stick"
-    return SpyreTensorLayout(
-        [k2, k1, o // 64, c, 64],
-        [1, k2, c * k1 * k2 * 64, k1 * k2, c * k1 * k2],
-        get_device_dtype(weight.dtype),
-    )
+    n, c, h, w = x.shape
+    (kh, kw), (bh, bw) = plan
+    rows, cols = h // (kh * bh) * kh, w // (kw * bw) * kw
+    x = x[:, :, : rows * bh, : cols * bw].reshape(n, c, rows, bh, cols, bw)
+    x = x.permute(0, 2, 4, 1, 3, 5).reshape(n, rows, cols, c * bh * bw)
+    return F.pad(x, (0, channels - c * bh * bw)).contiguous()
 
 
-def _input_layout(x: torch.Tensor):
-    """SpyreTensorLayout for a conv input (1, C, H, W), sticked on in-channels.
-
-    The stick walks the channel dim (host stride H*W), padding C up to a full stick.
-    """
-    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
-
-    b, c, h, w = x.shape
-    assert b == 1, f"conv input batch {b} != 1 (Pixtral feeds one image at a time)"
-    assert c <= 64, f"conv in_channels {c} must fit in one 64-wide stick"
-    return SpyreTensorLayout(
-        [w, h, 1, 1, 64],
-        [1, w, -1, c * h * w, h * w],
-        get_device_dtype(x.dtype),
-    )
+def _pack_weight(weight: torch.Tensor, plan: Plan, channels: int) -> torch.Tensor:
+    """[O, C, K1, K2] -> [channels, kh, kw, O], matching `_pack_input`'s channel
+    order (c, row-in-block, col-in-block) and sticked on out-channels."""
+    o, c = weight.shape[:2]
+    (kh, kw), (bh, bw) = plan
+    w = weight.reshape(o, c, kh, bh, kw, bw).permute(0, 1, 3, 5, 2, 4)
+    w = F.pad(w.reshape(o, c * bh * bw, kh, kw), (0, 0, 0, 0, 0, channels - c * bh * bw))
+    return w.permute(1, 2, 3, 0).contiguous()
 
 
 @Conv2dLayer.register_oot(name="Conv2dLayer")
 class SpyreConv2d(CompileOutermost, Conv2dLayer):
-    """Out-of-tree Conv2d for Spyre: `F.conv2d` on-card with explicit tiled layouts.
+    """Out-of-tree Conv2d for Spyre: a patch conv repacked onto torch-spyre's direct
+    conv2d lowering.
 
     Spyre needs static shapes, so the kernel recompiles per distinct (H, W). Past
     ``torch._dynamo.config.cache_size_limit`` (default 8) dynamo falls back to
-    eager, which is unvalidated for pre-laid-out tensors — bucket or resize images
-    if a workload uses many resolutions.
+    eager, which has no direct conv — bucket or resize images if a workload uses
+    many resolutions.
     """
 
     # Per-(H, W) recompiles are this layer's contract, so the compile guard must not
@@ -94,48 +108,50 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._plan = _repack_plan(self)
+        self._channels = _packed_channels(self.in_channels, self._plan) if self._plan else 0
         self._w_dev: torch.Tensor | None = None
 
-    @maybe_compile
-    def _conv_native(self, x: torch.Tensor, w: torch.Tensor, bias) -> torch.Tensor:
-        return F.conv2d(
-            x,
-            w,
-            bias,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-            groups=self.groups,
-        )
+    # force: the direct conv exists only as a compiled lowering, even under enforce_eager.
+    @maybe_compile(force=True)
+    def _conv_direct(self, x: torch.Tensor, w: torch.Tensor, bias) -> torch.Tensor:
+        assert self._plan is not None
+        out = F.conv2d(x.permute(0, 3, 1, 2), w.permute(3, 0, 1, 2), bias, stride=self._plan[0])
+        return out.permute(0, 2, 3, 1)
 
     def process_weights_after_loading(self) -> None:
-        """Place the patch-conv weight into its tiled layout once after model load."""
-        if self._w_dev is not None or self.weight.device.type != "spyre":
+        """Repack the patch-conv weight for the direct conv once after model load."""
+        if self._w_dev is not None or self._plan is None or self.weight.device.type != "spyre":
             return
         w_cpu = convert(self.weight.detach(), device="cpu")
-        self._w_dev = convert(w_cpu, device="spyre", device_layout=_weight_layout(w_cpu))
+        self._w_dev = convert(
+            _pack_weight(w_cpu, self._plan, self._channels), device=self.weight.device
+        )
 
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
         # `_forward_conv`, not `forward_native`: a patch embed sets `enable_linear`, so
-        # `forward_native` picks the unfold/reshape path this class exists to avoid.
+        # `forward_native` picks an unfold/reshape path Spyre cannot lower.
         if x.device.type != "spyre":
-            # The tiled layouts move a tensor onto the card; applying them to a
-            # CPU input is the opposite of what the caller asked for.
             return self._forward_conv(x)
-        if not _layouts_supported(x, self.weight):
+        if self._plan is None or x.dtype != torch.float16:
             logger.warning_once(
-                "Spyre conv2d: shape %s (weight %s) outside the tiled-layout "
-                "assumptions (batch 1, in_channels <= 64, out_channels %% 64 == 0); "
-                "falling back to F.conv2d without them.",
+                "Spyre conv2d: %s (kernel %s, stride %s, dtype %s) is not a patch conv "
+                "the direct conv2d lowering can take; falling back to F.conv2d.",
                 tuple(x.shape),
-                tuple(self.weight.shape),
+                self.kernel_size,
+                self.stride,
+                x.dtype,
             )
             return self._forward_conv(x)
-        logger.info_once("Spyre conv2d: on-card F.conv2d with tiled layouts")
-        # Via CPU: CPU->spyre is the tested entry path, and a device-side
-        # restickify would hit the same unsupported layout.
-        x_cpu = convert(x, device="cpu")
-        x_dev = convert(x_cpu, device="spyre", device_layout=_input_layout(x_cpu))
+        logger.info_once("Spyre conv2d: space-to-depth onto the direct conv2d lowering")
         assert self._w_dev is not None, "Conv weights must be prepared after model loading."
-        return self._conv_native(x_dev, self._w_dev, self.bias)
+        from torch_spyre._inductor import config as spyre_config
+
+        x_packed = _pack_input(convert(x, device="cpu"), self._plan, self._channels)
+        # Scoped so no other conv in the process changes path.
+        with spyre_config.patch(conv2d_direct_lowering=True):
+            out = self._conv_direct(convert(x_packed, device=x.device), self._w_dev, self.bias)
+        # NCHW view of the channel-last result; Pixtral's flatten(2).permute(0, 2, 1)
+        # turns it back into a contiguous [N, H*W, O] without a copy.
+        return out.permute(0, 3, 1, 2)
