@@ -282,6 +282,37 @@ def patch_patch_merger() -> None:
     )
 
 
+class _DefaultLayoutNorm(nn.Module):
+    """Materialize a default-layout input before Pixtral's pre-transformer norm."""
+
+    def __init__(self, norm: nn.Module) -> None:
+        super().__init__()
+        self.norm = norm
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "spyre":
+            device = x.device
+            x = convert(convert(x, device="cpu").contiguous(), device=device)
+        return self.norm(x)
+
+
+def patch_pre_transformer_norm(model: nn.Module) -> None:
+    """Reset the patch-conv layout before RMSNorm's fp32 accumulation.
+
+    The direct conv2d's output keeps its patch dimension on the device stick through
+    the flatten. RMSNorm's fp32 upcast inherits that stick, and its multiply then
+    pairs a staggered full operand with a STANDARD one whose stick is also the patch
+    dimension, which torch-spyre rejects ("Multi-arg pointwise with mixed EA"). A CPU
+    round trip after flattening materializes the logical ``[batch, patches, hidden]``
+    tensor in its default layout.
+    """
+    tower = getattr(model, "vision_encoder", None) or getattr(model, "vision_tower", None)
+    if tower is None or isinstance(tower.ln_pre, _DefaultLayoutNorm):
+        return
+    tower.ln_pre = _DefaultLayoutNorm(tower.ln_pre)
+    logger.info("Spyre: Pixtral pre-transformer norm input uses the default device layout.")
+
+
 def apply(model: torch.nn.Module, device: torch.device) -> None:
     """Install every Pixtral vision-tower workaround, in dependency order.
 
@@ -310,3 +341,4 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     patch_transformer_mask()
     patch_block_attention_mask()
     patch_patch_merger()
+    patch_pre_transformer_norm(model)
