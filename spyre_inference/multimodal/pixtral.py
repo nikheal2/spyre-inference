@@ -69,6 +69,11 @@ def install_rope_perm(model: nn.Module, device: torch.device) -> None:
     except ImportError:
         return
 
+    # The patched `Attention.forward` passes `perm` whenever the buffer exists, which
+    # only `patch_vision_rope_vit`'s replacement accepts.
+    if not getattr(pixtral.apply_rotary_emb_vit, "_spyre_patched", False):
+        raise RuntimeError("install_rope_perm requires patch_vision_rope_vit() to run first")
+
     for module in model.modules():
         if isinstance(module, pixtral.Attention) and not hasattr(module, _ROPE_PERM_BUFFER):
             perm = rope_perm_matrix("pair", module.head_dim, device)
@@ -81,8 +86,9 @@ def patch_vision_attention() -> None:
     At a patch count coprime with the 64 stick, stock SDPA either fails to restickify
     a batch-matmul operand or returns silently wrong values, so the padding is a
     correctness requirement. The body is upstream's non-xformers branch with only the
-    SDPA call swapped; `patch_vision_rope_vit` must run first because
-    `apply_rotary_emb_vit` is resolved by name at call time.
+    SDPA call swapped. `apply_rotary_emb_vit` is resolved by name at call time, so it
+    runs whichever rope is installed; on card that must be `patch_vision_rope_vit`'s,
+    since upstream's is complex.
     """
     try:
         from vllm.model_executor.models import pixtral
@@ -100,15 +106,17 @@ def patch_vision_attention() -> None:
         q = q.reshape(batch, patches, self.n_heads, self.head_dim)
         k = k.reshape(batch, patches, self.n_heads, self.head_dim)
         v = v.reshape(batch, patches, self.n_heads, self.head_dim)
-        # Resolves to the `patch_vision_rope_vit` replacement, which takes `perm`.
+        # Only `install_rope_perm` adds the buffer, and it requires the rope patch,
+        # whose replacement is the one that takes `perm`.
         perm = getattr(self, _ROPE_PERM_BUFFER, None)
-        q, k = pixtral.apply_rotary_emb_vit(q, k, freqs_cis=freqs_cis, perm=perm)  # ty: ignore[unknown-argument]
+        rope_kwargs = {} if perm is None else {"perm": perm}
+        q, k = pixtral.apply_rotary_emb_vit(q, k, freqs_cis=freqs_cis, **rope_kwargs)
         # [B, H, L, D] for SDPA.
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        # A Spyre mask was already padded by `patch_transformer_mask`.
-        out = padded_sdpa(q, k, v, mask, mask_is_padded=mask.device.type == "spyre")
+        # On card `patch_transformer_mask` has already padded it, which `padded_sdpa` sees.
+        out = padded_sdpa(q, k, v, mask)
         out = out.transpose(1, 2).reshape(batch, patches, self.n_heads * self.head_dim)
         out, _ = self.o_proj(out)
         return out
@@ -334,7 +342,7 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
             "Uninstall xformers in this environment."
         )
 
-    # Must precede the attention patch, which resolves apply_rotary_emb_vit by name.
+    # Must precede `install_rope_perm`, which raises without it.
     patch_vision_rope_vit()
     patch_vision_attention()
     install_rope_perm(model, device)

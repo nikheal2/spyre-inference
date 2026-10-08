@@ -201,7 +201,11 @@ def test_transformer_mask_patch_is_applied_and_idempotent():
 
 @pytest.mark.pixtral
 def test_install_rope_perm_registers_a_non_persistent_buffer():
-    from spyre_inference.multimodal.pixtral import install_rope_perm, rope_perm_matrix
+    from spyre_inference.multimodal.pixtral import (
+        install_rope_perm,
+        patch_vision_rope_vit,
+        rope_perm_matrix,
+    )
 
     attn = pixtral.Attention.__new__(pixtral.Attention)
     torch.nn.Module.__init__(attn)
@@ -209,6 +213,7 @@ def test_install_rope_perm_registers_a_non_persistent_buffer():
     model = torch.nn.Module()
     model.attention = attn
 
+    patch_vision_rope_vit()
     install_rope_perm(model, torch.device("cpu"))
     perm = attn.spyre_rope_perm
     assert torch.equal(perm, rope_perm_matrix("pair", 64, torch.device("cpu")))
@@ -216,6 +221,16 @@ def test_install_rope_perm_registers_a_non_persistent_buffer():
 
     install_rope_perm(model, torch.device("cpu"))
     assert attn.spyre_rope_perm is perm, "second call must be a no-op"
+
+
+@pytest.mark.pixtral
+def test_install_rope_perm_requires_the_rope_patch():
+    """The patched forward passes `perm` once the buffer exists, which upstream's
+    `apply_rotary_emb_vit` does not accept."""
+    from spyre_inference.multimodal.pixtral import install_rope_perm
+
+    with pytest.raises(RuntimeError, match="patch_vision_rope_vit"):
+        install_rope_perm(torch.nn.Module(), torch.device("cpu"))
 
 
 @pytest.mark.pixtral
@@ -576,6 +591,44 @@ def test_padded_keys_are_masked_off(seq, seq_pad):
     neg_inf = torch.finfo(torch.float16).min
     assert (m[:, :, :, seq:] == neg_inf).all(), "padded keys must be masked off"
     assert (m[:, :, :, :seq] == 0).all(), "real keys must be unmasked"
+
+
+def _qkv(seq):
+    torch.manual_seed(41)
+    return [torch.randn(1, 2, seq, HEAD_DIM, dtype=torch.float16) for _ in range(3)]
+
+
+@pytest.mark.pixtral
+def test_padded_sdpa_uses_a_prepadded_mask_as_is(monkeypatch):
+    """`patch_transformer_mask` pads outside the compiled block; `padded_sdpa` must not
+    pad that mask again."""
+    from spyre_inference.multimodal import utils
+
+    q, k, v = _qkv(67)
+    mask = torch.ones(67, 67, dtype=torch.bool).tril()
+    expected = utils.padded_sdpa(q, k, v, mask)
+    prepadded = utils._padded_attn_mask(mask, 1, 67, 128, torch.float16, torch.device("cpu"))
+
+    def _no_repad(*args):
+        raise AssertionError("an already padded mask was padded again")
+
+    monkeypatch.setattr(utils, "_padded_attn_mask", _no_repad)
+    torch.testing.assert_close(utils.padded_sdpa(q, k, v, prepadded), expected)
+
+
+@pytest.mark.pixtral
+@pytest.mark.parametrize("seq", [64, 67])
+def test_padded_sdpa_pads_a_mask_that_was_not_prepadded(seq):
+    """A mask already on `q`'s device but never padded must still be padded."""
+    from spyre_inference.multimodal.utils import padded_sdpa
+
+    q, k, v = _qkv(seq)
+    bool_mask = torch.ones(seq, seq, dtype=torch.bool).tril()
+    additive = torch.zeros(1, 1, seq, seq, dtype=torch.float16).masked_fill(
+        ~bool_mask, torch.finfo(torch.float16).min
+    )
+
+    torch.testing.assert_close(padded_sdpa(q, k, v, additive), padded_sdpa(q, k, v, bool_mask))
 
 
 # ---------------------------------------------------------------------------
