@@ -51,6 +51,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.pooling_params import PoolingParams
@@ -83,6 +84,7 @@ from spyre_inference.custom_ops.mlp_pad import (
     verify_padded_intermediate_size,
 )
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
+from spyre_inference.models import check_spyre_model
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
 from spyre_inference.multimodal import apply_multimodal_patches
@@ -680,6 +682,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.model = model_loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
+        check_spyre_model(self.model, get_model_architecture(self.model_config)[1])
         self.model_memory_usage = 0  # No GPU memory profiling for Spyre
 
         # Cases appearing in GPUModelRunner.
@@ -1193,6 +1196,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
             EncoderRectPlan,
             build_encoder_plan,
+            encoder_inline_active,
             publish_encoder_grid,
         )
 
@@ -1209,6 +1213,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         groups = per_layer if isinstance(per_layer, list) else [per_layer]
         plan = None
         seen: set[int] = set()
+        causal: set[bool] = set()
         for group in groups:
             if not isinstance(group, dict):
                 continue
@@ -1216,9 +1221,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 if id(md) in seen or not hasattr(md, "encoder_plan"):
                     continue
                 seen.add(id(md))
+                encoder_md = cast(SpyreAttentionMetadata, md)
+                causal.add(encoder_md.apply_causal_mask)
                 if md.encoder_plan is None:
-                    encoder_md = cast(SpyreAttentionMetadata, md)
-                    plan = self._forced_encoder_plan() or build_encoder_plan(
+                    plan = self._forced_encoder_plan(encoder_md) or build_encoder_plan(
                         encoder_md,
                         rectangles=rectangles,
                         width_cap_for=self._encoder_width_caps,
@@ -1234,6 +1240,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 else:
                     plan = md.encoder_plan
 
+        # The traced rectangle reads one published mask in every inlined layer, so groups
+        # that differ in causality cannot share it.
+        if isinstance(plan, EncoderRectPlan) and encoder_inline_active() and len(causal) > 1:
+            raise NotImplementedError(
+                "Encoder attention groups mix causal and bidirectional masks; the traced "
+                "rectangle path publishes one mask for all of them."
+            )
         # A rectangle's mask shape is how a traced forward reads the grid; the ragged path
         # publishes nothing and so stays opaque.
         publish_encoder_grid(plan)
@@ -1253,13 +1266,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 )
         return out
 
-    def _forced_encoder_plan(self):
+    def _forced_encoder_plan(self, md: SpyreAttentionMetadata):
         """Warmup's declared rectangle, ignoring the dummy batch's own shape.
 
         Upstream's ``_dummy_run`` splits its tokens evenly over ``max_num_seqs``, so it only
         ever lands on the shortest rectangle. Lengths of exactly ``extent`` make
         ``sum(query_lens)`` the body row count, which keeps ``_preprocess``'s expansion an
-        identity.
+        identity. The mask takes ``md``'s causality, as the group's real plans do.
         """
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
             EncoderRectPlan,
@@ -1273,7 +1286,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             extent=extent,
             width=width,
             mask=convert(
-                encoder_key_pad_mask(extent, [extent] * width, self._model_dtype()),
+                encoder_key_pad_mask(
+                    extent, [extent] * width, self._model_dtype(), md.apply_causal_mask
+                ),
                 self._spyre_device,
             ),
             query_lens=[extent] * width,
@@ -1627,11 +1642,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         out = super()._preprocess(*args, **kwargs)
         grid = self._encoder_grid
+        # A model that masks multimodal rows after embedding (CLIP, models/clip.py)
+        # needs its mask in the same row layout as the embeddings.
+        align_token_mask = getattr(self.model, "spyre_align_token_mask", None)
         if grid is None:
+            if align_token_mask is not None:
+                scheduler_output = args[0] if args else kwargs["scheduler_output"]
+                align_token_mask(scheduler_output.total_num_scheduled_tokens, None)
             return self._offset_preprocess_positions(out)
         input_ids, inputs_embeds, positions, *rest = out
         extent, width, query_lens = grid
         num_tokens = sum(query_lens)
+        if align_token_mask is not None:
+            align_token_mask(num_tokens, grid)
         hf_config = getattr(self.model_config, "hf_config", None)
         position_offset = roberta_position_delta(hf_config)
 

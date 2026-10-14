@@ -53,7 +53,9 @@ Issues = "https://github.com/torch-spyre/spyre-inference/issues"
 spyre_inference = "spyre_inference:register"
 
 [project.entry-points."vllm.general_plugins"]
-spyre_inference_ops = "spyre_inference:register_ops"
+# Same name as the platform plugin, so `VLLM_PLUGINS=spyre_inference` also registers the
+# model adaptations in every process, before vLLM's first model lookup.
+spyre_inference = "spyre_inference:register_ops"
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)
