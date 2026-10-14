@@ -255,8 +255,12 @@ on the wrapper — so its projection compiles its own graph, over row widths war
 
 Vision towers stay eager, except block classes in `_compilable_vision_block_classes`
 (Pixtral's `TransformerBlock`). At TP>1 their all_reduces then build the comms plan once
-instead of on every eager call. Each new image size compiles once, on the first request
-that brings it: warmup runs no image, so unlike the buckets above it is not pre-compiled.
+instead of on every eager call. The compile key is the encoder batch's total patch count:
+`VisionTransformer.forward` concatenates every image in one `embed_multimodal` call into a
+single sequence, and blocks compile with `dynamic=False`. Each new total compiles on the
+first request that brings it, after the compile guard has armed, since warmup runs no image.
+The recompile limits are raised for torch-spyre's per-op compiles, so the number of keys is
+unbounded until image lengths are padded onto a fixed set and warmed.
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
 grows with layer count.

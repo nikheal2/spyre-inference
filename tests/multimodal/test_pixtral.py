@@ -60,6 +60,7 @@ def restore_pixtral(monkeypatch):
     )
     monkeypatch.setattr(pixtral.Attention, "forward", pixtral.Attention.forward)
     monkeypatch.setattr(pixtral.PatchMerger, "forward", pixtral.PatchMerger.forward)
+    monkeypatch.setattr(pixtral.Transformer, "forward", pixtral.Transformer.forward)
     # The block-mask patch lives on transformers, not vllm.
     from transformers.models.pixtral import modeling_pixtral
 
@@ -753,6 +754,59 @@ def test_padded_vision_attention_matches_cpu_on_spyre(tp_group, num_patches):
     device = torch.device("spyre")
     layer = layer.to(device)
     actual = pixtral.Attention.forward(layer, x.to(device), mask, freqs_cis.to(device))
+
+    assert actual.shape == expected.shape == (1, num_patches, HIDDEN_SIZE)
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.pixtral
+@pytest.mark.parametrize("num_patches", [64, CORRUPTING_PATCHES])
+def test_compiled_vision_attention_matches_cpu_on_spyre(tp_group, num_patches):
+    """The vision attention compiled as the runner compiles a block must equal CPU.
+
+    The mask is padded and uploaded outside the graph, as `patch_transformer_mask`
+    does. At `CORRUPTING_PATCHES` `padded_sdpa` then pads q/k/v inside the graph
+    against that pre-padded mask, the path a compiled tower serves every unaligned
+    image through.
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    from spyre_inference.multimodal.pixtral import (
+        install_rope_perm,
+        patch_vision_attention,
+        patch_vision_rope_vit,
+    )
+    from spyre_inference.multimodal.utils import _padded_attn_mask, align_up
+
+    args = _vision_args()
+    layer = pixtral.Attention(args, disable_tp=True).to(torch.float16)
+    torch.manual_seed(31)
+    for param in layer.parameters():
+        param.data.normal_(std=0.02)
+    _finish_weight_loading(layer)
+
+    patch_vision_rope_vit()
+    patch_vision_attention()
+
+    positions = _positions(num_patches)
+    table = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())
+    freqs_cis = table[(positions[:, 0], positions[:, 1])]
+
+    torch.manual_seed(37)
+    x = torch.randn(1, num_patches, HIDDEN_SIZE, dtype=torch.float16)
+    mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
+
+    expected = pixtral.Attention.forward(layer, x, mask, freqs_cis)
+
+    device = torch.device("spyre")
+    layer = layer.to(device)
+    install_rope_perm(layer, device)
+    layer.compile(backend="inductor", fullgraph=True, dynamic=False)
+    padded_mask = _padded_attn_mask(
+        mask, 1, num_patches, align_up(num_patches), torch.float16, device
+    )
+    actual = layer(x.to(device), padded_mask, freqs_cis.to(device))
 
     assert actual.shape == expected.shape == (1, num_patches, HIDDEN_SIZE)
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)

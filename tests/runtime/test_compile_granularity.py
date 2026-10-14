@@ -410,9 +410,50 @@ def test_vlm_compiles_pixtral_vision_blocks_but_not_other_towers() -> None:
     decoder_layers = model.language_model.layers
     assert _repeated_block_lists(model) == [pixtral_layers, decoder_layers]
 
-    assert _runner(model)._compile_blocks() == 5
+    runner = _runner(model)
+    assert runner._compile_blocks() == 3
+    assert runner._compiled_tower_blocks == 2
     assert all(block._compiled_call_impl is not None for block in pixtral_layers)
     assert all(block._compiled_call_impl is None for block in model.vision_model.layers)
+
+
+def test_pixtral_tower_does_not_suppress_the_whole_model_fallback(monkeypatch) -> None:
+    """A decoder with no recognised blocks (MLA) still takes the whole-model path."""
+    from vllm.model_executor.models import pixtral
+
+    compiled: list[object] = []
+    monkeypatch.setattr(torch, "compile", lambda m, **kw: compiled.append(m) or m)
+
+    def pixtral_block() -> nn.Module:
+        block = pixtral.TransformerBlock.__new__(pixtral.TransformerBlock)
+        nn.Module.__init__(block)
+        return block
+
+    class MLADecoderLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = nn.Linear(4, 4)
+
+    class VLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_encoder = nn.Module()
+            self.vision_encoder.transformer = nn.Module()
+            self.vision_encoder.transformer.layers = nn.ModuleList(
+                [pixtral_block() for _ in range(2)]
+            )
+            self.language_model = nn.Module()
+            self.language_model.layers = nn.ModuleList([MLADecoderLayer() for _ in range(3)])
+
+    model = VLM()
+    runner = _runner(model)
+    runner._compile_for_spyre()
+
+    assert runner._compiled_tower_blocks == 2
+    assert model in compiled
+    assert all(
+        block._compiled_call_impl is not None for block in model.vision_encoder.transformer.layers
+    )
 
 
 def test_compile_blocks_wraps_every_block_in_place() -> None:
