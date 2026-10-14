@@ -87,13 +87,14 @@ def _generate(
 
 def _generate_image_prompt(tp: int) -> list[list[int]]:
     """Greedy token ids for one Pixtral image prompt, compiled, at `tp` cards."""
+    from vllm import LLM, SamplingParams
+
     from tests.e2e.test_multimodal import (
         MAX_MODEL_LEN,
         MODEL,
         _conversation,
         _synthetic_image_data_uri,
     )
-    from vllm import LLM, SamplingParams
 
     llm = LLM(
         model=MODEL,
