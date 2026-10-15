@@ -16,18 +16,19 @@
 
 A vision model subclasses its upstream class with ``SpyreVisionEncoderMixin`` ahead of it and
 implements the hooks in the mixin's first section; everything else (the protocol, warmup,
-serving) is shared. The encoder runs in three graphs, compiled once per upstream token budget:
+serving) is shared. The encoder runs in three steps at each upstream token budget's static shape;
+only the layers are compiled:
 
     host:   vision_inputs     items -> buffers, one entry per patch
-    graph:  vision_embed      patches -> the blocks' input embeddings
+    eager:  vision_embed      patches -> the blocks' input embeddings
     graph:  vision_blocks     the repeated encoder layers
-    graph:  vision_project    merge or pool, then project into the text model's space
+    eager:  vision_project    merge or pool, then project into the text model's space
 
 Units follow upstream: an *image token* is one position of ``vision_project``'s output, the unit
 of the token budgets, and every image token is ``patches_per_token`` patches.
 
 The image tokens then merge into the prompt embeddings in ``embed_input_ids``: placed on the
-host, combined on the card by ``vision_merge``, a fourth graph compiled per token bucket.
+host, combined on the card by ``vision_merge``, eager at each token bucket.
 """
 
 from __future__ import annotations
@@ -224,20 +225,17 @@ class SpyreVisionEncoderMixin:
     max_tokens_per_item: int
 
     def compile_vision_graphs(self) -> None:
-        """Compile ``vision_embed``, every layer, ``vision_project`` and ``vision_merge`` with
-        static shapes and register them with the compile guard. Called at warmup; a repeat call
-        is a no-op."""
-        if hasattr(self, "_spyre_vision_embed"):
+        """Compile every layer with static shapes and register it with the compile guard.
+        Called at warmup; a repeat call is a no-op.
+
+        ``vision_embed``, ``vision_project`` and ``vision_merge`` stay eager: the budgets fix
+        their shapes too, so warmup builds torch-spyre's per-op kernels for them."""
+        if getattr(self, "_spyre_vision_compiled", False):
             return
-        compile_kwargs: dict[str, Any] = dict(backend="inductor", fullgraph=True, dynamic=False)
-        self._spyre_vision_embed = torch.compile(self.vision_embed, **compile_kwargs)
-        self._spyre_vision_project = torch.compile(self.vision_project, **compile_kwargs)
-        self._spyre_vision_merge = torch.compile(self.vision_merge, **compile_kwargs)
-        for name in ("vision_embed", "vision_project", "vision_merge"):
-            compile_guard.watch(getattr(self, f"_spyre_{name}"), f"{type(self).__name__}.{name}")
         for block in self.vision_blocks():
-            block.compile(**compile_kwargs)
+            block.compile(backend="inductor", fullgraph=True, dynamic=False)
             compile_guard.watch(block, f"{type(block).__name__} (vision block)")
+        self._spyre_vision_compiled = True
 
     # --- 4. Upstream's SupportsEncoderCudaGraph, in the order the manager calls it ---
 
@@ -299,13 +297,11 @@ class SpyreVisionEncoderMixin:
     def encoder_cudagraph_forward(
         self, inputs: dict[str, torch.Tensor], path: str = "default"
     ) -> torch.Tensor:
-        """Run the three graphs on padded device buffers and return the output on the host.
+        """Run the three steps on padded device buffers and return the output on the host.
 
         One copy to the host here: device views at offsets off the stick read as offset 0
         (torch-spyre#3770), and the embedding merge runs on the host anyway.
         """
-        embed = getattr(self, "_spyre_vision_embed", self.vision_embed)
-        project = getattr(self, "_spyre_vision_project", self.vision_project)
         blocks = self.vision_blocks()
         depth = len(blocks) + 1
         if any(not -depth <= t < depth for t in self.vision_taps):
@@ -314,14 +310,14 @@ class SpyreVisionEncoderMixin:
             )
         wanted = {t % depth for t in self.vision_taps}
 
-        x, block_kwargs = embed(inputs)
+        x, block_kwargs = self.vision_embed(inputs)
         hidden = {0: x} if 0 in wanted else {}
         for i, block in enumerate(blocks, start=1):
             x = self.vision_call_block(block, x, block_kwargs)
             if i in wanted:
                 hidden[i] = x
         taps = [hidden[t % depth] for t in self.vision_taps]
-        return convert(project(x, taps), device="cpu")
+        return convert(self.vision_project(x, taps), device="cpu")
 
     def encoder_eager_forward(
         self, mm_kwargs: dict[str, Any], path: str = "default"
@@ -403,8 +399,7 @@ class SpyreVisionEncoderMixin:
             )
         image = torch.zeros(text.shape, dtype=text.dtype)
         image[mask] = rows.to(text.dtype)
-        merge = getattr(self, "_spyre_vision_merge", self.vision_merge)
-        return merge(
+        return self.vision_merge(
             text, convert(image, device=text.device), convert(mask[:, None], device=text.device)
         )
 

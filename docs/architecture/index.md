@@ -284,9 +284,11 @@ upstream's `SupportsEncoderCudaGraph` protocol, so the bucketing is upstream's:
 `EncoderCudaGraphManager` picks power-of-two token budgets, packs a step's images into them,
 pads the inputs and splits the output per image. `SpyreEncoderGraphManager`
 (`v1/worker/spyre_encoder_graph.py`) replaces only capture and replay: capturing a budget
-compiles the encoder at that static shape during warmup, and replay uploads the padded
-inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention
-kernels, so the compile guard covers the vision graphs. Upstream's
+runs the encoder at that static shape during warmup, and replay uploads the padded
+inputs and runs it again. Only the encoder layers are compiled; `vision_embed`,
+`vision_project` and `vision_merge` run eager, and since the budgets fix their shapes too,
+warmup builds their per-op kernels. Warmup runs every budget, largest first, after the attention
+kernels, so the compile guard covers the vision path. Upstream's
 `GPUModelRunner._execute_mm_encoder` already sends encoder work through the manager, and
 the embedding merge, encoder cache and decoder are unchanged.
 
@@ -305,9 +307,9 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 | `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, one-hot segments, positions; `M²`; text hidden size |
 | `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image |
 | `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major patches, segments, RoPE positions |
-| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, image mask |
-| `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` |
-| `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter |
+| `vision_embed(values)` | yes | eager: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, image mask |
+| `vision_blocks()` | yes | compiled: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` |
+| `vision_project(x, taps)` | yes | eager: merge or pool, then project into the text space | projector norm, patch merge, adapter |
 | `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default |
 | `vision_taps` | no | intermediate hidden states passed to `vision_project` | none |
 | `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default |

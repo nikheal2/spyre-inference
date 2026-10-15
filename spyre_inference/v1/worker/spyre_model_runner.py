@@ -1022,7 +1022,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _record_vision_graphs(self) -> None:
-        """Compile the vision encoder at every budget; serving then runs through the manager."""
+        """Compile the vision blocks and warm the encoder at every budget; serving then runs
+        through the manager."""
         model = self._compiled_vision_model()
         if model is None:
             return
@@ -1034,7 +1035,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self._warmup_vision_merge(model)
 
     def _warmup_vision_merge(self, model: SpyreVisionEncoderMixin) -> None:
-        """Compile ``vision_merge`` at every token bucket an image step can land on."""
+        """Run ``vision_merge`` at every token bucket an image step can land on, so its per-op
+        kernels are built before serving."""
         bucketer = self.spyre_shape_bucketer
         if bucketer is None:
             return
@@ -1050,7 +1052,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             wrapper.embed_input_ids(
                 torch.zeros(size, dtype=torch.int32), image_rows, is_multimodal=is_multimodal
             )
-        logger.info("Vision merge compiled at every token bucket.")
+        logger.info("Vision merge warmed at every token bucket.")
 
     def _compiled_vision_model(self) -> SpyreVisionEncoderMixin | None:
         if not self.supports_mm_inputs or self.compilation_config.mode is CompilationMode.NONE:

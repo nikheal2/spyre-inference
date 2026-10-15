@@ -292,15 +292,21 @@ def test_out_of_range_tap_fails_instead_of_aliasing():
         del type(model).vision_taps
 
 
-def test_compile_vision_graphs_twice_keeps_the_first_compile():
-    """A retried warmup must not re-wrap the graphs it already compiled."""
+def test_compile_vision_graphs_compiles_only_the_blocks(monkeypatch):
+    compiled: list[object] = []
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: compiled.append(fn) or fn)
     model = _FakeVisionModel(num_blocks=2)
     model.compile_vision_graphs()
-    embed, project = model._spyre_vision_embed, model._spyre_vision_project
+    # nn.Module.compile goes through torch.compile, once per block and for nothing else.
+    assert [fn.__self__ for fn in compiled] == list(model.blocks)
+
+
+def test_compile_vision_graphs_twice_keeps_the_first_compile():
+    """A retried warmup must not re-wrap the blocks it already compiled."""
+    model = _FakeVisionModel(num_blocks=2)
+    model.compile_vision_graphs()
     blocks = [b._compiled_call_impl for b in model.blocks]
     model.compile_vision_graphs()
-    assert model._spyre_vision_embed is embed
-    assert model._spyre_vision_project is project
     assert [b._compiled_call_impl for b in model.blocks] == blocks
 
 
