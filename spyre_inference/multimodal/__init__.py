@@ -17,7 +17,8 @@
 One module per architecture, each exposing `apply(model, device)`. These monkeypatch
 upstream vLLM model code, unlike `custom_ops/`, which registers out-of-tree
 implementations by layer class. Architectures migrated to a registered subclass on
-`models._vision_encoder.SpyreVisionEncoderMixin` (native Pixtral) are not patched here.
+`models._vision_encoder.SpyreVisionEncoderMixin` (native Pixtral, Gemma 4) are not patched
+here.
 """
 
 import torch
@@ -25,7 +26,6 @@ import torch
 from . import (
     blip2,
     clip,
-    gemma4_vision,
     granite4_vision,
     pixtral_hf,
     siglip,
@@ -50,9 +50,7 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
         # Dispatch by tower class name: the `vision_tower` attribute is shared
         # across architectures, so it does not name the model family.
         tower_cls = type(vision_tower).__name__
-        if tower_cls == "Gemma4VisionModel":
-            gemma4_vision.apply(model, device)
-        elif tower_cls == "SiglipVisionModel":
+        if tower_cls == "SiglipVisionModel":
             # Granite4Vision uses a SigLIP tower. All three patches are
             # needed together and none apply to any other architecture.
             siglip.apply(model, device)
