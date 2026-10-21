@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gemma 4 with a compiled, bucketed vision encoder (tensor math from hf-adapters#495).
-
-The tower is stock transformers code, so its attention and norm instances, not classes, switch
-to Spyre subclasses. Video is rejected: upstream runs it eagerly through the same tower.
-"""
+"""Gemma 4 with its vision encoder compiled per token budget (math from hf-adapters#495)."""
 
 from __future__ import annotations
 
@@ -60,8 +56,7 @@ _MASK_MIN = torch.finfo(torch.float16).min / 2
 def gemma4_rope_tables(
     inv_freq: torch.Tensor, size: int, padded_head_dim: int, attention_scaling: float = 1.0
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-axis cos and signed-sin tables over `_pad_qk_linear`'s `[X, Y, 0 | X, Y, 0]` head:
-    a patch at ``(x, y)`` rotates by ``cos[0, x] + cos[1, y]``, ``sin[0, x] + sin[1, y]``."""
+    """`[2, size, D]` cos/sin over `[X, Y, 0 | X, Y, 0]`; patch (x, y) sums rows [0, x], [1, y]."""
     quarter = inv_freq.shape[0]
     half = padded_head_dim // 2
     angles = torch.arange(size, dtype=torch.float32)[:, None] * inv_freq.float()
@@ -81,10 +76,9 @@ def gemma4_rope_tables(
     return cos, sin
 
 
+# Not a module, so the model's move to the card leaves it on the host.
 @dataclass
 class _VisionTail:
-    """Not a module, so the model's move to the card leaves it on the host."""
-
     scale: float
     std_bias: torch.Tensor | None
     std_scale: torch.Tensor | None
@@ -119,16 +113,14 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
     vision_max_items_per_call = STICK - 1
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        # Transformers builds the tower at vision_config.dtype (the checkpoint's bf16), not the
-        # model's fp16; Spyre stores both as one 16-bit format, but a logical bf16 operand
-        # promotes fp16 math to fp32 inside a graph. Loading converts the checkpoint into it.
+        # Transformers builds the tower at vision_config.dtype (bf16), and bf16 + fp16 in a graph
+        # promotes to an fp32 convert Spyre cannot lay out; loading converts the checkpoint.
         model_config = vllm_config.model_config
         model_config.hf_config.vision_config.dtype = model_config.dtype
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._init_spyre_vision()
 
     def _init_spyre_vision(self) -> None:
-        """Separate from ``__init__`` so tests can run it without a ``VllmConfig``."""
         vision_config = self.config.vision_config
         self._pool = vision_config.pooling_kernel_size
         self.patches_per_token = self._pool**2
@@ -161,8 +153,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
                 setattr(layer, name, norm)
 
     def process_weights_after_loading(self) -> None:
-        """Rebuild the vision weights in the graphs' layouts, so one copy of each reaches the
-        card. Runs on the host, after the Spyre linears store their weights transposed."""
+        """Rebuild the vision weights in place, in the graphs' layouts, on the host."""
         tower = self.vision_tower
         if not isinstance(tower, modeling_gemma4.Gemma4VisionModel):
             return
@@ -174,11 +165,10 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
 
         embedder = tower.patch_embedder
         weight = _linear_weight(embedder.input_proj).float()
-        # The model's dtype, which __init__ builds the tower in: a bf16 + fp16 add in a graph
-        # goes through an fp32 convert whose layout Spyre cannot combine with the other operand.
+        # Not the tower's dtype: see __init__.
         dtype = cast(torch.dtype, self.model_dtype)
         weight_t = F.pad(weight, (0, self._patch_width - weight.shape[1])).t().contiguous()
-        # A plain holder, not the linear: nothing runs it, so no Spyre-layout copy goes to the card.
+        # A plain holder: nothing runs the linear, so no second copy of it goes to the card.
         embedder.input_proj = nn.Module()
         embedder.input_proj.weight = nn.Parameter(weight_t.to(dtype), requires_grad=False)
 
@@ -221,8 +211,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         clone: bool = False,
         batch_mm_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        """The pool's scale, standardize and ``embed_vision``, in fp32 on the host as upstream
-        runs them: the ``sqrt(hidden_size)`` scale can leave the fp16 range."""
+        """The tail in fp32 on the host, as upstream: its scale can overflow fp16."""
         num_tokens = sum(per_item_out_tokens[i] for i in indices)
         tail = self._spyre_vision_tail
         x = outputs["default"][:num_tokens].float() * tail.scale
@@ -240,8 +229,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         ]
 
     def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """The processor makes both grid sides divide by the pooling kernel, so laid out
-        offset-major, the pool is a sum over offset groups."""
+        """Valid patches laid out offset-major, so the pool is a sum over offset groups."""
         k = self._pool
         patches, segments, xs, ys = [], [], [], []
         for i, (pixel_values, positions) in enumerate(_images(mm_kwargs)):

@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``SpyreGemma4ForConditionalGeneration``'s vision pipeline against the stock tower.
-
-Each rewrite can be wrong while still giving plausible numbers, so the load-bearing tests
-compare against stock transformers on CPU; the on-card twins skip without a device. The
-padding helpers it shares with ``multimodal/gemma4_vision.py`` are tested there.
-"""
+"""``SpyreGemma4ForConditionalGeneration``'s vision pipeline against the stock tower."""
 
 import inspect
 from types import SimpleNamespace
@@ -71,20 +66,14 @@ def _tower_config(num_layers: int = 2, standardize: bool = False):
 
 
 def _position_ids(num_patches: int = NUM_PATCHES) -> torch.Tensor:
-    """`[1, num_patches, 2]` (x, y) patch coordinates, as the encoder feeds them."""
     side = 8
     xs = torch.arange(side).repeat(side)[:num_patches]
     ys = torch.arange(side).repeat_interleave(side)[:num_patches]
     return torch.stack([xs, ys], dim=-1).unsqueeze(0)
 
 
+# `_pad_qk_linear`'s remap on activations, written out so the rope check is independent of it.
 def _pad_activation_quarters(x: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
-    """The `_pad_qk_linear` channel remap, applied to activations instead of weights.
-
-    Kept in the test rather than imported: it mirrors what the padded q_proj weight
-    does to its output, so writing it out independently is what makes the rope
-    equivalence check below meaningful.
-    """
     quarter = orig // 4
     half = padded // 2
     out = torch.zeros((*x.shape[:-1], padded), dtype=x.dtype)
@@ -104,11 +93,6 @@ def _unpad_activation_quarters(padded: torch.Tensor, orig: int, padded_dim: int)
     out[..., quarter : 2 * quarter] = padded[..., half : half + quarter]
     out[..., 3 * quarter :] = padded[..., half + quarter : half + 2 * quarter]
     return out
-
-
-# ---------------------------------------------------------------------------
-# The pipeline against the stock tower
-# ---------------------------------------------------------------------------
 
 
 def _stock_modules(config) -> tuple[nn.Module, nn.Module]:
@@ -134,7 +118,6 @@ def _stock_modules(config) -> tuple[nn.Module, nn.Module]:
 
 
 def _image(hp: int, wp: int, pad: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """As the processor emits it: row-major patches, then ``pad`` patches at ``(-1, -1)``."""
     generator = torch.Generator().manual_seed(seed)
     n = hp * wp
     pixel_values = torch.rand(n + pad, 3 * PATCH * PATCH, generator=generator)
@@ -167,7 +150,6 @@ def _reference(config, images) -> list[torch.Tensor]:
 
 
 def _built_model(config):
-    """As constructed, before weights load."""
     from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
 
     model = SpyreGemma4ForConditionalGeneration.__new__(SpyreGemma4ForConditionalGeneration)
@@ -213,8 +195,7 @@ def test_pipeline_matches_stock(standardize, num_images):
 
 
 def test_padding_does_not_leak_into_images():
-    """Budget padding must not change any image's tokens: padding slots have their own
-    segment, and each offset group is padded separately."""
+    """Padding slots have their own segment, and each offset group is padded separately."""
     config = _tower_config(num_layers=1)
     model = _spyre_model(config)
     mm_kwargs = _mm_kwargs(_images())
@@ -236,8 +217,7 @@ def test_padding_does_not_leak_into_images():
 
 
 def test_offset_major_sum_matches_the_stock_pooler():
-    """Summing the offset groups of a k-divisible grid, scaled, is stock's position-driven
-    average with its ``sqrt(hidden_size)`` scale."""
+    """Summed offset groups, scaled, equal stock's position-driven average."""
     from spyre_inference.models._vision_encoder import offset_major
 
     config = _tower_config()
@@ -284,8 +264,7 @@ def test_gqa_tower_is_rejected():
 
 
 def test_tower_classes_stay_stock_and_weight_names_are_kept():
-    """Only instances switch: the transformers classes are shared process-wide. Names are
-    checked as constructed, which is when the checkpoint loads into them."""
+    """Only instances switch; names are checked as constructed, when the checkpoint loads."""
     from spyre_inference.multimodal.gemma4_vision import (
         SpyreGemma4RMSNorm,
         SpyreGemma4VisionAttention,
@@ -307,9 +286,7 @@ def test_tower_classes_stay_stock_and_weight_names_are_kept():
 
 
 def test_spyre_layers_are_constructed_and_keep_upstreams_linears():
-    """Built through their constructors, not a ``__class__`` swap, so constructor state (the
-    RoPE swap buffer) exists before weights load; the projections stay the modules upstream
-    already replaced with vLLM linears."""
+    """Not a ``__class__`` swap: constructor state exists before weights load."""
     from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
 
     config = _tower_config(num_layers=2)
@@ -344,9 +321,7 @@ def test_process_weights_after_loading_pads_every_layer():
 
 
 def test_loaded_vision_weights_reach_the_card_once():
-    """The patch projection becomes the graph's layout under its own name, and the stock
-    position table and ``embed_vision``, which live on in the gather tables and the host
-    tail, are dropped."""
+    """The stock position table and ``embed_vision`` live on in the gather tables and tail."""
     from spyre_inference.multimodal.utils import align_up
 
     model = _spyre_model(_tower_config(num_layers=1))
@@ -361,9 +336,7 @@ def test_loaded_vision_weights_reach_the_card_once():
 
 
 def test_graph_inputs_take_the_model_dtype_not_the_towers():
-    """Transformers builds the tower at the checkpoint's ``vision_config`` dtype (bf16) while
-    the model runs fp16. A bf16 gather row added to the fp16 patch matmul promotes through an
-    fp32 convert that Spyre cannot lay out, so every input of ``vision_embed`` must be fp16."""
+    """Even from a bf16 tower: bf16 + fp16 in a graph promotes to fp32, which Spyre rejects."""
     model = _built_model(_tower_config(num_layers=1))
     model.vision_tower.to(torch.bfloat16)
     model.process_weights_after_loading()
@@ -380,10 +353,7 @@ def test_graph_inputs_take_the_model_dtype_not_the_towers():
 
 
 def test_tower_is_built_in_the_model_dtype(monkeypatch):
-    """The checkpoint's ``vision_config`` says bf16, which Spyre stores as fp16 anyway; the
-    tower has to be built fp16 so no logical bf16 operand reaches a graph. Checks both that
-    ``__init__`` sets the dtype before upstream builds the tower, and that transformers builds
-    every tower parameter at it."""
+    """Set before upstream builds the tower, and transformers builds every parameter at it."""
     from transformers import AutoModel
 
     from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
@@ -439,8 +409,7 @@ def test_registry_resolves_to_spyre_class_and_keeps_processor():
 
 
 def test_construction_reaches_upstream_init_and_protocol():
-    """``super().__init__`` must land on upstream's: a ``Protocol`` base ahead of it in the
-    MRO would substitute its placeholder ``__init__`` and skip building the model."""
+    """A ``Protocol`` base ahead of upstream in the MRO would skip building the model."""
     from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 
     from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
@@ -452,8 +421,7 @@ def test_construction_reaches_upstream_init_and_protocol():
 
 
 def test_multimodal_patches_leave_the_spyre_model_alone():
-    """The registered subclass adapts the tower; the class-name dispatch to the old
-    ``multimodal/gemma4_vision.py`` patches must not reach it."""
+    """The old class-name dispatch to ``multimodal/gemma4_vision.py`` must not reach it."""
     from spyre_inference import multimodal
 
     patched = (
@@ -467,17 +435,9 @@ def test_multimodal_patches_leave_the_spyre_model_alone():
     assert {cls: dict(vars(cls)) for cls in patched} == stock
 
 
-# ---------------------------------------------------------------------------
-# RoPE: per-axis tables over the padded head == the transformers reference
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.rotary
 def test_rope_tables_match_transformers_reference():
-    """Gathering both axes' rows and rotating over the padded layout must reproduce stock
-    `apply_multidimensional_rope` on the real channels. Catches an off-by-a-quarter
-    interleave, a swapped axis, or a sin sign error -- each still plausible in magnitude.
-    """
+    """Catches an off-by-a-quarter interleave, a swapped axis or a sin sign error."""
     from spyre_inference.models.gemma4_mm import gemma4_rope_tables
     from spyre_inference.multimodal.utils import rope_perm_matrix, rope_rotate_matmul
 
@@ -504,8 +464,7 @@ def test_rope_tables_match_transformers_reference():
 
 @pytest.mark.rotary
 def test_rope_tables_padding_lanes_are_the_identity_rotation():
-    """Padding lanes must rotate by nothing (cos=1, sin=0) once both axes are summed, so a
-    padded channel that is not exactly zero still cannot leak into a real one."""
+    """cos=1, sin=0 after both axes sum, so a nonzero padded channel cannot leak."""
     from spyre_inference.models.gemma4_mm import gemma4_rope_tables
 
     rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(_vision_config())
@@ -538,11 +497,6 @@ def test_rope_tables_apply_attention_scaling_to_the_real_lanes_only():
         assert torch.all(sin_scaled[..., lanes] == 0.0)
 
 
-# ---------------------------------------------------------------------------
-# On card
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
 def test_pipeline_matches_stock_on_spyre():
     """Same comparison with the encoder on the card, uncompiled (the eager path)."""
@@ -559,8 +513,7 @@ def test_pipeline_matches_stock_on_spyre():
 
 @pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
 def test_compiled_pipeline_matches_stock_on_spyre():
-    """The compiled graphs at one budget, fed as the manager feeds them, then the host tail,
-    against the stock tower: the same bar as the eager twin above."""
+    """The compiled graphs at one budget, fed as the manager feeds them, then the host tail."""
     from spyre_inference.custom_ops.utils import convert
 
     config = _tower_config()
