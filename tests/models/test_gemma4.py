@@ -170,7 +170,7 @@ def test_is_multimodal_gemma4_requires_a_vision_tower(hf_config, expected):
 
 
 def test_multimodal_gemma4_delegates_its_text_half_through_the_model_registry():
-    """Why ``Gemma4ForConditionalGeneration`` needs no ``_ADAPTED_ARCHS`` entry: it
+    """Why ``SpyreGemma4ForConditionalGeneration`` adapts only the vision tower: upstream
     resolves its text half through ``ModelRegistry``, so it already lands on
     ``SpyreGemma4ForCausalLM``. If upstream ever built that model directly, the PLE and
     MoE adaptations would vanish silently -- hence a tripwire rather than a comment.
@@ -183,7 +183,7 @@ def test_multimodal_gemma4_delegates_its_text_half_through_the_model_registry():
     assert "init_vllm_registered_model" in source, (
         "Gemma4ForConditionalGeneration no longer resolves its text model through "
         "the vLLM registry; SpyreGemma4ForCausalLM's MoE/PLE adaptations are being "
-        "bypassed. Register a Spyre subclass of it in models/_ADAPTED_ARCHS."
+        "bypassed. SpyreGemma4ForConditionalGeneration has to build it itself."
     )
     assert '"Gemma4ForCausalLM"' in source, (
         "Gemma4ForConditionalGeneration no longer names Gemma4ForCausalLM as its "
