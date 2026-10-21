@@ -39,6 +39,7 @@ from spyre_inference.models._vision_encoder import (
 )
 from spyre_inference.models.pixtral import _linear_weight
 from spyre_inference.multimodal.gemma4_vision import (
+    _LAYER_NORMS,
     SpyreGemma4RMSNorm,
     SpyreGemma4VisionAttention,
     _fp32_inv_freq,
@@ -46,7 +47,6 @@ from spyre_inference.multimodal.gemma4_vision import (
     _pad_mlp,
     _padded_head_dim,
     _prepare_attention,
-    _swap_class,
 )
 from spyre_inference.multimodal.utils import STICK, align_up
 
@@ -149,10 +149,16 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
                 "Gemma 4 vision GQA is not supported on Spyre; num_key_value_heads "
                 "must equal num_attention_heads."
             )
-        # In place, not rebuilt: the instances already hold vLLM's replaced linears.
-        encoder = self.vision_tower.encoder
-        _swap_class(encoder, modeling_gemma4.Gemma4RMSNorm, SpyreGemma4RMSNorm)
-        _swap_class(encoder, modeling_gemma4.Gemma4VisionAttention, SpyreGemma4VisionAttention)
+        for layer in self.vision_tower.encoder.layers:
+            stock = layer.self_attn
+            attn = SpyreGemma4VisionAttention(vision_config, stock.layer_idx)
+            # Upstream has already replaced these with vLLM linears; keep them.
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                setattr(attn, name, getattr(stock, name))
+            layer.self_attn = attn
+            for name in _LAYER_NORMS:
+                norm = SpyreGemma4RMSNorm(vision_config.hidden_size, eps=vision_config.rms_norm_eps)
+                setattr(layer, name, norm)
 
     def process_weights_after_loading(self) -> None:
         """Rebuild the vision weights in the graphs' layouts, so one copy of each reaches the

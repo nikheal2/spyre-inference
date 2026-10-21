@@ -177,7 +177,10 @@ def _built_model(config):
     )
     model.model_dtype = torch.float16
     model.vision_tower, model.embed_vision = _stock_modules(config)
+    weights = model.vision_tower.state_dict()
     model._init_spyre_vision()
+    # As the checkpoint does, after construction and by name; strict, so a name has to match.
+    model.vision_tower.load_state_dict(weights)
     return model
 
 
@@ -299,6 +302,34 @@ def test_tower_classes_stay_stock_and_weight_names_are_kept():
     assert type(layer.self_attn) is SpyreGemma4VisionAttention
     assert type(layer.input_layernorm) is SpyreGemma4RMSNorm
     assert [name for name, _ in model.vision_tower.named_parameters()] == names
+
+
+def test_spyre_layers_are_constructed_and_keep_upstreams_linears():
+    """Built through their constructors, not a ``__class__`` swap, so constructor state (the
+    RoPE swap buffer) exists before weights load; the projections stay the modules upstream
+    already replaced with vLLM linears."""
+    from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
+
+    config = _tower_config(num_layers=2)
+    model = SpyreGemma4ForConditionalGeneration.__new__(SpyreGemma4ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        vision_config=config, text_config=SimpleNamespace(hidden_size=TEXT_HIDDEN)
+    )
+    model.vision_tower, model.embed_vision = _stock_modules(config)
+    layers = model.vision_tower.encoder.layers
+    projections = [
+        [getattr(layer.self_attn, n) for n in ("q_proj", "k_proj", "v_proj", "o_proj")]
+        for layer in layers
+    ]
+
+    model._init_spyre_vision()
+
+    for layer, kept in zip(layers, projections, strict=True):
+        attn = layer.self_attn
+        assert [getattr(attn, n) for n in ("q_proj", "k_proj", "v_proj", "o_proj")] == kept
+        assert attn.spyre_rope_swap.shape == (PADDED_HEAD_DIM, PADDED_HEAD_DIM)
+        assert "spyre_rope_swap" not in attn.state_dict()
 
 
 def test_process_weights_after_loading_pads_every_layer():

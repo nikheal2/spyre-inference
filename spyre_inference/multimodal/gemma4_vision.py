@@ -344,11 +344,13 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
     )
     # A buffer: an index write inside a compiled block has no device layout. Projection
     # dtype, not the norm's: transformers builds RMSNorm weights fp32, which would promote.
-    attn.register_buffer(
-        "spyre_rope_swap",
-        rope_perm_matrix("half", padded_head_dim, device, attn.q_proj.linear.weight.dtype),
-        persistent=False,
-    )
+    # Only for a `__class__`-swapped instance (`apply()`), which skipped the constructor's.
+    if "spyre_rope_swap" not in attn._buffers:
+        attn.register_buffer(
+            "spyre_rope_swap",
+            rope_perm_matrix("half", padded_head_dim, device, attn.q_proj.linear.weight.dtype),
+            persistent=False,
+        )
     attn._spyre_padded_head_dim = padded_head_dim
 
 
@@ -362,6 +364,15 @@ class SpyreGemma4VisionAttention(modeling_gemma4.Gemma4VisionAttention):
     """Padded rope + `padded_sdpa` over the head dim `pad_vision_weights` padded to."""
 
     spyre_rope_swap: torch.Tensor
+
+    def __init__(self, config, layer_idx: int) -> None:
+        super().__init__(config, layer_idx)
+        weight = self.q_proj.linear.weight
+        self.register_buffer(
+            "spyre_rope_swap",
+            rope_perm_matrix("half", _padded_head_dim(self.head_dim), weight.device, weight.dtype),
+            persistent=False,
+        )
 
     def forward(  # ty: ignore[invalid-method-override]
         self,
