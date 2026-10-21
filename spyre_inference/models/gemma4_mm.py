@@ -119,6 +119,11 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
     vision_max_items_per_call = STICK - 1
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        # Transformers builds the tower at vision_config.dtype (the checkpoint's bf16), not the
+        # model's fp16; Spyre stores both as one 16-bit format, but a logical bf16 operand
+        # promotes fp16 math to fp32 inside a graph. Loading converts the checkpoint into it.
+        model_config = vllm_config.model_config
+        model_config.hf_config.vision_config.dtype = model_config.dtype
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._init_spyre_vision()
 
@@ -163,7 +168,9 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
 
         embedder = tower.patch_embedder
         weight = _linear_weight(embedder.input_proj).float()
-        dtype = cast(torch.Tensor, embedder.position_embedding_table).dtype
+        # The model's dtype, which __init__ builds the tower in: a bf16 + fp16 add in a graph
+        # goes through an fp32 convert whose layout Spyre cannot combine with the other operand.
+        dtype = cast(torch.dtype, self.model_dtype)
         weight_t = F.pad(weight, (0, self._patch_width - weight.shape[1])).t().contiguous()
         # A plain holder, not the linear: nothing runs it, so no Spyre-layout copy goes to the card.
         embedder.input_proj = nn.Module()

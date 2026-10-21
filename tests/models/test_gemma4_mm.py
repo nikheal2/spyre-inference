@@ -175,6 +175,7 @@ def _built_model(config):
     model.config = SimpleNamespace(
         vision_config=config, text_config=SimpleNamespace(hidden_size=TEXT_HIDDEN)
     )
+    model.model_dtype = torch.float16
     model.vision_tower, model.embed_vision = _stock_modules(config)
     model._init_spyre_vision()
     return model
@@ -324,6 +325,59 @@ def test_loaded_vision_weights_reach_the_card_once():
     assert model.embed_vision is None
     names = {name for name, _ in model.named_parameters()} | {n for n, _ in model.named_buffers()}
     assert not any("spyre_patch_weight" in n or "embed_vision" in n for n in names)
+
+
+def test_graph_inputs_take_the_model_dtype_not_the_towers():
+    """Transformers builds the tower at the checkpoint's ``vision_config`` dtype (bf16) while
+    the model runs fp16. A bf16 gather row added to the fp16 patch matmul promotes through an
+    fp32 convert that Spyre cannot lay out, so every input of ``vision_embed`` must be fp16."""
+    model = _built_model(_tower_config(num_layers=1))
+    model.vision_tower.to(torch.bfloat16)
+    model.process_weights_after_loading()
+
+    assert model.vision_tower.patch_embedder.input_proj.weight.dtype == torch.float16
+    assert model.spyre_vision_x.table.dtype == torch.float16
+    assert model.spyre_vision_y.table.dtype == torch.float16
+
+    values = model._vision_empty(576)
+    with torch.inference_mode():
+        x, block_kwargs = model.vision_embed(values)
+    cos, sin = block_kwargs["position_embeddings"]
+    assert {x.dtype, cos.dtype, sin.dtype, block_kwargs["attention_mask"].dtype} == {torch.float16}
+
+
+def test_tower_is_built_in_the_model_dtype(monkeypatch):
+    """The checkpoint's ``vision_config`` says bf16, which Spyre stores as fp16 anyway; the
+    tower has to be built fp16 so no logical bf16 operand reaches a graph. Checks both that
+    ``__init__`` sets the dtype before upstream builds the tower, and that transformers builds
+    every tower parameter at it."""
+    from transformers import AutoModel
+
+    from spyre_inference.models.gemma4_mm import SpyreGemma4ForConditionalGeneration
+
+    class _Built(Exception):
+        pass
+
+    seen = {}
+
+    def upstream_init(self, *, vllm_config, prefix=""):
+        seen["dtype"] = vllm_config.model_config.hf_config.vision_config.dtype
+        raise _Built
+
+    monkeypatch.setattr(gemma4_mm.Gemma4ForConditionalGeneration, "__init__", upstream_init)
+    config = _tower_config(num_layers=1)
+    config.dtype = torch.bfloat16
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.float16, hf_config=SimpleNamespace(vision_config=config)
+        )
+    )
+    with pytest.raises(_Built):
+        SpyreGemma4ForConditionalGeneration(vllm_config=vllm_config)
+    assert seen["dtype"] == torch.float16
+
+    tower = AutoModel.from_config(config=config)
+    assert {p.dtype for p in tower.parameters()} == {torch.float16}
 
 
 def test_upstream_tower_contract_is_unchanged():
