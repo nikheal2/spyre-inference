@@ -248,7 +248,11 @@ warmup is a shape warmup missed. A tower whose per-image shape varies beyond the
 width (a patch budget, an aspect ratio) has to make that shape enumerable before it is
 marked. Gemma 4's tower is not marked: `SpyreGemma4ForConditionalGeneration`
 (`models/gemma4_mm.py`) runs it on the vision encoder mixin below, compiled per token
-budget, and rejects video.
+budget. Video frames are images to Gemma 4: they skip the manager, which would pack a
+video into one attention sequence, and run in chunks through the image budgets' graphs, so
+video adds no budgets of its own. The budgets stop at the largest image the engine's
+`max_soft_tokens` allows, so a request passing a larger `max_soft_tokens` compiles on first
+use: the guard reports it at its default `warn` level and refuses it at `error`.
 
 Blocks of one class share one `forward` code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
@@ -314,7 +318,7 @@ budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per 
 | `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
 | `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
 | `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) | 63 (one-hot width) |
-| `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
+| `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video frames run through the image graphs |
 
 Two upstream protocol methods are also the extension points for model-specific shapes, used
 as upstream models use them: override `postprocess_encoder_output` when placeholder embeddings

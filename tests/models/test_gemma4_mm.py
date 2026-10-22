@@ -250,10 +250,54 @@ def test_a_grid_the_kernel_does_not_divide_is_rejected():
         model.vision_inputs(_mm_kwargs([_image(4, 6, pad=0, seed=0)]))
 
 
-def test_video_is_rejected():
-    model = _spyre_model(_tower_config(num_layers=1))
-    with pytest.raises(NotImplementedError, match="video"):
-        model.embed_multimodal(pixel_values_videos=torch.zeros(1, 9, 48))
+def _videos(frame_counts: list[int]) -> tuple[dict, list[torch.Tensor]]:
+    """Frames flat across videos, as upstream's processor batches them; 6 tokens each."""
+    frames = [_image(6, 9, pad=9, seed=10 + i) for i in range(sum(frame_counts))]
+    kwargs = {
+        "pixel_values_videos": torch.stack([pv for pv, _ in frames]),
+        "pixel_position_ids_videos": torch.stack([pos for _, pos in frames]),
+        "video_frame_counts": torch.tensor(frame_counts),
+    }
+    return kwargs, frames
+
+
+def _video_reference(config, frames, frame_counts: list[int]) -> list[torch.Tensor]:
+    per_frame = _reference(config, frames)
+    out, start = [], 0
+    for count in frame_counts:
+        out.append(torch.cat(per_frame[start : start + count]))
+        start += count
+    return out
+
+
+@pytest.mark.parametrize(("budgets", "calls"), [((), 1), ((64,), 2)], ids=["eager", "budgets"])
+def test_video_matches_stock_frame_by_frame(budgets, calls):
+    """Each frame attends alone, as upstream's batched frames do; the 64-token budget holds
+    10 of the 12 six-token frames, so a chunk ends inside the second video."""
+    config = _tower_config(num_layers=1)
+    frame_counts = [7, 5]
+    kwargs, frames = _videos(frame_counts)
+    model = _spyre_model(config)
+    model.vision_token_budgets = budgets
+    forward = model.encoder_eager_forward
+    patches = []
+
+    def counted(batch):
+        out = forward(batch)
+        patches.append(out.shape[0] * model.patches_per_token)
+        return out
+
+    model.encoder_eager_forward = counted
+    with torch.inference_mode():
+        expected = _video_reference(config, frames, frame_counts)
+        actual = model.embed_multimodal(**kwargs)
+
+    assert len(patches) == calls
+    if budgets:
+        assert set(patches) == {64 * model.patches_per_token}
+    assert [t.shape for t in actual] == [t.shape for t in expected]
+    for got, want in zip(actual, expected, strict=True):
+        assert _cosine(got, want) > 0.995
 
 
 def test_gqa_tower_is_rejected():
@@ -438,7 +482,7 @@ def test_multimodal_patches_leave_the_spyre_model_alone():
 @pytest.mark.rotary
 def test_rope_tables_match_transformers_reference():
     """Catches an off-by-a-quarter interleave, a swapped axis or a sin sign error."""
-    from spyre_inference.models.gemma4_mm import gemma4_rope_tables
+    from spyre_inference.multimodal.gemma4_vision import gemma4_rope_tables
     from spyre_inference.multimodal.utils import rope_perm_matrix, rope_rotate_matmul
 
     torch.manual_seed(0)
@@ -465,7 +509,7 @@ def test_rope_tables_match_transformers_reference():
 @pytest.mark.rotary
 def test_rope_tables_padding_lanes_are_the_identity_rotation():
     """cos=1, sin=0 after both axes sum, so a nonzero padded channel cannot leak."""
-    from spyre_inference.models.gemma4_mm import gemma4_rope_tables
+    from spyre_inference.multimodal.gemma4_vision import gemma4_rope_tables
 
     rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(_vision_config())
     cos_t, sin_t = gemma4_rope_tables(rope.inv_freq, 8, PADDED_HEAD_DIM)
@@ -479,7 +523,7 @@ def test_rope_tables_padding_lanes_are_the_identity_rotation():
 
 
 def test_rope_tables_apply_attention_scaling_to_the_real_lanes_only():
-    from spyre_inference.models.gemma4_mm import gemma4_rope_tables
+    from spyre_inference.multimodal.gemma4_vision import gemma4_rope_tables
 
     rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(_vision_config())
     cos, sin = gemma4_rope_tables(rope.inv_freq, 8, PADDED_HEAD_DIM)
@@ -497,9 +541,10 @@ def test_rope_tables_apply_attention_scaling_to_the_real_lanes_only():
         assert torch.all(sin_scaled[..., lanes] == 0.0)
 
 
-@pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
 def test_pipeline_matches_stock_on_spyre():
     """Same comparison with the encoder on the card, uncompiled (the eager path)."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
     config = _tower_config()
     images = _images()
 
@@ -511,9 +556,10 @@ def test_pipeline_matches_stock_on_spyre():
         assert _cosine(got, want) > 0.99
 
 
-@pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
 def test_compiled_pipeline_matches_stock_on_spyre():
     """The compiled graphs at one budget, fed as the manager feeds them, then the host tail."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
     from spyre_inference.custom_ops.utils import convert
 
     config = _tower_config()
@@ -540,4 +586,23 @@ def test_compiled_pipeline_matches_stock_on_spyre():
 
     for got, want in zip(actual, expected, strict=True):
         assert got is not None
+        assert _cosine(got, want) > 0.99
+
+
+def test_compiled_video_matches_stock_on_spyre():
+    """Video frames through the graphs compiled for the image budgets, chunked into them."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    config = _tower_config()
+    frame_counts = [7, 5]
+    kwargs, frames = _videos(frame_counts)
+    model = _spyre_model(config).to("spyre")
+    model.vision_token_budgets = (64,)
+
+    with torch.inference_mode():
+        expected = _video_reference(config, frames, frame_counts)
+        model.compile_vision_graphs()
+        actual = model.embed_multimodal(**kwargs)
+
+    for got, want in zip(actual, expected, strict=True):
         assert _cosine(got, want) > 0.99

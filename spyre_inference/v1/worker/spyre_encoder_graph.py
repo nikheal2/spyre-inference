@@ -68,6 +68,7 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
 
         self.token_budgets = aligned(self.token_budgets)
         self.path_token_budgets = {p: aligned(b) for p, b in self.path_token_budgets.items()}
+        model.vision_token_budgets = tuple(self.token_budgets)
         # Fail at startup rather than compile mid-request when user budgets miss an item.
         largest_item = model.get_encoder_cudagraph_budget_range(vllm_config)[1]
         if self.token_budgets[-1] < largest_item:

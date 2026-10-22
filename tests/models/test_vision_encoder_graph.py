@@ -120,6 +120,18 @@ def test_budgets_are_stick_aligned_and_cover_the_largest_item():
     assert all(b * MERGE_PATCHES % 64 == 0 for b in manager.token_budgets)
 
 
+def test_eager_forward_pads_to_the_smallest_compiled_budget():
+    """Outside the manager, an input that fits a compiled budget reuses its shape."""
+    model = _FakeVisionModel(max_tokens=300)
+    model.encoder_eager_forward({"tokens": [10]})
+    _manager(model)
+    assert model.vision_token_budgets == (16, 32, 64, 128, 256, 304)
+    model.encoder_eager_forward({"tokens": [20]})
+    model.encoder_eager_forward({"tokens": [400]})
+    # 10 tokens: one 64-patch stick. 20: the 32 budget. 400: past every budget.
+    assert model.forward_patches == [16 * MERGE_PATCHES, 32 * MERGE_PATCHES, 400 * MERGE_PATCHES]
+
+
 def test_user_budgets_below_the_largest_item_fail_at_startup():
     with pytest.raises(ValueError, match="largest encoder budget"):
         _manager(_FakeVisionModel(max_tokens=300), budgets=[16, 64])

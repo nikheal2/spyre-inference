@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.model_executor.models import utils as vllm_utils
 from vllm.model_executor.models.utils import scatter_output_slices
 from vllm.v1.worker.encoder_cudagraph_defs import (
@@ -100,6 +101,28 @@ def offset_major(t: torch.Tensor, merge: int) -> torch.Tensor:
     t = t.reshape(hp // merge, merge, wp // merge, merge, *t.shape[2:])
     t = t.permute(1, 3, 0, 2, *range(4, t.dim()))
     return t.reshape(merge * merge, (hp // merge) * (wp // merge), *t.shape[4:])
+
+
+# Half of fp16's most negative value: a full `finfo.min` saturates to -inf and NaNs SDPA.
+_MASK_MIN = torch.finfo(torch.float16).min / 2
+# Most items per call with `segment_buffer`: the one-hot is a stick wide, its last column padding.
+SEGMENT_ITEMS = STICK - 1
+
+
+def segment_buffer() -> VisionBuffer:
+    """Each patch's item as a one-hot row; padding slots take the last column."""
+    return VisionBuffer(STICK, pad=F.one_hot(torch.tensor(STICK - 1), STICK).half())
+
+
+def one_hot_segments(item_ids: torch.Tensor) -> torch.Tensor:
+    return F.one_hot(item_ids, STICK).to(torch.float16)
+
+
+def segment_mask(segments: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Additive `[1, 1, P, P]` mask keeping each patch to its own item."""
+    # A matmul: Spyre cannot lay out a column-minus-row broadcast.
+    segments = segments.to(dtype)
+    return ((1.0 - torch.matmul(segments, segments.t())) * _MASK_MIN)[None, None]
 
 
 class SpyreVisionEncoderMixin:
@@ -222,6 +245,8 @@ class SpyreVisionEncoderMixin:
     # Image tokens of the largest item: set by the runner from upstream's processor budget before
     # the manager is built, and read by get_encoder_cudagraph_budget_range.
     max_tokens_per_item: int
+    # Compiled token budgets: set by the manager, empty until it is built.
+    vision_token_budgets: tuple[int, ...] = ()
 
     def compile_vision_graphs(self) -> None:
         """Compile ``vision_embed``, every layer, ``vision_project`` and ``vision_merge`` with
@@ -327,14 +352,22 @@ class SpyreVisionEncoderMixin:
     def encoder_eager_forward(
         self, mm_kwargs: dict[str, Any], path: str = "default"
     ) -> torch.Tensor:
-        """The encoder without a budget, padded only to ``vision_patch_multiple``.
+        """The encoder outside the manager, padded to the smallest compiled budget that fits,
+        else to ``vision_patch_multiple``.
 
-        Serves ``enforce_eager`` and the profiling run before warmup. Unreached once compiled:
-        the manager's startup check makes the largest budget cover every item.
+        Serves ``enforce_eager``, the profiling run before warmup, and a modality the manager
+        does not own that a model runs through the same graphs (e.g. Gemma 4's video frames).
         """
         values = self._checked_inputs(mm_kwargs)
         num_patches = next(iter(values.values())).shape[0]
-        padded = self._vision_empty(align_up(num_patches, self.vision_patch_multiple))
+        fits = [
+            b * self.patches_per_token
+            for b in self.vision_token_budgets
+            if b * self.patches_per_token >= num_patches
+        ]
+        padded = self._vision_empty(
+            min(fits) if fits else align_up(num_patches, self.vision_patch_multiple)
+        )
         padding = self.get_encoder_cudagraph_config().padding_logics
         for key, src in values.items():
             padding[key](padded[key], src)

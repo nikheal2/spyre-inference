@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import accumulate, pairwise
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -28,10 +29,14 @@ from vllm.model_executor.models.utils import scatter_output_slices
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
+    SEGMENT_ITEMS,
     GatherTable,
     SpyreVisionEncoderMixin,
     VisionBuffer,
     offset_major,
+    one_hot_segments,
+    segment_buffer,
+    segment_mask,
 )
 from spyre_inference.models.pixtral import _linear_weight
 from spyre_inference.multimodal.gemma4_vision import (
@@ -43,37 +48,12 @@ from spyre_inference.multimodal.gemma4_vision import (
     _pad_mlp,
     _padded_head_dim,
     _prepare_attention,
+    gemma4_rope_tables,
 )
-from spyre_inference.multimodal.utils import STICK, align_up
+from spyre_inference.multimodal.utils import align_up
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-
-# Half of fp16's most negative value: a full `finfo.min` saturates to -inf and NaNs SDPA.
-_MASK_MIN = torch.finfo(torch.float16).min / 2
-
-
-def gemma4_rope_tables(
-    inv_freq: torch.Tensor, size: int, padded_head_dim: int, attention_scaling: float = 1.0
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """`[2, size, D]` cos/sin over `[X, Y, 0 | X, Y, 0]`; patch (x, y) sums rows [0, x], [1, y]."""
-    quarter = inv_freq.shape[0]
-    half = padded_head_dim // 2
-    angles = torch.arange(size, dtype=torch.float32)[:, None] * inv_freq.float()
-    cos_axis = angles.cos() * attention_scaling
-    sin_axis = angles.sin() * attention_scaling
-    cos = torch.zeros(2, size, padded_head_dim)
-    sin = torch.zeros(2, size, padded_head_dim)
-    for axis in range(2):
-        lanes = slice(axis * quarter, (axis + 1) * quarter)
-        upper = slice(half + axis * quarter, half + (axis + 1) * quarter)
-        cos[axis, :, lanes] = cos_axis
-        cos[axis, :, upper] = cos_axis
-        sin[axis, :, lanes] = -sin_axis
-        sin[axis, :, upper] = sin_axis
-    cos[0, :, 2 * quarter : half] = 1.0
-    cos[0, :, half + 2 * quarter :] = 1.0
-    return cos, sin
 
 
 # Not a module, so the model's move to the card leaves it on the host.
@@ -109,8 +89,7 @@ def _valid_patches(
 
 
 class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForConditionalGeneration):
-    # The one-hot image matrix is 64 wide, and its last column belongs to the padding.
-    vision_max_items_per_call = STICK - 1
+    vision_max_items_per_call = SEGMENT_ITEMS
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         # Transformers builds the tower at vision_config.dtype (bf16), and bf16 + fp16 in a graph
@@ -128,7 +107,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         self._patch_width = align_up(3 * vision_config.patch_size**2)
         self.vision_buffers = {
             "patches": VisionBuffer(self._patch_width),
-            "segments": VisionBuffer(STICK, pad=F.one_hot(torch.tensor(STICK - 1), STICK).half()),
+            "segments": segment_buffer(),
             "pos_x": VisionBuffer(None, pad=0, dtype=torch.int64),
             "pos_y": VisionBuffer(None, pad=0, dtype=torch.int64),
         }
@@ -196,11 +175,43 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         self.embed_vision = None
 
     def embed_multimodal(self, **kwargs: object) -> Any:
-        if "pixel_values_videos" in kwargs:
-            raise NotImplementedError(
-                "Gemma 4 video input is not supported on Spyre; send the frames as images."
+        if "pixel_values_videos" not in kwargs:
+            return super().embed_multimodal(**kwargs)
+        return self._embed_videos(kwargs)
+
+    def _embed_videos(self, kwargs: dict[str, Any]) -> tuple[torch.Tensor, ...]:
+        """Frames as images, chunked into the image budgets; one tensor per video.
+
+        Not through the manager: it would pack a video's frames into one attention sequence,
+        while upstream encodes each frame alone, so video needs no budgets of its own.
+        """
+        frames = {
+            "pixel_values": _unbind(kwargs["pixel_values_videos"]),
+            "pixel_position_ids": _unbind(kwargs["pixel_position_ids_videos"]),
+        }
+        tokens = self.vision_item_tokens(frames)
+        # Before the manager is built (enforce_eager), chunk at the default image size.
+        limit = max(
+            self.vision_token_budgets, default=self.config.vision_config.default_output_length
+        )
+        dest: list[torch.Tensor | None] = [None] * len(tokens)
+        start = 0
+        while start < len(tokens):
+            end, total = start + 1, tokens[start]
+            while (
+                end < len(tokens) and end - start < SEGMENT_ITEMS and total + tokens[end] <= limit
+            ):
+                total += tokens[end]
+                end += 1
+            batch = {key: value[start:end] for key, value in frames.items()}
+            output = self.encoder_eager_forward(batch)
+            self.postprocess_encoder_output(
+                {"default": output}, list(range(start, end)), tokens, dest
             )
-        return super().embed_multimodal(**kwargs)
+            start = end
+        counts = _unbind(kwargs["video_frame_counts"])
+        bounds = list(accumulate((int(c) for c in counts), initial=0))
+        return tuple(torch.cat(cast(list[torch.Tensor], dest[a:b])) for a, b in pairwise(bounds))
 
     def postprocess_encoder_output(
         self,
@@ -250,7 +261,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         flat = (torch.cat(patches, dim=1).flatten(0, 1).float() * 2 - 1).to(torch.float16)
         return {
             "patches": F.pad(flat, (0, self._patch_width - flat.shape[1])),
-            "segments": F.one_hot(torch.cat(segments, dim=1).flatten(), STICK).to(torch.float16),
+            "segments": one_hot_segments(torch.cat(segments, dim=1).flatten()),
             "pos_x": torch.cat(xs, dim=1).flatten().to(torch.int64),
             "pos_y": torch.cat(ys, dim=1).flatten().to(torch.int64),
         }
@@ -267,9 +278,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         x = (torch.matmul(values["patches"], patch_weight_t) + rows[:, :hidden]).unsqueeze(0)
         cos = rows[:, hidden : hidden + head_dim][None, :, None]
         sin = rows[:, hidden + head_dim :][None, :, None]
-        # Same-image mask as a matmul: Spyre cannot lay out a column-minus-row broadcast.
-        segments = values["segments"].to(x.dtype)
-        mask = ((1.0 - torch.matmul(segments, segments.t())) * _MASK_MIN)[None, None]
+        mask = segment_mask(values["segments"], x.dtype)
         return x, {"position_embeddings": (cos, sin), "attention_mask": mask}
 
     def vision_blocks(self) -> nn.ModuleList:

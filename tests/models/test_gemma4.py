@@ -44,6 +44,7 @@ def _engine_args(**overrides):
         code_revision=None,
         config_format="auto",
         hf_token=None,
+        limit_mm_per_prompt={},
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -100,8 +101,7 @@ def test_audio_only_checkpoint_is_rejected(monkeypatch):
 
 
 def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path(monkeypatch):
-    """Both towers present: the vision path still works, so this warns rather than
-    refusing to load."""
+    """Both towers present: the vision path still works, so it loads, with audio refused."""
     hf_config = SimpleNamespace(
         model_type="gemma4",
         vision_config=SimpleNamespace(model_type="gemma4_vision"),
@@ -109,10 +109,39 @@ def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path(monkeypatch
     )
     _patch_get_config(monkeypatch, hf_config)
 
-    engine_args = _engine_args()
+    engine_args = _engine_args(limit_mm_per_prompt={"image": 2})
     force_text_backbone(engine_args)
 
     assert engine_args.hf_overrides is None
+    assert engine_args.limit_mm_per_prompt == {"image": 2, "audio": 0}
+
+
+@pytest.mark.parametrize("limit", [1, {"count": 2}])
+def test_an_explicit_audio_limit_fails_at_startup(monkeypatch, limit):
+    hf_config = SimpleNamespace(
+        model_type="gemma4",
+        vision_config=SimpleNamespace(model_type="gemma4_vision"),
+        audio_config=SimpleNamespace(model_type="gemma4_audio"),
+    )
+    _patch_get_config(monkeypatch, hf_config)
+
+    with pytest.raises(NotImplementedError, match="audio input is not supported"):
+        force_text_backbone(_engine_args(limit_mm_per_prompt={"audio": limit}))
+
+
+def test_vision_checkpoint_keeps_its_video_limit(monkeypatch):
+    """Video runs on Spyre, so a vision-only checkpoint's limits are left alone."""
+    hf_config = SimpleNamespace(
+        model_type="gemma4",
+        vision_config=SimpleNamespace(model_type="gemma4_vision"),
+        audio_config=None,
+    )
+    _patch_get_config(monkeypatch, hf_config)
+
+    engine_args = _engine_args(limit_mm_per_prompt={"video": 1})
+    force_text_backbone(engine_args)
+
+    assert engine_args.limit_mm_per_prompt == {"video": 1}
 
 
 def test_repair_head_dim_access_reaches_the_nested_text_config():
