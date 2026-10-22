@@ -113,7 +113,7 @@ def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path(monkeypatch
     force_text_backbone(engine_args)
 
     assert engine_args.hf_overrides is None
-    assert engine_args.limit_mm_per_prompt == {"image": 2, "audio": 0}
+    assert engine_args.limit_mm_per_prompt == {"image": 2, "video": 0, "audio": 0}
 
 
 @pytest.mark.parametrize("limit", [1, {"count": 2}])
@@ -129,8 +129,8 @@ def test_an_explicit_audio_limit_fails_at_startup(monkeypatch, limit):
         force_text_backbone(_engine_args(limit_mm_per_prompt={"audio": limit}))
 
 
-def test_vision_checkpoint_keeps_its_video_limit(monkeypatch):
-    """Video runs on Spyre, so a vision-only checkpoint's limits are left alone."""
+def test_vision_checkpoint_refuses_video_per_request(monkeypatch):
+    """Capped at 0, so the frontend rejects a video request instead of the worker crashing."""
     hf_config = SimpleNamespace(
         model_type="gemma4",
         vision_config=SimpleNamespace(model_type="gemma4_vision"),
@@ -138,10 +138,23 @@ def test_vision_checkpoint_keeps_its_video_limit(monkeypatch):
     )
     _patch_get_config(monkeypatch, hf_config)
 
-    engine_args = _engine_args(limit_mm_per_prompt={"video": 1})
+    engine_args = _engine_args()
     force_text_backbone(engine_args)
 
-    assert engine_args.limit_mm_per_prompt == {"video": 1}
+    assert engine_args.limit_mm_per_prompt == {"video": 0}
+
+
+@pytest.mark.parametrize("limit", [1, {"count": 2}])
+def test_an_explicit_video_limit_fails_at_startup(monkeypatch, limit):
+    hf_config = SimpleNamespace(
+        model_type="gemma4",
+        vision_config=SimpleNamespace(model_type="gemma4_vision"),
+        audio_config=None,
+    )
+    _patch_get_config(monkeypatch, hf_config)
+
+    with pytest.raises(NotImplementedError, match="video input is not supported"):
+        force_text_backbone(_engine_args(limit_mm_per_prompt={"video": limit}))
 
 
 def test_repair_head_dim_access_reaches_the_nested_text_config():

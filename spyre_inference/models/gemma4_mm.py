@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import accumulate, pairwise
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -54,10 +53,6 @@ from spyre_inference.multimodal.utils import align_up
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-
-
-# Video chunk size before the manager is built (enforce_eager): Gemma 4's default image size.
-_UNCOMPILED_CHUNK_TOKENS = 280
 
 
 # Not a module, so the model's move to the card leaves it on the host.
@@ -179,40 +174,11 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         self.embed_vision = None
 
     def embed_multimodal(self, **kwargs: object) -> Any:
-        if "pixel_values_videos" not in kwargs:
-            return super().embed_multimodal(**kwargs)
-        return self._embed_videos(kwargs)
-
-    def _embed_videos(self, kwargs: dict[str, Any]) -> tuple[torch.Tensor, ...]:
-        """Frames as images, chunked into the image budgets; one tensor per video.
-
-        Not through the manager: it would pack a video's frames into one attention sequence,
-        while upstream encodes each frame alone, so video needs no budgets of its own.
-        """
-        frames = {
-            "pixel_values": _unbind(kwargs["pixel_values_videos"]),
-            "pixel_position_ids": _unbind(kwargs["pixel_position_ids_videos"]),
-        }
-        tokens = self.vision_item_tokens(frames)
-        limit = max(self.vision_token_budgets, default=_UNCOMPILED_CHUNK_TOKENS)
-        dest: list[torch.Tensor | None] = [None] * len(tokens)
-        start = 0
-        while start < len(tokens):
-            end, total = start + 1, tokens[start]
-            while (
-                end < len(tokens) and end - start < SEGMENT_ITEMS and total + tokens[end] <= limit
-            ):
-                total += tokens[end]
-                end += 1
-            batch = {key: value[start:end] for key, value in frames.items()}
-            output = self.encoder_eager_forward(batch)
-            self.postprocess_encoder_output(
-                {"default": output}, list(range(start, end)), tokens, dest
+        if "pixel_values_videos" in kwargs:
+            raise NotImplementedError(
+                "Gemma 4 video input is not supported on Spyre; send the frames as images."
             )
-            start = end
-        counts = _unbind(kwargs["video_frame_counts"])
-        bounds = list(accumulate((int(c) for c in counts), initial=0))
-        return tuple(torch.cat(cast(list[torch.Tensor], dest[a:b])) for a, b in pairwise(bounds))
+        return super().embed_multimodal(**kwargs)
 
     def postprocess_encoder_output(
         self,

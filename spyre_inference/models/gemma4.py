@@ -96,16 +96,18 @@ def is_multimodal_gemma4(hf_config: Any) -> bool:
     return getattr(hf_config, "vision_config", None) is not None
 
 
-def _disable_audio(engine_args: EngineArgs) -> None:
-    # A limit of 0 makes the frontend refuse audio per request; past it, the worker
+def _disable_unsupported_modalities(engine_args: EngineArgs, has_audio: bool) -> None:
+    # A limit of 0 makes the frontend refuse the input per request; past it, the worker
     # raises mid-step and takes the engine down with every in-flight request.
     limits = dict(engine_args.limit_mm_per_prompt or {})
-    value = limits.get("audio")
-    if value.get("count") if isinstance(value, dict) else value:
-        raise NotImplementedError(
-            "gemma-4 audio input is not supported on Spyre; remove it from limit_mm_per_prompt."
-        )
-    limits["audio"] = 0
+    for modality in ("video", "audio") if has_audio else ("video",):
+        value = limits.get(modality)
+        if value.get("count") if isinstance(value, dict) else value:
+            raise NotImplementedError(
+                f"gemma-4 {modality} input is not supported on Spyre; remove it from "
+                "limit_mm_per_prompt."
+            )
+        limits[modality] = 0
     engine_args.limit_mm_per_prompt = limits
 
 
@@ -116,7 +118,7 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     documents, so a user override of any shape replaces it wholesale (the head-dim repair
     they also need runs from the platform hook, not from here). A vision checkpoint keeps
     its real ``architectures`` -- forcing ``Gemma4ForCausalLM`` there would strip the tower
-    -- with audio capped at 0 per prompt, while an audio-only one is rejected
+    -- with video and audio capped at 0 per prompt, while an audio-only one is rejected
     rather than silently reduced to text.
     """
     if engine_args.hf_overrides:
@@ -142,8 +144,7 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     has_audio = getattr(hf_config, "audio_config", None) is not None
     # A multimodal Gemma4Config reports the same model_type as a text checkpoint.
     if is_multimodal_gemma4(hf_config):
-        if has_audio:
-            _disable_audio(engine_args)
+        _disable_unsupported_modalities(engine_args, has_audio)
         return
     if has_audio:
         # Falling through would force the text-only backbone and silently drop the

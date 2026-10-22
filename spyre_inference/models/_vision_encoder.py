@@ -245,8 +245,6 @@ class SpyreVisionEncoderMixin:
     # Image tokens of the largest item: set by the runner from upstream's processor budget before
     # the manager is built, and read by get_encoder_cudagraph_budget_range.
     max_tokens_per_item: int
-    # Compiled token budgets: set by the manager, empty until it is built.
-    vision_token_budgets: tuple[int, ...] = ()
 
     def compile_vision_graphs(self) -> None:
         """Compile ``vision_embed``, every layer, ``vision_project`` and ``vision_merge`` with
@@ -352,22 +350,14 @@ class SpyreVisionEncoderMixin:
     def encoder_eager_forward(
         self, mm_kwargs: dict[str, Any], path: str = "default"
     ) -> torch.Tensor:
-        """The encoder outside the manager, padded to the smallest compiled budget that fits,
-        else to ``vision_patch_multiple``.
+        """The encoder without a budget, padded only to ``vision_patch_multiple``.
 
-        Serves ``enforce_eager``, the profiling run before warmup, and a modality the manager
-        does not own that a model runs through the same graphs (e.g. Gemma 4's video frames).
+        Serves ``enforce_eager`` and the profiling run before warmup. Unreached once compiled:
+        the manager's startup check makes the largest budget cover every item.
         """
         values = self._checked_inputs(mm_kwargs)
         num_patches = next(iter(values.values())).shape[0]
-        fits = [
-            b * self.patches_per_token
-            for b in self.vision_token_budgets
-            if b * self.patches_per_token >= num_patches
-        ]
-        padded = self._vision_empty(
-            min(fits) if fits else align_up(num_patches, self.vision_patch_multiple)
-        )
+        padded = self._vision_empty(align_up(num_patches, self.vision_patch_multiple))
         padding = self.get_encoder_cudagraph_config().padding_logics
         for key, src in values.items():
             padding[key](padded[key], src)
