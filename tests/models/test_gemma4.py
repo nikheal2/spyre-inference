@@ -116,7 +116,8 @@ def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path(monkeypatch
     assert engine_args.limit_mm_per_prompt == {"image": 2, "video": 0, "audio": 0}
 
 
-@pytest.mark.parametrize("limit", [1, {"count": 2}])
+# A dict without "count" takes vLLM's default of 999, so it enables the modality too.
+@pytest.mark.parametrize("limit", [1, {"count": 2}, {}])
 def test_an_explicit_audio_limit_fails_at_startup(monkeypatch, limit):
     hf_config = SimpleNamespace(
         model_type="gemma4",
@@ -144,7 +145,7 @@ def test_vision_checkpoint_refuses_video_per_request(monkeypatch):
     assert engine_args.limit_mm_per_prompt == {"video": 0}
 
 
-@pytest.mark.parametrize("limit", [1, {"count": 2}])
+@pytest.mark.parametrize("limit", [1, {"count": 2}, {"num_frames": 32, "width": 512}])
 def test_an_explicit_video_limit_fails_at_startup(monkeypatch, limit):
     hf_config = SimpleNamespace(
         model_type="gemma4",

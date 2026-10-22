@@ -91,6 +91,11 @@ class GatherTable(nn.Module):
         return self.table.index_select(0, index)
 
 
+def unbind_items(value: Any) -> list[torch.Tensor]:
+    """An ``mm_kwargs`` field as one tensor per item, whether batched in one tensor or a list."""
+    return list(value.unbind(0)) if isinstance(value, torch.Tensor) else list(value)
+
+
 def offset_major(t: torch.Tensor, merge: int) -> torch.Tensor:
     """``[hp, wp, ...]`` -> ``[merge**2, tokens, ...]``: one group per offset in a merge window.
 

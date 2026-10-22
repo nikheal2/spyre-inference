@@ -36,6 +36,7 @@ from spyre_inference.models._vision_encoder import (
     one_hot_segments,
     segment_buffer,
     segment_mask,
+    unbind_items,
 )
 from spyre_inference.models.pixtral import _linear_weight
 from spyre_inference.multimodal.gemma4_vision import (
@@ -66,16 +67,12 @@ class _VisionTail:
     dtype: torch.dtype
 
 
-def _unbind(t: Any) -> list[torch.Tensor]:
-    return list(t.unbind(0)) if isinstance(t, torch.Tensor) else list(t)
-
-
 def _images(mm_kwargs: dict[str, Any]) -> list[tuple[torch.Tensor, torch.Tensor]]:
     pixel_values = mm_kwargs.get("pixel_values")
     if pixel_values is None:
         return []
     positions = mm_kwargs["pixel_position_ids"]
-    return list(zip(_unbind(pixel_values), _unbind(positions), strict=True))
+    return list(zip(unbind_items(pixel_values), unbind_items(positions), strict=True))
 
 
 def _valid_patches(

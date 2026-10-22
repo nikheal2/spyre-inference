@@ -20,6 +20,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 
@@ -102,7 +103,10 @@ def _disable_unsupported_modalities(engine_args: EngineArgs, has_audio: bool) ->
     limits = dict(engine_args.limit_mm_per_prompt or {})
     for modality in ("video", "audio") if has_audio else ("video",):
         value = limits.get(modality)
-        if value.get("count") if isinstance(value, dict) else value:
+        # A dict without "count" takes vLLM's default, which enables the modality.
+        if isinstance(value, dict):
+            value = value.get("count", BaseDummyOptions().count)
+        if value:
             raise NotImplementedError(
                 f"gemma-4 {modality} input is not supported on Spyre; remove it from "
                 "limit_mm_per_prompt."

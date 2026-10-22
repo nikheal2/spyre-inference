@@ -49,6 +49,7 @@ from spyre_inference.models._vision_encoder import (
     one_hot_segments,
     segment_buffer,
     segment_mask,
+    unbind_items,
 )
 from spyre_inference.multimodal.utils import (
     align_up,
@@ -160,9 +161,7 @@ def _linear_weight(layer: nn.Module) -> torch.Tensor:
 def _images(mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
     """The ``[C, H, W]`` images in ``mm_kwargs``, whether batched in one tensor or a list."""
     images = mm_kwargs.get("images")
-    if images is None:
-        return []
-    return list(images.unbind(0)) if isinstance(images, torch.Tensor) else list(images)
+    return [] if images is None else unbind_items(images)
 
 
 class SpyrePixtralForConditionalGeneration(
