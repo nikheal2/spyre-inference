@@ -56,6 +56,10 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+# Video chunk size before the manager is built (enforce_eager): Gemma 4's default image size.
+_UNCOMPILED_CHUNK_TOKENS = 280
+
+
 # Not a module, so the model's move to the card leaves it on the host.
 @dataclass
 class _VisionTail:
@@ -190,10 +194,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
             "pixel_position_ids": _unbind(kwargs["pixel_position_ids_videos"]),
         }
         tokens = self.vision_item_tokens(frames)
-        # Before the manager is built (enforce_eager), chunk at the default image size.
-        limit = max(
-            self.vision_token_budgets, default=self.config.vision_config.default_output_length
-        )
+        limit = max(self.vision_token_budgets, default=_UNCOMPILED_CHUNK_TOKENS)
         dest: list[torch.Tensor | None] = [None] * len(tokens)
         start = 0
         while start < len(tokens):
