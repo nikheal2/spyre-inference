@@ -38,6 +38,16 @@ def align_up(n: int, align: int = STICK) -> int:
     return (n + align - 1) // align * align
 
 
+def to_host(t: torch.Tensor) -> torch.Tensor:
+    """Detach a weight onto the host before reshaping or padding it.
+
+    Composed strided slice-assignments lower silently wrong on a Spyre-resident tensor --
+    finite but inaccurate, and nothing raises -- so padding helpers pull their source here
+    and the caller moves the finished weight back.
+    """
+    return convert(t.detach(), device="cpu")
+
+
 @cache
 def rope_perm_matrix(
     kind: str, head_dim: int, device: torch.device, dtype: torch.dtype = torch.float16

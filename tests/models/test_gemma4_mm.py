@@ -312,6 +312,19 @@ def test_spyre_layers_are_constructed_and_keep_upstreams_linears():
         assert "spyre_rope_swap" not in attn.state_dict()
 
 
+def test_rope_swap_takes_the_construction_dtype():
+    """vLLM constructs the model at its dtype; an fp32 swap buffer would promote every rope
+    matmul to an fp32 result Spyre cannot lay out."""
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    with set_default_torch_dtype(torch.float16):
+        model = _built_model(_tower_config(num_layers=1))
+
+    attn = model.vision_tower.encoder.layers[0].self_attn
+    assert attn.spyre_rope_swap.dtype == torch.float16
+    assert attn.spyre_rope_swap.dtype == attn.q_proj.linear.weight.dtype
+
+
 def test_process_weights_after_loading_pads_every_layer():
     from spyre_inference.multimodal.utils import align_up
 
@@ -833,7 +846,7 @@ def test_padding_on_device_weights_matches_padding_on_host():
     """Padding a layer already on Spyre must give the same weights as padding it on the
     host and moving afterwards.
 
-    The regression `_host` exists for: composed on device-resident weights, the helpers'
+    The regression `to_host` exists for: composed on device-resident weights, the helpers'
     strided slice-assignments lower silently wrong.
     """
     if not spyre_available():
@@ -871,7 +884,7 @@ def test_padding_on_device_weights_matches_padding_on_host():
     gm._pad_mlp(on_device, config.intermediate_size, padded_inter)
 
     # Every host<->device convert halves an fp16 subnormal (normals round-trip exactly),
-    # and padding on device round-trips through `_host`, so its subnormals come back one
+    # and padding on device round-trips through `to_host`, so its subnormals come back one
     # halving further down -- an error bounded by half the largest subnormal. A wrongly
     # composed slice-assign moves whole weights, so `smallest_normal` still catches it.
     checked = 0

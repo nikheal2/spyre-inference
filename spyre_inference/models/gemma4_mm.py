@@ -45,21 +45,11 @@ from spyre_inference.multimodal.utils import (
     padded_sdpa,
     rope_perm_matrix,
     rope_rotate_matmul,
+    to_host,
 )
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-
-
-def _host(t: torch.Tensor) -> torch.Tensor:
-    """Detach a weight onto the host before reshaping or padding it.
-
-    The padding helpers rebuild weights out of composed strided slice-assignments, which
-    lower silently wrong on a Spyre-resident tensor -- finite but inaccurate, and nothing
-    raises. Each helper pulls its source here, wherever it lives, and the caller moves the
-    finished weight back.
-    """
-    return convert(t.detach(), device="cpu")
 
 
 def _as_plain_linear(layer: nn.Module) -> nn.Linear:
@@ -86,12 +76,12 @@ def _as_plain_linear(layer: nn.Module) -> nn.Linear:
         )
     # [in, out] once vLLM's Spyre OOT method has run. cast: `nn.Module.weight` is
     # `Tensor | Module` generically; this layer's is always a real Tensor.
-    weight_t = _host(cast(torch.Tensor, layer.weight))
+    weight_t = to_host(cast(torch.Tensor, layer.weight))
     in_features, out_features = weight_t.shape
     plain = nn.Linear(in_features, out_features, bias=layer.bias is not None)
     plain.weight = nn.Parameter(weight_t.t().contiguous(), requires_grad=False)
     if layer.bias is not None:
-        bias = _host(cast(torch.Tensor, layer.bias))
+        bias = to_host(cast(torch.Tensor, layer.bias))
         plain.bias = nn.Parameter(bias.clone(), requires_grad=False)
     return plain
 
@@ -106,8 +96,8 @@ def _assert_clipping_preserves_zero(proj, name: str) -> None:
     """
     if not getattr(proj, "use_clipped_linears", False):
         return
-    lo = _host(proj.output_min)
-    hi = _host(proj.output_max)
+    lo = to_host(proj.output_min)
+    hi = to_host(proj.output_max)
     if not bool(torch.all((lo <= 0) & (hi >= 0)).item()):
         raise NotImplementedError(
             f"{name}: output clipping must include zero when the head dim is padded, "
@@ -119,7 +109,7 @@ def _assert_clipping_preserves_zero(proj, name: str) -> None:
 def _pad_qk_linear(proj, num_heads: int, orig_head_dim: int, padded_head_dim: int) -> nn.Linear:
     """Pad and reorder two-axis RoPE channels into one matrix-RoPE layout."""
     linear = proj.linear
-    weight = _host(linear.weight).view(num_heads, orig_head_dim, -1)
+    weight = to_host(linear.weight).view(num_heads, orig_head_dim, -1)
     new_weight = torch.zeros(num_heads, padded_head_dim, weight.shape[-1], dtype=weight.dtype)
     quarter = orig_head_dim // 4
     padded_half = padded_head_dim // 2
@@ -134,7 +124,7 @@ def _pad_qk_linear(proj, num_heads: int, orig_head_dim: int, padded_head_dim: in
         new_weight.reshape(num_heads * padded_head_dim, -1), requires_grad=False
     )
     if linear.bias is not None:
-        bias = _host(linear.bias).view(num_heads, orig_head_dim)
+        bias = to_host(linear.bias).view(num_heads, orig_head_dim)
         new_bias = torch.zeros(num_heads, padded_head_dim, dtype=bias.dtype)
         new_bias[:, :quarter] = bias[:, :quarter]
         new_bias[:, quarter : 2 * quarter] = bias[:, 2 * quarter : 3 * quarter]
@@ -148,7 +138,7 @@ def _pad_proj_output_simple(
     proj: nn.Linear, n_heads: int, orig_head_dim: int, padded_head_dim: int
 ) -> nn.Linear:
     """End-pad each head of a [n_heads*head_dim, hidden] output projection (V)."""
-    w = _host(proj.weight)
+    w = to_host(proj.weight)
     hidden = w.shape[1]
     new_w = torch.zeros(n_heads * padded_head_dim, hidden, dtype=w.dtype)
     for h in range(n_heads):
@@ -157,7 +147,7 @@ def _pad_proj_output_simple(
     new_proj = nn.Linear(hidden, n_heads * padded_head_dim, bias=proj.bias is not None)
     new_proj.weight = nn.Parameter(new_w, requires_grad=False)
     if proj.bias is not None:
-        bias = _host(proj.bias)
+        bias = to_host(proj.bias)
         new_b = torch.zeros(n_heads * padded_head_dim, dtype=bias.dtype)
         for h in range(n_heads):
             s, d = h * orig_head_dim, h * padded_head_dim
@@ -170,7 +160,7 @@ def _pad_proj_input_simple(
     proj: nn.Linear, n_heads: int, orig_head_dim: int, padded_head_dim: int
 ) -> nn.Linear:
     """End-pad each head along the input dim of an O-style projection."""
-    w = _host(proj.weight)
+    w = to_host(proj.weight)
     hidden = w.shape[0]
     new_w = torch.zeros(hidden, n_heads * padded_head_dim, dtype=w.dtype)
     for h in range(n_heads):
@@ -179,12 +169,12 @@ def _pad_proj_input_simple(
     new_proj = nn.Linear(n_heads * padded_head_dim, hidden, bias=proj.bias is not None)
     new_proj.weight = nn.Parameter(new_w, requires_grad=False)
     if proj.bias is not None:
-        new_proj.bias = nn.Parameter(_host(proj.bias).clone(), requires_grad=False)
+        new_proj.bias = nn.Parameter(to_host(proj.bias).clone(), requires_grad=False)
     return new_proj
 
 
 def _pad_norm_weight(norm, orig_head_dim: int, padded_head_dim: int) -> nn.Parameter:
-    weight = _host(norm.weight)
+    weight = to_host(norm.weight)
     padded = torch.ones(padded_head_dim, dtype=weight.dtype)
     quarter = orig_head_dim // 4
     padded_half = padded_head_dim // 2
@@ -287,7 +277,7 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
     for _name in ("q_proj", "k_proj", "v_proj", "o_proj"):
         _assert_clipping_preserves_zero(getattr(attn, _name), f"vision attention {_name}")
 
-    # The helpers pad on the host (see `_host`), so every result is moved back.
+    # The helpers pad on the host (see `to_host`), so every result is moved back.
     device = attn.q_norm.weight.device
     attn.q_proj.linear = _as_plain_linear(attn.q_proj.linear)
     attn.k_proj.linear = _as_plain_linear(attn.k_proj.linear)
@@ -515,7 +505,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         embedder.input_proj.weight = nn.Parameter(weight_t.to(dtype), requires_grad=False)
 
         # One row per coordinate and axis: [position embedding | cos | sin].
-        table = _host(cast(torch.Tensor, embedder.position_embedding_table)).float()
+        table = to_host(cast(torch.Tensor, embedder.position_embedding_table)).float()
         inv_freq, attention_scaling = _fp32_inv_freq(tower.encoder.rotary_emb, config)
         cos, sin = gemma4_rope_tables(inv_freq, table.shape[1], padded, attention_scaling)
         rows = torch.cat([table, cos, sin], dim=-1).to(dtype)
@@ -528,10 +518,10 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         self._spyre_vision_tail = _VisionTail(
             # vision_project sums the k*k patches; the pooler averages and scales them.
             scale=tower.pooler.root_hidden_size / self.patches_per_token,
-            std_bias=_host(tower.std_bias).float() if standardize else None,
-            std_scale=_host(tower.std_scale).float() if standardize else None,
+            std_bias=to_host(tower.std_bias).float() if standardize else None,
+            std_scale=to_host(tower.std_scale).float() if standardize else None,
             eps=self.embed_vision.eps,
-            weight=_host(_linear_weight(projection)).float(),
+            weight=to_host(_linear_weight(projection)).float(),
             dtype=dtype,
         )
         # Only upstream's eager image and video paths ran it; the tail above replaces it.

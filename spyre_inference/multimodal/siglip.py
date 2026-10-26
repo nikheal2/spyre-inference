@@ -23,20 +23,9 @@ import torch.nn as nn
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import STICK, align_up, padded_sdpa
+from spyre_inference.multimodal.utils import STICK, align_up, padded_sdpa, to_host
 
 logger = init_logger(__name__)
-
-
-def _host(t: torch.Tensor) -> torch.Tensor:
-    """Detach a weight onto the host before reshaping or padding it.
-
-    Strided slice-assignments lower silently wrong on Spyre-resident tensors.
-    vLLM moves the model before our patches run, so every padding helper pulls
-    its source to CPU here; the caller moves the finished weight back.
-    Mirrors models.gemma4_mm._host.
-    """
-    return convert(t.detach(), device="cpu")
 
 
 def _pad_qkv_weight(w: torch.Tensor, num_heads: int, orig_d: int, pad_d: int) -> torch.Tensor:
@@ -48,7 +37,7 @@ def _pad_qkv_weight(w: torch.Tensor, num_heads: int, orig_d: int, pad_d: int) ->
     the same transposed layout [hidden, 3*H*D_pad] so the `x @ Wᵀ` forward
     in SpyreTransposedWeightMethod.apply still works unchanged.
     """
-    w = _host(w)
+    w = to_host(w)
     hidden = w.shape[0]
     out = torch.zeros(hidden, 3 * num_heads * pad_d, dtype=w.dtype)
     for b in range(3):  # Q, K, V blocks
@@ -61,7 +50,7 @@ def _pad_qkv_weight(w: torch.Tensor, num_heads: int, orig_d: int, pad_d: int) ->
 
 def _pad_qkv_bias(b: torch.Tensor, num_heads: int, orig_d: int, pad_d: int) -> torch.Tensor:
     """Zero-extend each head block of a fused QKV bias [3*H*D] -> [3*H*D_pad]."""
-    b = _host(b)
+    b = to_host(b)
     out = torch.zeros(3 * num_heads * pad_d, dtype=b.dtype)
     for blk in range(3):
         for h in range(num_heads):
@@ -80,7 +69,7 @@ def _pad_out_weight(w: torch.Tensor, num_heads: int, orig_d: int, pad_d: int) ->
     keep the result in the same transposed layout [H*D_pad, hidden] so the
     `x @ Wᵀ` forward still works unchanged.
     """
-    w = _host(w)
+    w = to_host(w)
     hidden = w.shape[1]
     out = torch.zeros(num_heads * pad_d, hidden, dtype=w.dtype)
     for h in range(num_heads):
@@ -124,9 +113,9 @@ def patch_siglip_attention(model: torch.nn.Module) -> None:
     pad_head_dim = align_up(orig_head_dim, STICK)
     scale = orig_head_dim**-0.5
 
-    # Pad weights on every SiglipAttention instance.  _host() pulls each weight
+    # Pad weights on every SiglipAttention instance.  to_host() pulls each weight
     # to CPU before the slice-assignments (Spyre slice-assign is silently wrong);
-    # .to(dev) moves the padded result back.  Mirrors models.gemma4_mm._prepare_attention.
+    # .to(dev) moves the padded result back.
     for module in model.modules():
         if not isinstance(module, SiglipAttention):
             continue
