@@ -159,7 +159,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.32.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "c79a93c82560591c2101acb34d25a7bd4886db6e" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "b9daa0c3aa7ac7624e3ff6897da5893bb1fa54f4" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -374,7 +374,7 @@ markers = [
     "blip2: BLIP-2 Q-Former patch tests (tests/multimodal/test_blip2.py)",
     "granite4_vision: Granite Vision 4 patch tests (tests/multimodal/test_granite4_vision.py)",
     "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
-    "rmsnorm: GemmaRMSNorm custom-op tests (tests/custom_ops/test_gemma_rms_norm.py)",
+    "rmsnorm: RMSNorm and GemmaRMSNorm custom-op tests (tests/custom_ops/test_rms_norm.py)",
     "granite_vision_e2e: End-to-end Granite Vision 4.1 tests (tests/e2e/test_granite_vision.py); slow, needs a card",
     "runtime: encoder inline-dispatch tests (tests/runtime/test_encoder_inline_dispatch.py); CPU-only",
 ]
