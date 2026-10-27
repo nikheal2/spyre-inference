@@ -26,6 +26,7 @@ from transformers.models.gemma4 import modeling_gemma4
 from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 from vllm.model_executor.models.utils import scatter_output_slices
 
+from spyre_inference.custom_ops.head_pad import pad_input_end, pad_output_end
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import (
     SEGMENT_ITEMS,
@@ -38,18 +39,29 @@ from spyre_inference.models._vision_encoder import (
     segment_mask,
     unbind_items,
 )
-from spyre_inference.models.pixtral import _linear_weight
 from spyre_inference.multimodal.utils import (
     STICK,
     align_up,
+    linear_weight,
     padded_sdpa,
     rope_perm_matrix,
     rope_rotate_matmul,
-    to_host,
 )
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+_NOT_PADDED = (
+    "Gemma 4 vision weights are not padded for this head dim; "
+    "`process_weights_after_loading` pads them and has to precede the first forward."
+)
+
+_LAYER_NORMS = (
+    "input_layernorm",
+    "post_attention_layernorm",
+    "pre_feedforward_layernorm",
+    "post_feedforward_layernorm",
+)
 
 
 def _as_plain_linear(layer: nn.Module) -> nn.Linear:
@@ -76,12 +88,12 @@ def _as_plain_linear(layer: nn.Module) -> nn.Linear:
         )
     # [in, out] once vLLM's Spyre OOT method has run. cast: `nn.Module.weight` is
     # `Tensor | Module` generically; this layer's is always a real Tensor.
-    weight_t = to_host(cast(torch.Tensor, layer.weight))
+    weight_t = convert(cast(torch.Tensor, layer.weight).detach(), device="cpu")
     in_features, out_features = weight_t.shape
     plain = nn.Linear(in_features, out_features, bias=layer.bias is not None)
     plain.weight = nn.Parameter(weight_t.t().contiguous(), requires_grad=False)
     if layer.bias is not None:
-        bias = to_host(cast(torch.Tensor, layer.bias))
+        bias = convert(cast(torch.Tensor, layer.bias).detach(), device="cpu")
         plain.bias = nn.Parameter(bias.clone(), requires_grad=False)
     return plain
 
@@ -96,8 +108,8 @@ def _assert_clipping_preserves_zero(proj, name: str) -> None:
     """
     if not getattr(proj, "use_clipped_linears", False):
         return
-    lo = to_host(proj.output_min)
-    hi = to_host(proj.output_max)
+    lo = convert(proj.output_min, device="cpu")
+    hi = convert(proj.output_max, device="cpu")
     if not bool(torch.all((lo <= 0) & (hi >= 0)).item()):
         raise NotImplementedError(
             f"{name}: output clipping must include zero when the head dim is padded, "
@@ -106,83 +118,64 @@ def _assert_clipping_preserves_zero(proj, name: str) -> None:
         )
 
 
+def _two_axis_layout(x: torch.Tensor, padded_head_dim: int, fill: float = 0.0) -> torch.Tensor:
+    """``[..., D]`` in stock's ``[X0, X1, Y0, Y1]`` quarters -> ``[X0, Y0, fill | X1, Y1, fill]``.
+
+    Gemma 4 vision rotates each axis with its own ``rotate_half``; with each axis's halves in
+    opposite halves of the padded head, one first-half/second-half swap serves both axes.
+    """
+    x0, x1, y0, y1 = x.split(x.shape[-1] // 4, dim=-1)
+    pad = x.new_full((*x.shape[:-1], padded_head_dim // 2 - 2 * x0.shape[-1]), fill)
+    return torch.cat([x0, y0, pad, x1, y1, pad], dim=-1)
+
+
+def _rebuilt_linear(weight: torch.Tensor, bias: torch.Tensor | None) -> nn.Linear:
+    linear = nn.Linear(weight.shape[1], weight.shape[0], bias=bias is not None)
+    linear.weight = nn.Parameter(weight, requires_grad=False)
+    if bias is not None:
+        linear.bias = nn.Parameter(bias, requires_grad=False)
+    return linear
+
+
 def _pad_qk_linear(proj, num_heads: int, orig_head_dim: int, padded_head_dim: int) -> nn.Linear:
     """Pad and reorder two-axis RoPE channels into one matrix-RoPE layout."""
     linear = proj.linear
-    weight = to_host(linear.weight).view(num_heads, orig_head_dim, -1)
-    new_weight = torch.zeros(num_heads, padded_head_dim, weight.shape[-1], dtype=weight.dtype)
-    quarter = orig_head_dim // 4
-    padded_half = padded_head_dim // 2
-    new_weight[:, :quarter] = weight[:, :quarter]
-    new_weight[:, quarter : 2 * quarter] = weight[:, 2 * quarter : 3 * quarter]
-    new_weight[:, padded_half : padded_half + quarter] = weight[:, quarter : 2 * quarter]
-    new_weight[:, padded_half + quarter : padded_half + 2 * quarter] = weight[:, 3 * quarter :]
-    padded = nn.Linear(
-        linear.in_features, num_heads * padded_head_dim, bias=linear.bias is not None
-    )
-    padded.weight = nn.Parameter(
-        new_weight.reshape(num_heads * padded_head_dim, -1), requires_grad=False
-    )
+    weight = convert(linear.weight.detach(), device="cpu").view(num_heads, orig_head_dim, -1)
+    weight = _two_axis_layout(weight.transpose(1, 2), padded_head_dim).transpose(1, 2)
+    bias = None
     if linear.bias is not None:
-        bias = to_host(linear.bias).view(num_heads, orig_head_dim)
-        new_bias = torch.zeros(num_heads, padded_head_dim, dtype=bias.dtype)
-        new_bias[:, :quarter] = bias[:, :quarter]
-        new_bias[:, quarter : 2 * quarter] = bias[:, 2 * quarter : 3 * quarter]
-        new_bias[:, padded_half : padded_half + quarter] = bias[:, quarter : 2 * quarter]
-        new_bias[:, padded_half + quarter : padded_half + 2 * quarter] = bias[:, 3 * quarter :]
-        padded.bias = nn.Parameter(new_bias.reshape(-1), requires_grad=False)
-    return padded
+        bias = convert(linear.bias.detach(), device="cpu").view(num_heads, orig_head_dim)
+        bias = _two_axis_layout(bias, padded_head_dim).reshape(-1)
+    return _rebuilt_linear(weight.reshape(num_heads * padded_head_dim, -1), bias)
 
 
 def _pad_proj_output_simple(
     proj: nn.Linear, n_heads: int, orig_head_dim: int, padded_head_dim: int
 ) -> nn.Linear:
     """End-pad each head of a [n_heads*head_dim, hidden] output projection (V)."""
-    w = to_host(proj.weight)
-    hidden = w.shape[1]
-    new_w = torch.zeros(n_heads * padded_head_dim, hidden, dtype=w.dtype)
-    for h in range(n_heads):
-        s, d = h * orig_head_dim, h * padded_head_dim
-        new_w[d : d + orig_head_dim, :] = w[s : s + orig_head_dim, :]
-    new_proj = nn.Linear(hidden, n_heads * padded_head_dim, bias=proj.bias is not None)
-    new_proj.weight = nn.Parameter(new_w, requires_grad=False)
+    pad = (n_heads, orig_head_dim, padded_head_dim)
+    weight = pad_output_end(convert(proj.weight.detach(), device="cpu"), *pad)
+    bias = None
     if proj.bias is not None:
-        bias = to_host(proj.bias)
-        new_b = torch.zeros(n_heads * padded_head_dim, dtype=bias.dtype)
-        for h in range(n_heads):
-            s, d = h * orig_head_dim, h * padded_head_dim
-            new_b[d : d + orig_head_dim] = bias[s : s + orig_head_dim]
-        new_proj.bias = nn.Parameter(new_b, requires_grad=False)
-    return new_proj
+        bias = pad_output_end(convert(proj.bias.detach(), device="cpu"), *pad)
+    return _rebuilt_linear(weight, bias)
 
 
 def _pad_proj_input_simple(
     proj: nn.Linear, n_heads: int, orig_head_dim: int, padded_head_dim: int
 ) -> nn.Linear:
     """End-pad each head along the input dim of an O-style projection."""
-    w = to_host(proj.weight)
-    hidden = w.shape[0]
-    new_w = torch.zeros(hidden, n_heads * padded_head_dim, dtype=w.dtype)
-    for h in range(n_heads):
-        s, d = h * orig_head_dim, h * padded_head_dim
-        new_w[:, d : d + orig_head_dim] = w[:, s : s + orig_head_dim]
-    new_proj = nn.Linear(n_heads * padded_head_dim, hidden, bias=proj.bias is not None)
-    new_proj.weight = nn.Parameter(new_w, requires_grad=False)
+    weight = convert(proj.weight.detach(), device="cpu")
+    weight = pad_input_end(weight, n_heads, orig_head_dim, padded_head_dim)
+    bias = None
     if proj.bias is not None:
-        new_proj.bias = nn.Parameter(to_host(proj.bias).clone(), requires_grad=False)
-    return new_proj
+        bias = convert(proj.bias.detach(), device="cpu").clone()
+    return _rebuilt_linear(weight, bias)
 
 
-def _pad_norm_weight(norm, orig_head_dim: int, padded_head_dim: int) -> nn.Parameter:
-    weight = to_host(norm.weight)
-    padded = torch.ones(padded_head_dim, dtype=weight.dtype)
-    quarter = orig_head_dim // 4
-    padded_half = padded_head_dim // 2
-    padded[:quarter] = weight[:quarter]
-    padded[quarter : 2 * quarter] = weight[2 * quarter : 3 * quarter]
-    padded[padded_half : padded_half + quarter] = weight[quarter : 2 * quarter]
-    padded[padded_half + quarter : padded_half + 2 * quarter] = weight[3 * quarter :]
-    return nn.Parameter(padded, requires_grad=False)
+def _pad_norm_weight(norm, padded_head_dim: int) -> nn.Parameter:
+    weight = convert(norm.weight.detach(), device="cpu")
+    return nn.Parameter(_two_axis_layout(weight, padded_head_dim, fill=1.0), requires_grad=False)
 
 
 def _padded_rms_norm(
@@ -277,7 +270,8 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
     for _name in ("q_proj", "k_proj", "v_proj", "o_proj"):
         _assert_clipping_preserves_zero(getattr(attn, _name), f"vision attention {_name}")
 
-    # The helpers pad on the host (see `to_host`), so every result is moved back.
+    # Padding composed on a Spyre-resident weight lowers silently wrong, so the helpers
+    # pad on the host and every result is moved back.
     device = attn.q_norm.weight.device
     attn.q_proj.linear = _as_plain_linear(attn.q_proj.linear)
     attn.k_proj.linear = _as_plain_linear(attn.k_proj.linear)
@@ -296,20 +290,14 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
         attn.o_proj.linear, num_heads, orig_head_dim, padded_head_dim
     ).to(device)
     attn.q_norm.weight = nn.Parameter(
-        _pad_norm_weight(attn.q_norm, orig_head_dim, padded_head_dim).to(device),
+        _pad_norm_weight(attn.q_norm, padded_head_dim).to(device),
         requires_grad=False,
     )
     attn.k_norm.weight = nn.Parameter(
-        _pad_norm_weight(attn.k_norm, orig_head_dim, padded_head_dim).to(device),
+        _pad_norm_weight(attn.k_norm, padded_head_dim).to(device),
         requires_grad=False,
     )
     attn._spyre_padded_head_dim = padded_head_dim
-
-
-_NOT_PADDED = (
-    "Gemma 4 vision weights are not padded for this head dim; "
-    "`process_weights_after_loading` pads them and has to precede the first forward."
-)
 
 
 class SpyreGemma4VisionAttention(modeling_gemma4.Gemma4VisionAttention):
@@ -372,44 +360,35 @@ class SpyreGemma4RMSNorm(modeling_gemma4.Gemma4RMSNorm):
         return _padded_rms_norm(hidden_states, weight, self.eps, orig_head_dim=None)
 
 
-_LAYER_NORMS = (
-    "input_layernorm",
-    "post_attention_layernorm",
-    "pre_feedforward_layernorm",
-    "post_feedforward_layernorm",
-)
-
-
 def gemma4_rope_tables(
     inv_freq: torch.Tensor, size: int, padded_head_dim: int, attention_scaling: float = 1.0
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`[2, size, D]` cos and signed-sin per axis; patch (x, y) sums rows [0, x], [1, y].
 
-    Gemma 4 vision rotates its two position axes independently, each with its own
-    `rotate_half` (stock `apply_multidimensional_rope`). `_pad_qk_linear` packs the padded
-    head as `[X, Y, zeros | X, Y, zeros]`, so one first-half/second-half swap serves both
-    axes at once: each axis's angle is duplicated into both blocks, with `rotate_half`'s
-    sign flip baked into `sin`.
+    Built in stock's head layout and mapped with `_two_axis_layout`, as the projections are:
+    each axis's angle fills both of its quarters, with `rotate_half`'s sign flip baked into
+    `sin`. Padding lanes are 1 in axis 0's cos and 0 elsewhere, so the summed rows rotate
+    them by identity.
 
-    `attention_scaling` (stock applies it to the whole table) scales the real lanes only;
-    the padded ones stay an exact identity rotation.
+    `attention_scaling` (stock applies it to the whole table) scales the real lanes only.
     """
-    quarter = inv_freq.shape[0]
-    half = padded_head_dim // 2
     angles = torch.arange(size, dtype=torch.float32)[:, None] * inv_freq.float()
-    cos_axis = angles.cos() * attention_scaling
-    sin_axis = angles.sin() * attention_scaling
-    cos = torch.zeros(2, size, padded_head_dim)
-    sin = torch.zeros(2, size, padded_head_dim)
-    for axis in range(2):
-        lanes = slice(axis * quarter, (axis + 1) * quarter)
-        upper = slice(half + axis * quarter, half + (axis + 1) * quarter)
-        cos[axis, :, lanes] = cos_axis
-        cos[axis, :, upper] = cos_axis
-        sin[axis, :, lanes] = -sin_axis
-        sin[axis, :, upper] = sin_axis
-    cos[0, :, 2 * quarter : half] = 1.0
-    cos[0, :, half + 2 * quarter :] = 1.0
+    c = angles.cos() * attention_scaling
+    s = angles.sin() * attention_scaling
+    z = torch.zeros_like(c)
+    d = padded_head_dim
+    cos = torch.stack(
+        [
+            _two_axis_layout(torch.cat([c, c, z, z], dim=-1), d, fill=1.0),
+            _two_axis_layout(torch.cat([z, z, c, c], dim=-1), d),
+        ]
+    )
+    sin = torch.stack(
+        [
+            _two_axis_layout(torch.cat([-s, s, z, z], dim=-1), d),
+            _two_axis_layout(torch.cat([z, z, -s, s], dim=-1), d),
+        ]
+    )
     return cos, sin
 
 
@@ -430,15 +409,6 @@ def _images(mm_kwargs: dict[str, Any]) -> list[tuple[torch.Tensor, torch.Tensor]
         return []
     positions = mm_kwargs["pixel_position_ids"]
     return list(zip(unbind_items(pixel_values), unbind_items(positions), strict=True))
-
-
-def _valid_patches(
-    pixel_values: torch.Tensor, positions: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    pixel_values = convert(pixel_values, device="cpu")
-    positions = convert(positions, device="cpu")
-    valid = (positions != -1).any(dim=-1)
-    return pixel_values[valid], positions[valid]
 
 
 class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForConditionalGeneration):
@@ -496,7 +466,7 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
             _pad_mlp(layer, config.intermediate_size, align_up(config.intermediate_size))
 
         embedder = tower.patch_embedder
-        weight = _linear_weight(embedder.input_proj).float()
+        weight = linear_weight(embedder.input_proj).float()
         # Not the tower's dtype: see __init__.
         dtype = cast(torch.dtype, self.model_dtype)
         weight_t = F.pad(weight, (0, self._patch_width - weight.shape[1])).t().contiguous()
@@ -505,7 +475,8 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         embedder.input_proj.weight = nn.Parameter(weight_t.to(dtype), requires_grad=False)
 
         # One row per coordinate and axis: [position embedding | cos | sin].
-        table = to_host(cast(torch.Tensor, embedder.position_embedding_table)).float()
+        table = cast(torch.Tensor, embedder.position_embedding_table).detach()
+        table = convert(table, device="cpu").float()
         inv_freq, attention_scaling = _fp32_inv_freq(tower.encoder.rotary_emb, config)
         cos, sin = gemma4_rope_tables(inv_freq, table.shape[1], padded, attention_scaling)
         rows = torch.cat([table, cos, sin], dim=-1).to(dtype)
@@ -518,10 +489,10 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         self._spyre_vision_tail = _VisionTail(
             # vision_project sums the k*k patches; the pooler averages and scales them.
             scale=tower.pooler.root_hidden_size / self.patches_per_token,
-            std_bias=to_host(tower.std_bias).float() if standardize else None,
-            std_scale=to_host(tower.std_scale).float() if standardize else None,
+            std_bias=convert(tower.std_bias, device="cpu").float() if standardize else None,
+            std_scale=convert(tower.std_scale, device="cpu").float() if standardize else None,
             eps=self.embed_vision.eps,
-            weight=to_host(_linear_weight(projection)).float(),
+            weight=convert(linear_weight(projection), device="cpu").float(),
             dtype=dtype,
         )
         # Only upstream's eager image and video paths ran it; the tail above replaces it.
@@ -565,7 +536,10 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         k = self._pool
         patches, segments, xs, ys = [], [], [], []
         for i, (pixel_values, positions) in enumerate(_images(mm_kwargs)):
-            values, pos = _valid_patches(pixel_values, positions)
+            pixel_values = convert(pixel_values, device="cpu")
+            positions = convert(positions, device="cpu")
+            valid = (positions != -1).any(dim=-1)
+            values, pos = pixel_values[valid], positions[valid]
             wp, hp = (int(n) + 1 for n in pos.max(dim=0).values)
             if hp * wp != pos.shape[0] or hp % k or wp % k:
                 raise ValueError(

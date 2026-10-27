@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from functools import cache
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -38,14 +39,14 @@ def align_up(n: int, align: int = STICK) -> int:
     return (n + align - 1) // align * align
 
 
-def to_host(t: torch.Tensor) -> torch.Tensor:
-    """Detach a weight onto the host before reshaping or padding it.
-
-    Composed strided slice-assignments lower silently wrong on a Spyre-resident tensor --
-    finite but inaccurate, and nothing raises -- so padding helpers pull their source here
-    and the caller moves the finished weight back.
-    """
-    return convert(t.detach(), device="cpu")
+def linear_weight(layer: nn.Module) -> torch.Tensor:
+    """``[out, in]``, undoing the Spyre linear's post-load transpose and row padding."""
+    weight = cast(torch.Tensor, layer.weight).detach()
+    padding = getattr(layer, "spyre_row_padding", None)
+    if padding is None:
+        return weight
+    weight = weight.t()
+    return weight[: weight.shape[0] - padding]
 
 
 @cache

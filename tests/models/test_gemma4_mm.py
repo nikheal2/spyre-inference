@@ -516,7 +516,7 @@ def test_pad_norm_weight_fills_padding_lanes_with_ones():
     norm = modeling_gemma4.Gemma4RMSNorm(dim=ORIG_HEAD_DIM, eps=1e-6, with_scale=True)
     norm.weight.data.normal_()
 
-    padded = _pad_norm_weight(norm, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+    padded = _pad_norm_weight(norm, PADDED_HEAD_DIM)
 
     assert padded.shape == (PADDED_HEAD_DIM,)
     quarter = ORIG_HEAD_DIM // 4
@@ -846,8 +846,8 @@ def test_padding_on_device_weights_matches_padding_on_host():
     """Padding a layer already on Spyre must give the same weights as padding it on the
     host and moving afterwards.
 
-    The regression `to_host` exists for: composed on device-resident weights, the helpers'
-    strided slice-assignments lower silently wrong.
+    The regression the host round trip exists for: composed on device-resident weights, the
+    helpers' strided slice-assignments lower silently wrong.
     """
     if not spyre_available():
         pytest.skip("Spyre device not available")
@@ -884,7 +884,7 @@ def test_padding_on_device_weights_matches_padding_on_host():
     gm._pad_mlp(on_device, config.intermediate_size, padded_inter)
 
     # Every host<->device convert halves an fp16 subnormal (normals round-trip exactly),
-    # and padding on device round-trips through `to_host`, so its subnormals come back one
+    # and padding on device round-trips through the host, so its subnormals come back one
     # halving further down -- an error bounded by half the largest subnormal. A wrongly
     # composed slice-assign moves whole weights, so `smallest_normal` still catches it.
     checked = 0
