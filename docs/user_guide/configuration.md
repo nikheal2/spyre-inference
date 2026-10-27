@@ -188,6 +188,19 @@ different KV scales therefore compiles the transformer block and each recorded a
 kernel once per distinct pair of scales, which lengthens warmup; one without scales
 compiles them once, as an fp16 cache does.
 
+## Offline engine in the calling process
+
+At `tensor_parallel_size=1`, set `VLLM_ENABLE_V1_MULTIPROCESSING=0` to run the offline
+`LLM` engine in the calling process instead of a spawned EngineCore, which skips the
+spawn and the second round of imports at startup. `vllm serve` always spawns EngineCore.
+
+The engine then changes the calling process: vLLM freezes the garbage collector's heap,
+caches its environment variables, seeds the global RNGs and leaves `RANK`/`WORLD_SIZE`
+set, the worker sets torch's thread count, and the card stays open until the process
+exits. Build an engine with `tensor_parallel_size > 1` in a new process. Set
+`OMP_WAIT_POLICY=PASSIVE` before Python starts: OpenMP reads it when it loads, so the
+default the plugin sets only reaches spawned processes.
+
 ## pyproject.toml Reference
 
 The `pyproject.toml` includes several key build configurations:
