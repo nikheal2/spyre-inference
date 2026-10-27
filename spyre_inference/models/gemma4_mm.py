@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gemma 4 with its vision encoder compiled per token budget (math from hf-adapters#495)."""
+"""Gemma 4's vision model: the encoder compiled per token budget (math from hf-adapters#495).
+
+The text decoder and the startup hooks are in ``gemma4.py``.
+"""
 
 from __future__ import annotations
 
