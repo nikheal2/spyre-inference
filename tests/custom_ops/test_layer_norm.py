@@ -76,6 +76,11 @@ def test_spyre_layer_norm_matches_reference_on_spyre(
     layer = SpyreLayerNorm(hidden_size, eps=eps, elementwise_affine=elementwise_affine).to(
         torch.float16
     )
+    if elementwise_affine:
+        # Non-trivial weight/bias, so the fp16 affine step is actually exercised.
+        with torch.no_grad():
+            layer.weight.normal_()
+            layer.bias.normal_()
     x = torch.randn(4, hidden_size, dtype=torch.float16)
 
     weight = layer.weight if elementwise_affine else None
