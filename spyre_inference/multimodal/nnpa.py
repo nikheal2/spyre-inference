@@ -47,7 +47,7 @@ from spyre_inference.threading_config import THREADING_ENVS
 
 logger = init_logger(__name__)
 
-_VISION_DEVICES = ("spyre", "nnpa", "cpu")
+_VISION_DEVICES = ("auto", "spyre", "nnpa", "cpu")
 _VISION_PREFIXES = (
     "vision_encoder.",
     "patch_merger.",
@@ -62,6 +62,8 @@ def vision_offload_device() -> str | None:
     device = envs.SPYRE_VISION_DEVICE.lower()
     if device not in _VISION_DEVICES:
         raise ValueError(f"SPYRE_VISION_DEVICE must be one of {_VISION_DEVICES}, got {device!r}")
+    if device == "auto":
+        device = "nnpa" if platform.machine() == "s390x" else "spyre"
     if device == "nnpa" and platform.machine() != "s390x":
         raise ValueError(f"SPYRE_VISION_DEVICE=nnpa needs an s390x host, not {platform.machine()}")
     return None if device == "spyre" else device
@@ -138,7 +140,10 @@ class VisionOffload:
         reply = self._recv()
         if not reply["ok"]:
             self.close()
-            raise RuntimeError(f"Vision worker failed to start:\n{reply['error']}")
+            raise RuntimeError(
+                f"Vision worker failed to start on {config['device']} "
+                f"(SPYRE_VISION_DEVICE=spyre keeps the tower on the card):\n{reply['error']}"
+            )
         logger.info(
             "Vision tower running on %s in pid %d (%s), ready in %.1fs.",
             config["device"],
@@ -185,18 +190,27 @@ def offload_vision_tower(
     model_config: ModelConfig,
     device: str,
     out_dtype: torch.dtype,
-) -> VisionOffload:
-    """Start the vision worker for ``model`` and drop its tower; call before the move to Spyre."""
+) -> VisionOffload | None:
+    """Start the vision worker for ``model`` and drop its tower; call before the move to Spyre.
+
+    ``None`` when ``SPYRE_VISION_DEVICE=auto`` and the model has no tower this can run: other
+    vision models keep theirs on the card. An explicit device raises instead.
+    """
     from vllm.model_executor.models import pixtral
 
     from spyre_inference.models.pixtral import SpyrePixtralForConditionalGeneration
 
+    explicit = envs.SPYRE_VISION_DEVICE.lower() != "auto"
     if not isinstance(model, SpyrePixtralForConditionalGeneration):
+        if not explicit:
+            return None
         raise NotImplementedError(
             f"SPYRE_VISION_DEVICE={device} supports the Mistral-format Pixtral tower "
             f"(Ministral-3) only, not {type(model).__name__}."
         )
     if not isinstance(model.vision_encoder, pixtral.VisionTransformer):
+        if not explicit:
+            return None
         raise ValueError(f"SPYRE_VISION_DEVICE={device} needs the vision tower; image limit is 0.")
     args = model.vision_args
     config = {

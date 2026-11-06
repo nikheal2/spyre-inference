@@ -52,7 +52,7 @@ if TYPE_CHECKING:
     SPYRE_MOE_CHUNKS: int | None = None
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
-    SPYRE_VISION_DEVICE: str = "spyre"
+    SPYRE_VISION_DEVICE: str = "auto"
     SPYRE_VISION_DTYPE: str = "float32"
     SPYRE_VISION_PYTHON: str | None = None
     SPYRE_VISION_THREADS: int = 0
@@ -171,11 +171,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.
     "SPYRE_UPDATE_THREAD_CONFIG": lambda: bool(int(os.getenv("SPYRE_UPDATE_THREAD_CONFIG", "1"))),
     # Where the Mistral-format Pixtral vision tower (Ministral-3) runs:
-    #  - "spyre": on the card, compiled with the model (default)
+    #  - "auto": "nnpa" on s390x, "spyre" on every other architecture (default)
+    #  - "spyre": on the card, compiled with the model
     #  - "nnpa": on the s390x host's NNPA through torch_nnpa, in a child process (torch_nnpa
     #    and torch-spyre cannot share one); rejected on other architectures
     #  - "cpu": the same child process on the host CPU, for checking the offload path
-    "SPYRE_VISION_DEVICE": lambda: os.getenv("SPYRE_VISION_DEVICE") or "spyre",
+    "SPYRE_VISION_DEVICE": lambda: os.getenv("SPYRE_VISION_DEVICE") or "auto",
     # Weight and activation dtype of an offloaded vision tower: float32 (default), float16 or
     # bfloat16. Its output is cast to the model dtype.
     "SPYRE_VISION_DTYPE": lambda: os.getenv("SPYRE_VISION_DTYPE") or "float32",
