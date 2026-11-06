@@ -70,6 +70,11 @@ from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
 from spyre_inference.multimodal import apply_multimodal_patches
+from spyre_inference.multimodal.nnpa import (
+    VisionOffload,
+    offload_vision_tower,
+    vision_offload_device,
+)
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
@@ -346,6 +351,7 @@ class _SpyreModelWrapper:
         model_dtype: torch.dtype,
         inputs_embeds_buffer: torch.Tensor | None = None,
         keep_aux_hidden_states_on_device: bool = False,
+        vision_offload: VisionOffload | None = None,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -358,6 +364,7 @@ class _SpyreModelWrapper:
         object.__setattr__(
             self, "_keep_aux_hidden_states_on_device", keep_aux_hidden_states_on_device
         )
+        object.__setattr__(self, "_vision_offload", vision_offload)
 
     @contextmanager
     def outputs_on_host(self):
@@ -444,6 +451,8 @@ class _SpyreModelWrapper:
         input conversion, so pixel tensors would otherwise arrive on CPU while the
         vision weights are on Spyre.
         """
+        if self._vision_offload is not None:
+            return self._vision_offload(kwargs)
 
         def _to_spyre_float(t):
             if isinstance(t, torch.Tensor) and t.is_floating_point():
@@ -581,6 +590,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Set by load_model: whether the pooler/classifier stay on Spyre.
         self._pooling_on_spyre = False
+        # Set by load_model when SPYRE_VISION_DEVICE runs the vision tower off the card.
+        self._vision_offload: VisionOffload | None = None
 
         # Encoder shape tables, and the step state derived from them. The grid is
         # written by _build_attention_metadata and read by _preprocess and _pool,
@@ -683,6 +694,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # guard on their unset value and the first real prefill recompiles the block.
         resolve_kv_scales(self.model, self.compilation_config.static_forward_context)
 
+        # Before the move: the offload drops the tower so none of it reaches the card.
+        offload_device = vision_offload_device()
+        if offload_device is not None and self.supports_mm_inputs:
+            self._vision_offload = offload_vision_tower(
+                self.model, model_loader, self.model_config, offload_device, self._model_dtype()
+            )
+
         move_model_to_spyre(self.model, self._spyre_device)
         if self.speculative_config and self.speculative_config.use_dflash():
             from spyre_inference.v1.spec_decode.dflash import SpyreDFlashProposer
@@ -731,6 +749,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             model_dtype=self._model_dtype(),
             inputs_embeds_buffer=self.inputs_embeds.gpu,
             keep_aux_hidden_states_on_device=self.use_aux_hidden_state_outputs,
+            vision_offload=self._vision_offload,
         )
 
     def _input_fits_in_drafter(self, common_attn_metadata):
@@ -952,6 +971,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
     @torch.inference_mode()
     def _record_vision_graphs(self) -> None:
         """Compile the vision encoder at every budget; serving then runs through the manager."""
+        if self._vision_offload is not None:
+            # The tower runs off the card; only the merge into the text embeddings is here.
+            model = unwrap_model(self.model)
+            if self.compilation_config.mode is CompilationMode.NONE or not isinstance(
+                model, SpyreVisionEncoderMixin
+            ):
+                return
+            with _set_spyre_compilation_settings(self.vllm_config):
+                model.compile_vision_merge()
+                self._warmup_vision_merge(model)
+            return
         model = self._compiled_vision_model()
         if model is None:
             return
@@ -982,7 +1012,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Vision merge compiled at every token bucket.")
 
     def _compiled_vision_model(self) -> SpyreVisionEncoderMixin | None:
-        if not self.supports_mm_inputs or self.compilation_config.mode is CompilationMode.NONE:
+        if (
+            not self.supports_mm_inputs
+            or self.compilation_config.mode is CompilationMode.NONE
+            or self._vision_offload is not None
+        ):
             return None
         model = getattr(self.model, "_model", self.model)
         return model if isinstance(model, SpyreVisionEncoderMixin) else None

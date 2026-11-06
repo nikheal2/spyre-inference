@@ -260,12 +260,21 @@ class SpyreVisionEncoderMixin:
         compile_kwargs: dict[str, Any] = dict(backend="inductor", fullgraph=True, dynamic=False)
         self._spyre_vision_embed = torch.compile(self.vision_embed, **compile_kwargs)
         self._spyre_vision_project = torch.compile(self.vision_project, **compile_kwargs)
-        self._spyre_vision_merge = torch.compile(self.vision_merge, **compile_kwargs)
-        for name in ("vision_embed", "vision_project", "vision_merge"):
+        for name in ("vision_embed", "vision_project"):
             compile_guard.watch(getattr(self, f"_spyre_{name}"), f"{type(self).__name__}.{name}")
+        self.compile_vision_merge()
         for block in self.vision_blocks():
             block.compile(**compile_kwargs)
             compile_guard.watch(block, f"{type(block).__name__} (vision block)")
+
+    def compile_vision_merge(self) -> None:
+        """Compile ``vision_merge`` alone: all an encoder running off the card still needs."""
+        if hasattr(self, "_spyre_vision_merge"):
+            return
+        self._spyre_vision_merge = torch.compile(
+            self.vision_merge, backend="inductor", fullgraph=True, dynamic=False
+        )
+        compile_guard.watch(self._spyre_vision_merge, f"{type(self).__name__}.vision_merge")
 
     # --- 4. Upstream's SupportsEncoderCudaGraph, in the order the manager calls it ---
 
