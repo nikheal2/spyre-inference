@@ -75,7 +75,8 @@ def pixtral_block_dynamic(
 
     Args:
         x: ``[P, D]`` block input.
-        key_pad: ``[P]`` additive mask, ``MASK_MIN`` at padding slots.
+        key_pad: ``[P, 1]`` additive mask, ``MASK_MIN`` at padding slots. Not ``[P]``: the
+            declared dim cannot be the innermost (stick) one.
         cos, sin: ``[P, head_dim]`` RoPE rows, as separate tensors: slicing one gathered
             ``[P, 2 * head_dim]`` table changes the view's geometry and drops the declaration.
         tile: rows per trip, the declaration's granularity; ``P`` is a multiple of it.
@@ -112,7 +113,7 @@ def pixtral_block_dynamic(
 
     def kv_body(carry, tiles):
         k_t, v_t, pad_t, q_h = tiles
-        scores = torch.matmul(q_h, k_t.permute(1, 2, 0)) + pad_t
+        scores = torch.matmul(q_h, k_t.permute(1, 2, 0)) + pad_t.transpose(0, 1)
         run_max, run_sum, run_out = carry
         tile_max = torch.amax(scores, dim=-1, keepdim=True)
         # Read run_max before the maximum that supersedes it, as page_attn_prefill does.

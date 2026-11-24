@@ -114,7 +114,7 @@ def _host_inputs(hp, wp, rows, max_rows, hidden, tables, seed):
     gen = torch.Generator().manual_seed(seed)
     return {
         "x": torch.randn(max_rows, hidden, generator=gen),
-        "key_pad": to_max(key_pad.flatten()),
+        "key_pad": to_max(key_pad.flatten()[:, None]),
         "cos": to_max(cos_table[positions]),
         "sin": to_max(sin_table[positions]),
     }
@@ -223,6 +223,7 @@ def main() -> None:
         }
 
         x, key_pad, cos, sin = (host[k][:rows] for k in ("x", "key_pad", "cos", "sin"))
+        key_pad = key_pad[:, 0]
         want = reference_block(x, key_pad, cos, sin, w_cpu, num_heads=args.heads)
         got = _real_rows(out.cpu().float(), rows, patches)
         want = _real_rows(want, rows, patches)
