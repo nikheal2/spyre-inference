@@ -190,7 +190,9 @@ def main() -> None:
         upcast=not args.no_upcast,
     )
     compiled = torch.compile(block, fullgraph=True)
-    static = torch.compile(partial(reference_block, num_heads=args.heads), fullgraph=True)
+    static = torch.compile(
+        partial(reference_block, num_heads=args.heads), fullgraph=True, dynamic=False
+    )
 
     results = []
     for i, image in enumerate(args.images.split(",")):
@@ -229,14 +231,17 @@ def main() -> None:
         want = _real_rows(want, rows, patches)
         row["cosine"] = round(F.cosine_similarity(got.flatten(), want.flatten(), dim=0).item(), 6)
         row["max_abs"] = round((got - want).abs().max().item(), 4)
+        print(json.dumps(row), flush=True)
 
         if args.static_baseline:
             static_in = [t.half().to(device) for t in (x, key_pad, cos, sin)]
-            _, s_first, s_step = _timed(partial(static, *static_in, w=w_dev), args.iters)
-            row["static_first_call_s"] = round(s_first, 2)
-            row["static_step_ms"] = round(s_step, 2)
-
-        print(json.dumps(row), flush=True)
+            try:
+                _, s_first, s_step = _timed(partial(static, *static_in, w=w_dev), args.iters)
+                row["static_first_call_s"] = round(s_first, 2)
+                row["static_step_ms"] = round(s_step, 2)
+            except Exception as e:  # the baseline is a comparison point, not the spike
+                row["static_error"] = f"{type(e).__name__}: {str(e).splitlines()[0]}"
+            print(json.dumps({"image": image, **{k: v for k, v in row.items() if "static" in k}}))
         results.append(row)
 
     dynamic_graphs = sum(r["new_graphs"] for r in results)
