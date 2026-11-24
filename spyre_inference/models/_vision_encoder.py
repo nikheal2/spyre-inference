@@ -207,23 +207,32 @@ class SpyreVisionEncoderMixin:
     # Limit items per call by budget tokens and vision_max_items_per_call (then required)
     # instead of upstream's smallest budget, e.g. for a tower with one token per image.
     vision_items_limited_by_tokens: ClassVar[bool] = False
+    # Rows per for_each_tile trip when the graphs run over a patch count declared dynamic
+    # (#1473); None compiles one graph set per budget. When set, the manager compiles one budget,
+    # the largest, buffers upload declared on dim 0, and every hook must run its patch rows
+    # inside for_each_tile. vision_inputs then returns patches already padded to whole tiles.
+    vision_dynamic_tile: int | None = None
 
     @property
     def vision_pad_groups(self) -> int:
         """Equal groups every buffer's patches are split into, each padded at its own tail.
 
         Default ``patches_per_token``, one group per merge offset, which keeps the merge a free
-        view. Use 1 when items pad as whole units at the end (e.g. tiles).
+        view. Use 1 when items pad as whole units at the end (e.g. tiles). Always 1 with
+        ``vision_dynamic_tile``: ``vision_inputs`` pads to whole tiles itself.
         """
-        return self.patches_per_token
+        return 1 if self.vision_dynamic_tile else self.patches_per_token
 
     @property
     def vision_patch_multiple(self) -> int:
         """Every padded patch count is a whole multiple of this; budgets round up to it.
 
         Default: the least common multiple of the 64-wide stick, ``vision_pad_groups`` and
-        ``patches_per_token``. Override for a larger natural unit (e.g. a 576-patch tile).
+        ``patches_per_token``, or ``vision_dynamic_tile`` when set. Override for a larger
+        natural unit (e.g. a 576-patch tile).
         """
+        if self.vision_dynamic_tile:
+            return self.vision_dynamic_tile
         return math.lcm(STICK, self.vision_pad_groups, self.patches_per_token)
 
     def vision_call_block(
@@ -259,22 +268,52 @@ class SpyreVisionEncoderMixin:
     # Image tokens of the largest item: set by the runner from upstream's processor budget before
     # the manager is built, and read by get_encoder_cudagraph_budget_range.
     max_tokens_per_item: int
+    # Patch slots the dynamic declaration reserves: set by the manager with vision_dynamic_tile.
+    vision_max_patches: int | None = None
 
     def compile_vision_graphs(self) -> None:
         """Compile ``vision_embed``, every layer, ``vision_project`` and ``vision_merge`` with
-        static shapes and register them with the compile guard. Called at warmup; a repeat call
-        is a no-op."""
+        static shapes (bar the declared dim with ``vision_dynamic_tile``) and register them
+        with the compile guard. Called at warmup; a repeat call is a no-op."""
         if hasattr(self, "_spyre_vision_embed"):
             return
-        compile_kwargs: dict[str, Any] = dict(backend="inductor", fullgraph=True, dynamic=False)
+        compile_kwargs: dict[str, Any] = dict(backend="inductor", fullgraph=True)
+        # A dynamic upload's declared dim compiles under Dynamo's default, as the spike ran.
+        if not self.vision_dynamic_tile:
+            compile_kwargs["dynamic"] = False
         self._spyre_vision_embed = torch.compile(self.vision_embed, **compile_kwargs)
         self._spyre_vision_project = torch.compile(self.vision_project, **compile_kwargs)
-        self._spyre_vision_merge = torch.compile(self.vision_merge, **compile_kwargs)
+        # Over token buckets, never the declared dim.
+        self._spyre_vision_merge = torch.compile(
+            self.vision_merge, backend="inductor", fullgraph=True, dynamic=False
+        )
         for name in ("vision_embed", "vision_project", "vision_merge"):
             compile_guard.watch(getattr(self, f"_spyre_{name}"), f"{type(self).__name__}.{name}")
         for block in self.vision_blocks():
             block.compile(**compile_kwargs)
             compile_guard.watch(block, f"{type(block).__name__} (vision block)")
+
+    def vision_upload(
+        self, values: dict[str, torch.Tensor], device: torch.device, num_patches: int
+    ) -> dict[str, torch.Tensor]:
+        """Copy host buffers to the card, as ``num_patches`` slots.
+
+        Static: the buffers are already that size. With ``vision_dynamic_tile`` they are
+        ``vision_max_patches`` slots, padded on the host: each is uploaded whole, declared on
+        dim 0, then resized, since a partial copy into a declared buffer is slow
+        (torch-spyre#6026).
+        """
+        tile = self.vision_dynamic_tile
+        if not tile:
+            return {key: convert(value, device=device) for key, value in values.items()}
+        assert self.vision_max_patches is not None, "the manager sets vision_max_patches"
+        spec = {"min": tile, "max": self.vision_max_patches, "granularity": tile}
+        out = {}
+        for key, value in values.items():
+            # `dynamic=` is torch-spyre's extension of Tensor.to.
+            out[key] = value.to(device, dynamic={0: spec})  # ty: ignore[no-matching-overload]
+            out[key].resize_((num_patches, *value.shape[1:]))
+        return out
 
     # --- 4. Upstream's SupportsEncoderCudaGraph, in the order the manager calls it ---
 

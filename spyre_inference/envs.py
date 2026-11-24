@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     SPYRE_MOE_PREP_THREADS: int = 0
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
+    SPYRE_VISION_DYNAMIC_TILE: int = 0
 
 _cache: dict[str, Any] = {}
 
@@ -160,6 +161,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.
     "SPYRE_UPDATE_THREAD_CONFIG": lambda: bool(int(os.getenv("SPYRE_UPDATE_THREAD_CONFIG", "1"))),
+    # Pixtral (Ministral-3) only, experimental (#1787): compile the vision encoder once over a
+    # patch count declared dynamic, in loops of this many rows, instead of once per token
+    # budget. "0" (default) keeps the budgets. The tower then runs unsharded on every rank.
+    "SPYRE_VISION_DYNAMIC_TILE": lambda: int(os.getenv("SPYRE_VISION_DYNAMIC_TILE", "0")),
 }
 # --8<-- [end:env-vars-definition]
 

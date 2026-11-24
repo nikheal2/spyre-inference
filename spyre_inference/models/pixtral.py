@@ -30,6 +30,7 @@ the offset-major order changes how the merge lowers, not the result.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -39,7 +40,15 @@ from vllm.model_executor.models import pixtral
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.models._vision_dynamic import (
+    PixtralBlockWeights,
+    pixtral_block_dynamic,
+    pixtral_embed_dynamic,
+    pixtral_project_dynamic,
+    tile_offset_major,
+)
 from spyre_inference.models._vision_encoder import (
     MASK_MIN,
     GatherTable,
@@ -49,6 +58,7 @@ from spyre_inference.models._vision_encoder import (
     unbind_items,
 )
 from spyre_inference.multimodal.utils import (
+    STICK,
     align_up,
     linear_weight,
     padded_sdpa,
@@ -125,6 +135,58 @@ class SpyrePixtralTransformerBlock(pixtral.TransformerBlock):
         return h + self.feed_forward(self.ffn_norm(h))
 
 
+class SpyrePixtralDynamicBlock(SpyrePixtralTransformerBlock):
+    """The block over a patch count declared dynamic, as ``for_each_tile`` loops (#1787).
+
+    Built unsharded: a loop body cannot all-reduce reliably yet (torch-spyre#6062), so every
+    rank runs the whole tower. Called as ``(x, key_pad, cos, sin, max_rows)`` on ``[P, D]``.
+    """
+
+    def __init__(self, args, tile: int, prefix: str = "") -> None:
+        super().__init__(args, prefix=prefix, disable_tp=True)
+        self.tile = tile
+
+    def forward(  # ty: ignore[invalid-method-override]
+        self,
+        x: torch.Tensor,
+        key_pad: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        max_rows: int | None,
+    ) -> torch.Tensor:
+        attn, ffn = self.attention, self.feed_forward
+        weights = PixtralBlockWeights(
+            attention_norm=self.attention_norm.weight,
+            wqkv=_weight_t(attn.qkv_proj),
+            wo=_weight_t(attn.o_proj),
+            ffn_norm=self.ffn_norm.weight,
+            w_gate_up=_weight_t(ffn.gate_up_proj),
+            w_down=_weight_t(ffn.down_proj),
+            rope_perm=cast(torch.Tensor, attn.rope_perm),
+        )
+        return pixtral_block_dynamic(
+            x,
+            key_pad,
+            cos,
+            sin,
+            weights,
+            num_heads=attn.n_heads,
+            tile=self.tile,
+            max_rows=max_rows,
+        )
+
+
+def _weight_t(layer: nn.Module) -> torch.Tensor:
+    """A Spyre linear's ``[in, out]`` weight, for a ``for_each_tile`` operand."""
+    weight = cast(torch.Tensor, layer.weight)
+    if getattr(layer, "spyre_row_padding", None) or weight.dtype != torch.float16:
+        raise NotImplementedError(
+            f"SPYRE_VISION_DYNAMIC_TILE needs an unpadded fp16 weight, got {type(layer).__name__}"
+            f" {weight.dtype}"
+        )
+    return weight
+
+
 def pixtral_rope_tables(
     head_dim: int, max_side: int, theta: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -176,25 +238,47 @@ class SpyrePixtralForConditionalGeneration(
         self._max_side = args.image_size // args.patch_size
         head_dim = args.hidden_size // args.num_attention_heads
         self._patch_width = align_up(args.num_channels * args.patch_size**2)
-        self.vision_buffers = {
-            "patches": VisionBuffer(self._patch_width),
-            "key_pad": VisionBuffer(None, pad=MASK_MIN),
-            "positions": VisionBuffer(None, pad=0, dtype=torch.int64),
-        }
-        # [cos | sin] per position, gathered on the card in vision_embed.
         cos, sin = pixtral_rope_tables(head_dim, self._max_side, args.rope_theta)
-        self.spyre_rope_table = GatherTable(torch.cat([cos, sin], dim=-1).half())
         self._head_dim = head_dim
+        tile = envs.SPYRE_VISION_DYNAMIC_TILE or None
+        if tile is not None and tile % math.lcm(STICK, self.patches_per_token):
+            raise ValueError(
+                f"SPYRE_VISION_DYNAMIC_TILE={tile} must be a multiple of "
+                f"{math.lcm(STICK, self.patches_per_token)}"
+            )
+        self.vision_dynamic_tile = tile
+        if tile is None:
+            self.vision_buffers = {
+                "patches": VisionBuffer(self._patch_width),
+                "key_pad": VisionBuffer(None, pad=MASK_MIN),
+                "positions": VisionBuffer(None, pad=0, dtype=torch.int64),
+            }
+            # [cos | sin] per position, gathered on the card in vision_embed.
+            self.spyre_rope_table = GatherTable(torch.cat([cos, sin], dim=-1).half())
+        else:
+            # Gathered on the host: no buffer may be [P] (the declared dim cannot be the
+            # stick), a gather on a declared dim is a risk (torch-spyre#6372), and slicing one
+            # [cos | sin] row would drop the declaration.
+            self.vision_buffers = {
+                "patches": VisionBuffer(self._patch_width),
+                "key_pad": VisionBuffer(1, pad=MASK_MIN),
+                "cos": VisionBuffer(head_dim),
+                "sin": VisionBuffer(head_dim),
+            }
+            self._rope_cos, self._rope_sin = cos.half(), sin.half()
 
         # With an image limit of 0, upstream leaves a placeholder instead of the tower.
         if not isinstance(self.vision_encoder, pixtral.VisionTransformer):
             return
         layers = self.vision_encoder.transformer.layers
         for i in range(len(layers)):
-            layers[i] = SpyrePixtralTransformerBlock(
-                args,
-                prefix=maybe_prefix(prefix, f"vision_encoder.transformer.layers.{i}"),
-                disable_tp=is_vit_use_data_parallel(),
+            layer_prefix = maybe_prefix(prefix, f"vision_encoder.transformer.layers.{i}")
+            layers[i] = (
+                SpyrePixtralTransformerBlock(
+                    args, prefix=layer_prefix, disable_tp=is_vit_use_data_parallel()
+                )
+                if tile is None
+                else SpyrePixtralDynamicBlock(args, tile, prefix=layer_prefix)
             )
 
     def process_weights_after_loading(self) -> None:
@@ -250,8 +334,23 @@ class SpyrePixtralForConditionalGeneration(
         assert h % (p * m) == 0 and w % (p * m) == 0, f"{h}x{w} is not a multiple of {p * m}"
         hp, wp = h // p, w // p
         patches = convert(img, device="cpu").reshape(c, hp, p, wp, p).permute(1, 3, 0, 2, 4)
-        flat = offset_major(patches.reshape(hp, wp, -1), m).flatten(0, 1).to(torch.float16)
         grid = torch.arange(hp)[:, None] * self._max_side + torch.arange(wp)[None, :]
+        tile = self.vision_dynamic_tile
+        if tile:
+            # Each tile holds whole image tokens, offset-major inside, so vision_project's
+            # merge stays within one for_each_tile trip; padding tokens trail the last tile.
+            groups = offset_major(patches.reshape(hp, wp, -1), m).to(torch.float16)
+            groups = F.pad(groups, (0, self._patch_width - groups.shape[-1]))
+            positions = offset_major(grid, m)
+            return {
+                "patches": tile_offset_major(groups, tile, 0.0),
+                "key_pad": tile_offset_major(
+                    torch.zeros(*positions.shape, 1, dtype=torch.float16), tile, MASK_MIN
+                ),
+                "cos": tile_offset_major(self._rope_cos[positions], tile, 0.0),
+                "sin": tile_offset_major(self._rope_sin[positions], tile, 0.0),
+            }
+        flat = offset_major(patches.reshape(hp, wp, -1), m).flatten(0, 1).to(torch.float16)
         return {
             "patches": F.pad(flat, (0, self._patch_width - flat.shape[1])),
             "key_pad": torch.zeros(flat.shape[0], dtype=torch.float16),
@@ -262,6 +361,16 @@ class SpyrePixtralForConditionalGeneration(
         tower = self.vision_encoder
         # [patch width, D] since process_weights_after_loading.
         patch_weight_t = cast(torch.Tensor, tower.patch_conv.weight)
+        if tile := self.vision_dynamic_tile:
+            x = pixtral_embed_dynamic(
+                values["patches"],
+                patch_weight_t,
+                tower.ln_pre.weight,
+                tile=tile,
+                max_rows=self.vision_max_patches,
+            )
+            block_kwargs = {k: values[k] for k in ("key_pad", "cos", "sin")}
+            return x, {**block_kwargs, "max_rows": self.vision_max_patches}
         x = tower.ln_pre(torch.matmul(values["patches"], patch_weight_t).unsqueeze(0))
         mask = values["key_pad"].to(x.dtype)[None, None, None, :]
         rope = self.spyre_rope_table.gather(values["positions"])
@@ -272,6 +381,21 @@ class SpyrePixtralForConditionalGeneration(
         return self.vision_encoder.transformer.layers
 
     def vision_project(self, x: torch.Tensor, taps: list[torch.Tensor]) -> torch.Tensor:
+        if tile := self.vision_dynamic_tile:
+            adapter = self.vision_language_adapter
+            norm = self.pre_mm_projector_norm
+            merger = self.patch_merger
+            return pixtral_project_dynamic(
+                x,
+                None if norm is None else norm.weight,
+                None if merger is None else cast(torch.Tensor, merger.merging_layer.weight),
+                _weight_t(adapter.w_in),
+                adapter.w_in.bias,
+                _weight_t(adapter.w_out),
+                adapter.w_out.bias,
+                tile=tile,
+                max_rows=self.vision_max_patches,
+            )
         x = x.squeeze(0)
         if self.pre_mm_projector_norm is not None:
             x = self.pre_mm_projector_norm(x)

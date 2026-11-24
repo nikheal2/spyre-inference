@@ -61,13 +61,10 @@ def _weights(hidden, heads, inter, head_dim, device, dtype, seed):
     width = heads * head_dim
     host = PixtralBlockWeights(
         attention_norm=norm(),
-        wq=proj(hidden, width),
-        wk=proj(hidden, width),
-        wv=proj(hidden, width),
+        wqkv=proj(hidden, 3 * width),
         wo=proj(width, hidden),
         ffn_norm=norm(),
-        w_gate=proj(hidden, inter),
-        w_up=proj(hidden, inter),
+        w_gate_up=proj(hidden, 2 * inter),
         w_down=proj(inter, hidden),
         rope_perm=rope_perm_matrix("pair", head_dim, torch.device("cpu"), torch.float32),
     )
@@ -86,12 +83,14 @@ def reference_block(x, key_pad, cos, sin, w, *, num_heads, eps=1e-5):
         return t.reshape(1, rows, num_heads, head_dim).transpose(1, 2)
 
     h = rms_norm(x, w.attention_norm, eps, upcast=True)
-    q = rope_rotate_matmul(heads(h @ w.wq), cos, sin, w.rope_perm)
-    k = rope_rotate_matmul(heads(h @ w.wk), cos, sin, w.rope_perm)
-    attn = padded_sdpa(q, k, heads(h @ w.wv), key_pad.to(q.dtype)[None, None, None, :])
+    q, k, v = (heads(t) for t in (h @ w.wqkv).chunk(3, dim=-1))
+    q = rope_rotate_matmul(q, cos, sin, w.rope_perm)
+    k = rope_rotate_matmul(k, cos, sin, w.rope_perm)
+    attn = padded_sdpa(q, k, v, key_pad.to(q.dtype)[None, None, None, :])
     h = x + attn.transpose(1, 2).reshape(rows, -1) @ w.wo
     n = rms_norm(h, w.ffn_norm, eps, upcast=True)
-    return h + (F.silu(n @ w.w_gate) * (n @ w.w_up)) @ w.w_down
+    gate, up = (n @ w.w_gate_up).chunk(2, dim=-1)
+    return h + (F.silu(gate) * up) @ w.w_down
 
 
 def _host_inputs(hp, wp, rows, max_rows, hidden, tables, seed):

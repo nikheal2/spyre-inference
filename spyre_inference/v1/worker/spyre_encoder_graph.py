@@ -23,8 +23,6 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
-from spyre_inference.custom_ops.utils import convert
-
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
@@ -32,6 +30,9 @@ if TYPE_CHECKING:
     from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 
 logger = init_logger(__name__)
+
+# torch-spyre's MAX_BUCKETS: most granularity steps one dynamic declaration spans.
+_MAX_DYNAMIC_TRIPS = 256
 
 
 class SpyreEncoderGraphManager(EncoderCudaGraphManager):
@@ -85,6 +86,18 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
 
         self.token_budgets = aligned(self.token_budgets)
         self.path_token_budgets = {p: aligned(b) for p, b in self.path_token_budgets.items()}
+        if model.vision_dynamic_tile:
+            # One graph set over a declared patch range: keep only the largest budget, which
+            # sets the range's maximum.
+            self.token_budgets = self.token_budgets[-1:]
+            self.path_token_budgets = {p: b[-1:] for p, b in self.path_token_budgets.items()}
+            model.vision_max_patches = self.token_budgets[-1] * model.patches_per_token
+            trips = model.vision_max_patches // model.vision_dynamic_tile
+            if trips > _MAX_DYNAMIC_TRIPS:
+                raise ValueError(
+                    f"SPYRE_VISION_DYNAMIC_TILE={model.vision_dynamic_tile} gives {trips} tiles "
+                    f"for the largest image, above torch-spyre's {_MAX_DYNAMIC_TRIPS}; raise it."
+                )
         logger.info("Vision encoder budgets: %s", self.path_token_budgets)
         # Fail at startup rather than compile mid-request when user budgets miss an item.
         largest_item = model.get_encoder_cudagraph_budget_range(vllm_config)[1]
@@ -158,8 +171,9 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             path,
         ).values
         t0 = time.time()
+        num_patches = next(iter(values.values())).shape[0]
         with torch.inference_mode():
-            self.model.encoder_cudagraph_forward(self._upload(values), path=path)
+            self.model.encoder_cudagraph_forward(self._upload(values, num_patches), path=path)
         logger.info("Vision encoder budget %d compiled in %.1fs.", token_budget, time.time() - t0)
         self._staging.setdefault(path, {})[token_budget] = values
 
@@ -182,8 +196,14 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         for key, buf in staging.items():
             # The mixin validates replay buffers: every key is present and none is None.
             self.config.padding_logics[key](buf, cast(torch.Tensor, replay.values[key]))
+        # Static: the whole budget. Dynamic: the item's own tile-padded slots.
+        num_patches = next(iter(staging.values())).shape[0]
+        if self.model.vision_dynamic_tile:
+            num_patches = cast(torch.Tensor, next(iter(replay.values.values()))).shape[0]
         with torch.inference_mode():
-            output = self.model.encoder_cudagraph_forward(self._upload(staging), path=path)
+            output = self.model.encoder_cudagraph_forward(
+                self._upload(staging, num_patches), path=path
+            )
         self.graph_hits += num_items
         return output
 
@@ -197,6 +217,6 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         super().clear()
         self._staging.clear()
 
-    def _upload(self, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Copy host buffers to the encoder's device."""
-        return {key: convert(value, device=self.device) for key, value in values.items()}
+    def _upload(self, values: dict[str, torch.Tensor], num_patches: int) -> dict[str, torch.Tensor]:
+        """Copy host buffers to the encoder's device, as ``num_patches`` slots."""
+        return self.model.vision_upload(values, self.device, num_patches)
